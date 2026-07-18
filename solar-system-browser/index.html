@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Solar System Browser</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <main class="scene-shell" aria-label="3D solar system scene">
+        <canvas id="spaceCanvas" aria-label="3D solar system canvas"></canvas>
+        <div id="labelLayer" class="label-layer" aria-hidden="true"></div>
+
+        <div class="readout-bar">
+          <p class="readout-kv">
+            <span>Focused</span>
+            <strong id="focusedBodyName">Earth</strong>
+          </p>
+          <p class="readout-kv">
+            <span>Date</span>
+            <strong id="timelineDate">2026-07-08 12:00 UTC</strong>
+          </p>
+          <p class="status-pill" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="modeLabel">Simulation Ready</span>
+          </p>
+        </div>
+
+        <aside class="control-dock" aria-label="Scene controls">
+          <section class="hud-panel">
+            <h2>Time</h2>
+            <div class="button-row">
+              <button id="playPauseButton" class="primary-button" type="button" aria-pressed="false">
+                Play
+              </button>
+              <button id="resetTimeButton" class="secondary-button" type="button">
+                Today
+              </button>
+            </div>
+            <label class="range-field" for="speedSlider">
+              <span>Speed</span>
+              <output id="speedValue" for="speedSlider">1.00x</output>
+            </label>
+            <input id="speedSlider" type="range" min="0" max="6" step="0.01" value="1" />
+            <label class="range-field" for="timelineSlider">
+              <span>Timeline</span>
+              <span id="timelineHint">drag to scrub</span>
+            </label>
+            <input
+              id="timelineSlider"
+              type="range"
+              min="-3650"
+              max="3650"
+              step="1"
+              value="0"
+              aria-label="Timeline scrubber"
+            />
+          </section>
+
+          <section class="hud-panel">
+            <h2>Camera</h2>
+            <label class="range-field" for="zoomSlider">
+              <span>Zoom</span>
+              <output id="zoomValue" for="zoomSlider">100%</output>
+            </label>
+            <input id="zoomSlider" type="range" min="24" max="210" step="1" value="100" />
+            <div class="button-row">
+              <button id="zoomInButton" class="secondary-button" type="button">In</button>
+              <button id="zoomOutButton" class="secondary-button" type="button">Out</button>
+              <button id="cameraResetButton" class="secondary-button" type="button">Reset Camera</button>
+            </div>
+          </section>
+
+          <section class="hud-panel">
+            <h2>Focus</h2>
+            <div id="focusButtons" class="focus-grid" role="group" aria-label="Focus body"></div>
+          </section>
+
+          <section class="hud-panel">
+            <h2>Scene</h2>
+            <div class="toggle-list">
+              <label><input id="toggleOrbitLines" type="checkbox" checked /> Orbit lines</label>
+              <label><input id="toggleTrails" type="checkbox" checked /> Trails</label>
+              <label><input id="toggleLabels" type="checkbox" checked /> Labels</label>
+              <label><input id="toggleSpacecraft" type="checkbox" checked /> Show spacecraft</label>
+            </div>
+          </section>
+        </aside>
+      </main>
+
+      <section id="detailsPanel" class="details-panel" aria-live="polite">
+        <div>
+          <h2 id="detailName">Earth</h2>
+          <p id="detailSummary" class="detail-summary"></p>
+          <p id="detailType" class="detail-type"></p>
+        </div>
+        <div id="factsGrid" class="facts-grid"></div>
+      </section>
+
+      <p id="fallbackMessage" class="fallback-message"></p>
+    </div>
+
+    <script type="module" src="./solar-system.js"></script>
+  </body>
+</html>

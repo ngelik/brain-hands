@@ -1,0 +1,8 @@
+name: brain-hands
+skill: ../SKILL.md
+interface:
+  display_name: "Brain Hands"
+  short_description: "Run approval-gated Brain, Hands, and Verifier workflows"
+  default_prompt: "Use $brain-hands to show the complete engine-owned configuration preview before any intake questions, then plan, implement, verify, and deliver this project change."
+policy:
+  allow_implicit_invocation: true

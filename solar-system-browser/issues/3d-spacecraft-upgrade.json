@@ -1,0 +1,141 @@
+{
+  "type": "implementation_task",
+  "run_id": "2026-07-08T21-49-12-054Z-upgrade-the-local-solar-system-browser-app-into-a-fully-3d-space",
+  "parent_request": "Upgrade the local solar-system browser app into a fully 3D spacecraft experience.",
+  "goal": "Deliver a local no-remote 3D solar system simulator that renders the Sun, major planets, and named spacecraft/stations with a spacecraft-focused interaction model.",
+  "context": "Task 3 of the brain-hands solar 3D workflow plan requires issue seeding only, with no source changes to the app yet. The current app is a 2D canvas visual and needs a full spacecraft-oriented 3D upgrade plan.",
+  "scope": {
+    "include": [
+      "solar-system-browser/index.html",
+      "solar-system-browser/styles.css",
+      "solar-system-browser/solar-system.js",
+      "solar-system-browser/scripts/verify.mjs",
+      "solar-system-browser/README.md"
+    ],
+    "exclude": [
+      "private GitHub publishing flows",
+      "remote data sources",
+      "external imagery/CDN assets"
+    ]
+  },
+  "dependencies": [],
+  "implementation_steps": [
+    "Replace the current visual pipeline with a full-bleed Three.js scene that includes a textured Sun, planets, orbital paths, and a depth-aware starfield backdrop.",
+    "Model all major planets plus spacecraft and stations: ISS, Tiangong, Hubble, Voyager 1, Voyager 2, New Horizons, Parker Solar Probe, Juno, Cassini, Rosetta, and Mars Reconnaissance Orbiter.",
+    "Create persistent scene controls for focus target selection, spacecraft visibility toggles, orbit labels, trails, time speed, and camera reset behavior.",
+    "Add interactive HUD for spacecraft and controls that remains legible at desktop and mobile sizes without overlap.",
+    "Implement focus-on-body and orbit-follow behaviors for both planets and spacecraft targets, with clear active target labeling.",
+    "Maintain reduced-motion support by disabling continuous animation while preserving a static nonblank scene, camera state, and target highlights.",
+    "Update the verify script to assert browser evidence is produced, and add required DOM hooks and status text expected by the browser checks.",
+    "Capture required screenshot artifacts for desktop and mobile, and document remaining caveats in the run report."
+  ],
+  "acceptance_criteria": [
+    "App renders as a nonblank, full-bleed 3D scene with Sun, planets, orbital paths, and starfield in the browser.",
+    "All named spacecraft and stations are represented and focusable from the control surface.",
+    "Orbit lines, body labels, trails, and scene controls all work across desktop and mobile breakpoints.",
+    "Users can set camera target to spacecraft and planets and return to a stable default camera state.",
+    "No remote runtime assets are loaded; all models/data used for the scene come from in-repo assets or generated math/data definitions.",
+    "Reduced-motion mode renders a stable static 3D scene with no required animation dependence.",
+    "Verification captures at least desktop and mobile screenshots, and confirms key selectors are present."
+  ],
+  "verification": {
+    "required_commands": [
+      "npm run build",
+      "node --check solar-system-browser/solar-system.js",
+      "node --check solar-system-browser/scripts/verify.mjs",
+      "node solar-system-browser/scripts/verify.mjs",
+      "node dist/cli.js status --run .brain-hands/runs/2026-07-08T21-49-12-054Z-upgrade-the-local-solar-system-browser-app-into-a-fully-3d-space"
+    ],
+    "manual_checks": [
+      "Run local server command from browser checks at 127.0.0.1:5177 and open desktop and mobile viewports.",
+      "Confirm all spacecraft names appear and can be selected/focused.",
+      "Confirm no blocked mixed-content or remote network calls are required for rendering.",
+      "Verify visible labels, trails, and focus controls remain readable at narrow layouts.",
+      "Verify reduced-motion mode pauses animation while keeping the scene nonblank."
+    ],
+    "expected_artifacts": [
+      "reports/solar-3d-desktop.png",
+      "reports/solar-3d-mobile.png",
+      "reports/solar-3d-browser-evidence.json",
+      "reports/solar-3d-browser-report.json",
+      "reports/solar-workflow-test-report.md"
+    ]
+  },
+  "review_checklist": [
+    "Do all spacecraft and stations exist in scene data with stable IDs and focus hooks.",
+    "Is the scene full-bleed and not contained by decorative cards.",
+    "Do all required controls mutate camera, simulation speed, and visibility states deterministically.",
+    "Is reduced-motion supported without relying on animation frames.",
+    "Do browser checks require only local server assets and expected selectors.",
+    "Are artifacts and browser evidence paths deterministic and committed."
+  ],
+  "risk_register": [
+    "Three.js dependency install can fail on constrained environments; fallback to direct canvas/webgl paths may be required.",
+    "Mobile viewport constraints may cause control overlap without explicit density-aware layout work.",
+    "Large orbit scales can produce clipping if camera near/far planes are not tuned.",
+    "Spacecraft labels can become unreadable during close passes unless occlusion and depth handling are tuned."
+  ],
+  "handoff_prompt": "Implement the 3D spacecraft upgrade with local static assets only. Keep controls responsive, add focus controls for all requested bodies, preserve reduced-motion behavior, and make verification deterministic with browser screenshot checks that record required selectors, console, and network expectations.",
+  "browser_checks": [
+    {
+      "name": "desktop 3d smoke",
+      "url": "http://127.0.0.1:5177/solar-system-browser/index.html",
+      "local_server_command": "python3 -m http.server 5177 --bind 127.0.0.1",
+      "required_selectors": [
+        "#spaceCanvas",
+        "#focusButtons",
+        "#timelineSlider",
+        "#detailsPanel",
+        "#modeLabel"
+      ],
+      "console_error_policy": "no_errors",
+      "expected_network": [
+        "/solar-system-browser/solar-system.js",
+        "/solar-system-browser/styles.css",
+        "/node_modules/three/build/three.module.js"
+      ],
+      "screenshot_artifact": "reports/solar-3d-desktop.png",
+      "viewport": {
+        "width": 1512,
+        "height": 738,
+        "mobile": false
+      },
+      "wait_ms": 1800,
+      "require_no_horizontal_overflow": true,
+      "forbidden_overlaps": [
+        [".readout-bar", ".control-dock"],
+        [".readout-bar", "#detailsPanel"],
+        [".control-dock", "#detailsPanel"]
+      ]
+    },
+    {
+      "name": "mobile 3d smoke",
+      "url": "http://127.0.0.1:5177/solar-system-browser/index.html",
+      "local_server_command": "python3 -m http.server 5177 --bind 127.0.0.1",
+      "required_selectors": [
+        "#spaceCanvas",
+        "#focusButtons",
+        "#zoomSlider",
+        "#timelineSlider"
+      ],
+      "console_error_policy": "no_errors",
+      "expected_network": [
+        "/solar-system-browser/solar-system.js",
+        "/node_modules/three/build/three.module.js"
+      ],
+      "screenshot_artifact": "reports/solar-3d-mobile.png",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "mobile": true
+      },
+      "wait_ms": 1800,
+      "require_no_horizontal_overflow": true,
+      "forbidden_overlaps": [
+        [".readout-bar", ".control-dock"],
+        [".readout-bar", "#detailsPanel"],
+        [".control-dock", "#detailsPanel"]
+      ]
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+version: 2
+
+github:
+  default_remote: origin
+
+codex:
+  command: codex
+  timeout_seconds: 3600
+  isolate_user_config: true
+
+retry_policy:
+  max_hands_fix_attempts: 3
+  max_replan_attempts: 2
+  quality_gate:
+    hands_self_review_passes: 1
+    max_attempts_per_reviewer_action: 2
+    require_focused_verifier_confirmation: true
+
+resource_budget:
+  schema_version: 1
+  max_model_invocations: 64
+  max_workflow_attempts: 32
+  max_total_tokens: 4000000
+  max_active_elapsed_ms: 14400000
+  max_external_effects: 128
+
+profiles:
+  brain:
+    model: gpt-5.6-sol
+    reasoning_effort: high
+    sandbox: read-only
+
+  hands:
+    model: gpt-5.6-luna
+    reasoning_effort: high
+    sandbox: workspace-write
+
+  verifier:
+    model: gpt-5.6-sol
+    reasoning_effort: high
+    sandbox: read-only
+
+phase_reasoning:
+  hands_self_review: medium
+  reflection: medium

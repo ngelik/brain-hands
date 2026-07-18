@@ -1,0 +1,6 @@
+{
+  "name": "brain-hands",
+  "version": "0.4.0",
+  "description": "Approval-gated Brain, Hands, and Verifier orchestration for Codex projects.",
+  "skills": "./.agents/skills/"
+}

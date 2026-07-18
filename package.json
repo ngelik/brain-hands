@@ -1,0 +1,63 @@
+{
+  "name": "@ngelik/brain-hands",
+  "version": "0.4.0",
+  "description": "TypeScript CLI for orchestrating Codex brain/hands workflows.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ngelik/brain-hands.git"
+  },
+  "homepage": "https://github.com/ngelik/brain-hands#readme",
+  "bugs": {
+    "url": "https://github.com/ngelik/brain-hands/issues"
+  },
+  "bin": {
+    "brain-hands": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "prompts/",
+    "agentic-codex-workflow.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts",
+    "prepack": "npm run build && npm run validate-release",
+    "release": "scripts/release.sh",
+    "validate-release": "node scripts/validate-release.mjs",
+    "test": "npm run verify:funnel",
+    "test:static-contract": "vitest run tests/core/schema.test.ts tests/core/execution-spec.test.ts tests/core/testing-funnel.test.ts tests/prompts/renderer.test.ts tests/workflow/replan.test.ts",
+    "test:cross-cutting": "vitest run tests/workflow/runtime-local.test.ts tests/workflow/runtime-github.test.ts tests/workflow/preflight.test.ts tests/workflow/status.test.ts tests/core/ledger.test.ts tests/core/discovery-ledger.test.ts tests/core/run-configuration.test.ts tests/core/controller-provenance.test.ts tests/verification/runner.test.ts",
+    "test:built-cli": "vitest run tests/workflow/e2e-dry-run.test.ts tests/workflow/canonical-session-built-cli.test.ts",
+    "test:release:no-build": "vitest run --config vitest.release.config.ts",
+    "test:all:no-build": "vitest run",
+    "verify:funnel": "node scripts/verify-repository.mjs",
+    "release:e2e": "npm run build && npm run test:release:no-build",
+    "test:skill": "vitest run tests/skill-layout.test.ts tests/scripts/brain-hands-wrapper.test.ts",
+    "test:planner-replay": "vitest run tests/core/execution-spec.test.ts tests/workflow/plan-repair.test.ts tests/workflow/planner.test.ts tests/progress/events.test.ts tests/scripts/brain-hands-wrapper.test.ts",
+    "canary:planner": "node scripts/planner-canary.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "execa": "^9.6.1",
+    "three": "^0.185.1",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
