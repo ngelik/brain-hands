@@ -548,6 +548,12 @@ async function validateDiagnosticOwnedEvidence(
   artifact: DiagnosticRecoveryArtifactV1,
   workItemId: string,
 ): Promise<Array<{ snapshot: OwnedFileSnapshot; root: string; label: string }>> {
+  const belongsToWorkItem = (label: string, actual: unknown): boolean => {
+    if (actual === workItemId) return true;
+    if (label !== "verification" || typeof actual !== "string") return false;
+    const escaped = workItemId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^${escaped}:quality-gate:[1-9][0-9]*:(?:baseline|[1-9][0-9]*)(?::authority-[a-f0-9]{16})?$`).test(actual);
+  };
   const ownedEvidence = [
     {
       path: artifact.owned_evidence_refs.implementation_path,
@@ -587,7 +593,7 @@ async function validateDiagnosticOwnedEvidence(
       const value = evidence.schema.parse(JSON.parse(captured.bytes.toString("utf8")));
       if (
         !("work_item_id" in value)
-        || value.work_item_id !== workItemId
+        || !belongsToWorkItem(evidence.label, value.work_item_id)
         || captured.snapshot.sha256 !== evidence.sha256
         || (
           evidence.label === "verification"
@@ -642,9 +648,13 @@ async function validateDiagnosticAuthority(
   const approvedRevision = manifest.approved_revision;
   const approvedPlan = approvedRevision === null ? undefined : manifest.plan_revisions[String(approvedRevision)];
   const expectedPlanSha = approvedPlan?.sha256 ?? null;
+  const historicalPlanIsKnown = subject.approved_plan_sha256 === null
+    || Object.values(manifest.plan_revisions).some((revision) => revision.sha256 === subject.approved_plan_sha256);
   if (
     manifest.approved_revision !== manifest.approved_plan_revision
-    || subject.approved_plan_sha256 !== expectedPlanSha
+    || (requireCurrentProgress
+      ? subject.approved_plan_sha256 !== expectedPlanSha
+      : !historicalPlanIsKnown)
     || (requireCurrentProgress && subject.candidate_commit !== manifest.source_commit)
   ) {
     throw new Error("Recovery diagnostic approved plan or candidate commit does not match the locked manifest");
@@ -1721,7 +1731,17 @@ async function reconcileRecoveryJournalLocked(
     }
   }
 
-  const activeScope = eventProjection.latestScope;
+  const lifecycleEvents = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => event.type === "recovery_decision_recorded"
+      || event.type === "approved_replan_attempt_reset")
+    .sort((left, right) => {
+      const timestampOrder = Date.parse(left.event.timestamp) - Date.parse(right.event.timestamp);
+      return timestampOrder === 0 ? left.index - right.index : timestampOrder;
+    });
+  const activeScope = lifecycleEvents.at(-1)?.event.type === "approved_replan_attempt_reset"
+    ? null
+    : eventProjection.latestScope;
   if (staleScopes.length === 0 && manifest.recovery.active_scope === activeScope) return manifest;
   return transaction.updateManifestV2({
     recovery: {

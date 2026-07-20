@@ -22,6 +22,7 @@ import { z } from "zod";
 import { readOptionalValidatedArtifact } from "../core/ledger.js";
 import type { ArtifactRefV1, HandsContextV1 } from "../core/context-contracts.js";
 import { validateHandsInvocationContext } from "./role-context.js";
+import { invocationArtifactName } from "./invocation-artifacts.js";
 
 const legacyHandsWorkItemTemplate = `# Hands: implement one approved work item
 
@@ -81,6 +82,17 @@ change files outside \`completion_contract.expected_changed_files\`, or act on f
 this packet. Complete every required change unit and preserve every forbidden-change rule.
 If the packet is contradictory, report the exact unresolved requirement instead of applying
 a partial best-effort fix. Return only JSON matching the supplied result schema.
+Every \`unresolved_requirements[].requirement\` must quote one requirement string exactly from
+the referenced packet change unit. Never turn a verification success condition, command
+failure, sandbox limitation, or operational blocker into an unresolved change-unit requirement.
+\`status\` reports remediation completion: when every change unit is complete, return
+\`implemented\` even if a listed verification command failed or could not start; record that
+command outcome only in \`commands_attempted\`. For \`implemented\`, return exactly
+\`unresolved_requirements: []\` and \`blocker: null\`; never copy a verification-command failure
+into \`blocker\`. The controller independently verifies the change.
+Echo this controller-owned packet hash exactly as \`packet_sha256\`: {{fix_packet_sha256}}
+In \`commands_attempted\`, report only commands whose \`command_id\` and exact \`argv\` appear in
+the packet's \`verification.commands\`. Do not invent packet command IDs or report auxiliary commands.
 
 ## Active fix packet
 
@@ -181,6 +193,7 @@ export interface HandsFixPacketInput {
   contextAttempt?: number;
   profile?: Pick<RoleProfile, "model" | "reasoning_effort">;
   profileKind?: HandsProfileKind;
+  recoverStartedInvocation?: boolean;
   budget?: ResourceBudgetPort;
 }
 
@@ -322,7 +335,10 @@ export async function runHandsWorkItem(input: HandsWorkItemInput): Promise<Hands
     final: input.workItem.id === "integrated",
   };
   const suffix = profileKind === "backup" || attemptKind === "quality_recovery" ? `-${attemptKind}-${profileKind}` : "";
-  const artifactName = `hands-work-item-${id}-attempt-${attempt}${suffix}`;
+  const artifactName = await invocationArtifactName(
+    input.runDir,
+    `hands-work-item-${id}-attempt-${attempt}${suffix}`,
+  );
   await writeTextArtifact(input.runDir, `prompts/${artifactName}.md`, prompt);
   await writeTextArtifact(
     input.runDir,
@@ -451,9 +467,20 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
       profile: await readHandsFixPacketInvocationProfile(input.runDir, input.packet, input.actionAttempt),
     };
   }
-  if (await readOptionalValidatedArtifact(input.runDir, claimPath, fixPacketInvocationClaimSchema)) {
+  const existingClaim = await readOptionalValidatedArtifact(input.runDir, claimPath, fixPacketInvocationClaimSchema);
+  const profile = input.profile ?? input.intake.roles.hands;
+  const profileKind = input.profileKind ?? "primary";
+  if (existingClaim && !input.recoverStartedInvocation) {
     throw new Error(`Ambiguous Hands fix packet invocation for ${packet.provenance.packet_id} attempt ${input.actionAttempt}`);
   }
+  if (existingClaim && (
+    existingClaim.packet_id !== packet.provenance.packet_id
+    || existingClaim.packet_sha256 !== packetSha256
+    || existingClaim.action_attempt !== input.actionAttempt
+    || existingClaim.model !== profile.model
+    || existingClaim.reasoning_effort !== profile.reasoning_effort
+    || ("profile_kind" in existingClaim && existingClaim.profile_kind !== profileKind)
+  )) throw new Error("Authorized Hands fix packet recovery does not match its immutable invocation claim");
   const template = boundedContext ? await loadPromptTemplate("hands-fix-packet-v1") : legacyHandsFixPacketTemplate;
   const prompt = boundedContext
     ? renderTemplate(template, {
@@ -461,6 +488,7 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
           context_ref: boundedContext.context_ref,
           context: boundedContext.context,
           fix_packet: packet,
+          fix_packet_sha256: packetSha256,
           retry_supplement: supplement,
         }, null, 2),
       })
@@ -468,18 +496,21 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
         fix_packet_json: JSON.stringify(packet, null, 2), work_item_json: JSON.stringify(workItem, null, 2),
         source_context_json: JSON.stringify(input.relevantSourceContext, null, 2), evidence_context_json: JSON.stringify(input.evidenceContext, null, 2),
         completed_dependencies_json: JSON.stringify(input.completedDependencies, null, 2), current_diff: input.currentDiff,
-        supplement_json: JSON.stringify(supplement, null, 2),
+        supplement_json: JSON.stringify(supplement, null, 2), fix_packet_sha256: packetSha256,
       });
-  const artifactName = `hands-fix-packet-${artifactId(packet.provenance.packet_id)}-attempt-${input.actionAttempt}`;
+  const baseArtifactName = `hands-fix-packet-${artifactId(packet.provenance.packet_id)}-attempt-${input.actionAttempt}`;
+  const artifactName = existingClaim
+    ? await invocationArtifactName(input.runDir, baseArtifactName)
+    : baseArtifactName;
   await writeTextArtifact(input.runDir, `prompts/${artifactName}.md`, prompt);
   await writeTextArtifact(input.runDir, `schemas/${artifactName}.json`, `${JSON.stringify(fixPacketResultV1OutputSchema, null, 2)}\n`);
-  const profile = input.profile ?? input.intake.roles.hands;
-  const profileKind = input.profileKind ?? "primary";
-  await writeCreateOnceValidated(input.runDir, claimPath, {
-    packet_id: packet.provenance.packet_id, packet_sha256: packetSha256,
-    action_attempt: input.actionAttempt, model: profile.model, reasoning_effort: profile.reasoning_effort,
-    profile_kind: profileKind, state: "started",
-  }, fixPacketInvocationClaimSchema);
+  if (!existingClaim) {
+    await writeCreateOnceValidated(input.runDir, claimPath, {
+      packet_id: packet.provenance.packet_id, packet_sha256: packetSha256,
+      action_attempt: input.actionAttempt, model: profile.model, reasoning_effort: profile.reasoning_effort,
+      profile_kind: profileKind, state: "started",
+    }, fixPacketInvocationClaimSchema);
+  }
   const invocation = await input.codex.invoke({
     role: "hands", model: profile.model, reasoningEffort: profile.reasoning_effort, sandbox: "workspace-write", cwd: input.worktreePath,
     prompt, runDir: input.runDir, artifactName, outputSchema: fixPacketResultV1OutputSchema, outputParser: fixPacketResultV1Schema,

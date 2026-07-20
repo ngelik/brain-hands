@@ -32,6 +32,15 @@ export async function rewriteLegacyCheckoutSnapshot(
   return next;
 }
 
+/** Test-only downgrade for fixtures that need historical protocol semantics with current lineage state. */
+export async function rewriteLegacyWorkflowProtocol(runDir: string): Promise<RunManifestV2> {
+  const manifestPath = join(runDir, "manifest.json");
+  const current = runManifestV2Schema.parse(JSON.parse(await readFile(manifestPath, "utf8")));
+  const next = runManifestV2Schema.parse({ ...current, workflow_protocol: "legacy-v2" });
+  await writeFile(manifestPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  return next;
+}
+
 function inputValues(input: CreateRunLedgerV2Input): {
   repoRoot: string;
   originalRequest: string;

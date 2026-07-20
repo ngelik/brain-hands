@@ -16,6 +16,7 @@ import { writeTextArtifact } from "../core/ledger.js";
 import { loadPromptTemplate } from "../prompts/loader.js";
 import { renderTemplate } from "../prompts/renderer.js";
 import type { ResourceBudgetPort } from "../core/resource-budget.js";
+import { invocationArtifactName } from "./invocation-artifacts.js";
 
 export interface HandsSelfReviewInput {
   runDir: string;
@@ -130,7 +131,10 @@ export async function runHandsSelfReview(input: HandsSelfReviewInput): Promise<H
   }
 
   const id = artifactId(input.workItem.id);
-  const artifactName = `hands-self-review-${id}-attempt-${input.parentAttempt}-pass-${input.pass}`;
+  const baseArtifactName = `hands-self-review-${id}-attempt-${input.parentAttempt}-pass-${input.pass}`;
+  const artifactName = input.resumeBlockedClaim
+    ? await invocationArtifactName(input.runDir, baseArtifactName)
+    : baseArtifactName;
   const reportPath = `self-review/${id}/attempt-${input.parentAttempt}/pass-${input.pass}.json`;
   const claimPath = `self-review/${id}/attempt-${input.parentAttempt}/pass-${input.pass}.claim.json`;
   const activeActionId = input.activeAction?.action_id ?? null;
@@ -188,7 +192,15 @@ export async function runHandsSelfReview(input: HandsSelfReviewInput): Promise<H
       );
     }
 
-    const report = parseReport(invocation);
+    const parsedReport = parseReport(invocation);
+    const report = handsSelfReviewReportSchema.parse({
+      ...parsedReport,
+      work_item_id: input.workItem.id,
+      parent_attempt: input.parentAttempt,
+      mutation_kind: input.mutationKind,
+      pass: input.pass,
+      active_action_id: activeActionId,
+    });
     assertProvenance(report, input);
     await writeTextArtifact(
       input.runDir,

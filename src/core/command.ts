@@ -228,16 +228,19 @@ export function assertApprovedCommand(
     throw new Error("Verification command executable must be non-empty");
   }
 
-  for (const token of argv) {
+  const executableName = normalizedExecutable(executable);
+  for (const [index, token] of argv.entries()) {
     if (typeof token !== "string") {
       throw new Error("Verification command arguments must be strings");
     }
-    if (hasShellComposition(token)) {
+    const directNodeProgram = executableName === "node"
+      && index > 0
+      && (argv[index - 1] === "-e" || argv[index - 1] === "--eval");
+    if (!directNodeProgram && hasShellComposition(token)) {
       throw new Error(`Verification command contains forbidden shell syntax: ${token}`);
     }
   }
 
-  const executableName = normalizedExecutable(executable);
   if (SHELL_EXECUTABLES.has(executableName)) {
     throw new Error(`Shell executable is not allowed in verification commands: ${executable}`);
   }

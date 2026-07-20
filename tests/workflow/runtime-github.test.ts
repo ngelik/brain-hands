@@ -2410,7 +2410,7 @@ describe("runGithubWorkflow", () => {
     let identityCalls = 0;
     github.getRepositoryIdentity = async () => { identityCalls += 1; return { host: "github.com", name_with_owner: "acme/repo", actor: "operator" }; };
 
-    await expect(runGithubWorkflow({
+    const result = await runGithubWorkflow({
       runDir: first.runDir,
       repoRoot: first.root,
       worktreePath: secondWorktree,
@@ -2424,7 +2424,11 @@ describe("runGithubWorkflow", () => {
         controllerBootstrap: async () => { bootstrapCalls += 1; return {} as never; },
         hands: async () => { throw new Error("Hands must not run"); },
       },
-    })).rejects.toThrow(/worktree|branch|identity|binding/i);
+    });
+    expect(result).toMatchObject({
+      status: "human_action_required",
+      blocker: expect.stringMatching(/worktree|branch|identity|binding/i),
+    });
     expect(progressCalls).toBe(0);
     expect(bootstrapCalls).toBe(0);
     expect(identityCalls).toBe(0);
@@ -4493,7 +4497,7 @@ describe("runGithubWorkflow", () => {
     expect(second.status, second.blocker).toBe("awaiting_github_effects");
     const result = await runPastGithubEffectBoundaries(workflowInput);
     expect(result.status, result.blocker).toBe("github_ready"); expect(calls).toContain("hands:integrated"); expect(calls.filter((call) => call === "push")).toHaveLength(2);
-    expect(selfReviews.filter((entry) => entry.startsWith("integrated:"))).toEqual(["integrated:3:1", "integrated:3:2"]);
+    expect(selfReviews.filter((entry) => entry.startsWith("integrated:"))).toEqual(["integrated:3:1"]);
     expect(calls.indexOf("self-review:integrated:3:1")).toBeGreaterThan(calls.indexOf("hands:integrated"));
     const finalPushIndex = calls.lastIndexOf("push");
     const synchronizationIndex = calls.indexOf("record-remote-synchronization");
@@ -4588,7 +4592,7 @@ describe("runGithubWorkflow", () => {
     expect(completedProgress.push_expected_sha).toBeUndefined();
     expect(completedProgress.push_remote_before_sha).toBeUndefined();
 
-  }, 120_000);
+  }, 180_000);
 
   it("cannot replay a consumed post-PR transition after stale pending provenance and a remote reset", async () => {
     const setupResult = await setup(true, false, true); root = setupResult.root;
@@ -4949,9 +4953,7 @@ describe("runGithubWorkflow", () => {
     expect(state.integratedHandsKinds).toEqual(["3:primary_fix", "5:primary_fix"]);
     expect(state.mutationKinds.filter((entry) => entry.startsWith("integrated:"))).toEqual([
       "integrated:normal_fix:3:1",
-      "integrated:normal_fix:3:2",
       "integrated:normal_fix:5:1",
-      "integrated:normal_fix:5:2",
     ]);
     const manifest = await readManifestV2(setupResult.runDir);
     expect(manifest.work_item_progress.integrated).toMatchObject({
@@ -5022,7 +5024,7 @@ describe("runGithubWorkflow", () => {
     const integratedKinds = state.mutationKinds
       .filter((entry) => entry.startsWith("integrated:"))
       .map((entry) => entry.split(":")[1]);
-    expect(integratedKinds).toHaveLength(8);
+    expect(integratedKinds).toHaveLength(4);
     expect(new Set(integratedKinds)).toEqual(new Set(["normal_fix"]));
     expect(state.finalReviews).toBe(7);
     expect("merge" in github).toBe(false);

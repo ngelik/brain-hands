@@ -53,8 +53,9 @@ Planning requirements:
 - Use schema_version "2.0" and give every work item an id made only from letters, digits, `.`, `_`, and `-`, with dependencies by work-item id. Never use the reserved work-item id integrated.
 - Give every change unit, acceptance criterion, test, and verification command a stable unique id.
 - Make each change unit one operation against one exact file and one named target.
+- Every change unit must require a real repository byte change. Never use a change unit as an execution-only marker, and never require its target file to remain unchanged.
 - Map every file_contract target to exactly one change unit, and use that exact target string.
-- Keep every set-like array duplicate-free, including dependencies, evidence links, command links, completion lists, expected artifacts, and browser-check keys.
+- Keep every set-like array duplicate-free, including dependencies, evidence links, command links, completion lists, expected artifacts, and browser-check keys. Browser-check names and screenshot artifacts must also be unique across the whole plan, not only within one work item.
 - Link each acceptance criterion through satisfied_by to concrete change, test, or verification ids.
 - Freeze verification_commands[].argv and integration_verification as direct argv arrays. Each
   argv must start with an executable and must never contain a shell pipeline.

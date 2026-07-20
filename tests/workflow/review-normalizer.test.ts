@@ -283,24 +283,20 @@ describe("normalizeReviewInputs", () => {
     });
   });
 
-  it("turns a failed required command into an engine finding", () => {
+  it("rejects Verifier approval that contradicts a failed required command", () => {
     const verification = {
       ...passedEvidence,
       commands: [{ ...passedEvidence.commands[0], exit_code: 1 }],
     };
     const result = normalizeReviewInputs(input({ verification }));
 
-    expect(result.operational_blocker).toBeNull();
-    expect(result.findings[0]).toMatchObject({
-      source: "verification",
-      severity: "high",
-      disposition: "fix_in_scope",
-      criterion_ref: "BH-005:AC-3",
-      problem_class: "verification",
+    expect(result).toMatchObject({
+      findings: [],
+      operational_blocker: { code: "invalid_verifier_contract" },
     });
   });
 
-  it("normalizes missing required artifacts and failed browser checks as product findings", () => {
+  it("rejects Verifier approval that contradicts missing artifacts and failed browser checks", () => {
     const verification: VerificationEvidence = {
       ...passedEvidence,
       artifact_checks: [{ path: "reports/required.json", exists: false, required: true }],
@@ -322,19 +318,27 @@ describe("normalizeReviewInputs", () => {
     };
 
     const result = normalizeReviewInputs(input({ verification }));
+    expect(result).toMatchObject({
+      findings: [],
+      operational_blocker: { code: "invalid_verifier_contract" },
+    });
+  });
+
+  it("keeps a change request action queue bounded to Verifier findings when verification also failed", () => {
+    const verification = {
+      ...passedEvidence,
+      commands: [{ ...passedEvidence.commands[0], exit_code: 1 }],
+      artifact_checks: [{ path: "reports/required.json", exists: false, required: true }],
+    };
+    const result = normalizeReviewInputs(input({ review: findingReview(), verification }));
+
     expect(result.operational_blocker).toBeNull();
-    expect(result.findings).toEqual(expect.arrayContaining([
-      expect.objectContaining({ source: "verification", problem_class: "artifact" }),
-      expect.objectContaining({ source: "verification", problem_class: "browser" }),
-    ]));
-    const artifactFinding = result.findings.find((finding) => finding.problem_class === "artifact")!;
-    const browserFinding = result.findings.find((finding) => finding.problem_class === "browser")!;
-    expect(artifactFinding.evidence_refs).toEqual([passedEvidence.evidence_path]);
-    expect(browserFinding.evidence_refs).toEqual([
-      "reports/dashboard.json",
-      passedEvidence.evidence_path,
-    ].sort());
-    expect(browserFinding.evidence_refs).not.toContain("reports/dashboard.png");
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      source: "verifier",
+      normalized_location: "src/example.ts:12",
+      problem_class: "correctness",
+    });
   });
 
   it.each([
@@ -467,7 +471,7 @@ describe("normalizeReviewInputs", () => {
     expect(new Set(result.findings.map((finding) => finding.finding_id)).size).toBe(2);
   });
 
-  it("merges duplicate finding identities and preserves all evidence references", () => {
+  it("rejects approval when duplicate failed commands remain in verification evidence", () => {
     const verification = {
       ...passedEvidence,
       commands: [
@@ -477,11 +481,9 @@ describe("normalizeReviewInputs", () => {
     };
     const result = normalizeReviewInputs(input({ verification }));
 
-    expect(result.operational_blocker).toBeNull();
-    expect(result.findings).toHaveLength(1);
-    expect(result.findings[0].evidence_refs).toEqual(expect.arrayContaining([
-      "verification/issue-5/attempt-1/command-1.json",
-      "verification/second.json",
-    ]));
+    expect(result).toMatchObject({
+      findings: [],
+      operational_blocker: { code: "invalid_verifier_contract" },
+    });
   });
 });

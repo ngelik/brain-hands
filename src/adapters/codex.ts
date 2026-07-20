@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import type { ZodType } from "zod";
 import type {
@@ -403,7 +404,7 @@ async function withResourceBudget<T extends CodexInvokeResult>(
   }
   const claim = await input.budget.claim({
     kind: "model_invocation",
-    key: input.artifactName,
+    key: modelInvocationBudgetKey(input.artifactName),
     elapsed_reservation_ms: await reserveElapsedMs(),
   });
   try {
@@ -416,6 +417,10 @@ async function withResourceBudget<T extends CodexInvokeResult>(
     }
     throw error;
   }
+}
+
+export function modelInvocationBudgetKey(artifactName: string): string {
+  return `${artifactName}:invocation:${randomUUID()}`;
 }
 
 async function completeBudgetedInvocation(

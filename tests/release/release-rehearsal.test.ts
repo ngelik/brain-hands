@@ -123,6 +123,7 @@ describe("manual release rehearsal", () => {
       expect(child.terminate("SIGTERM")).toBe(true);
       const interrupted = await child.wait();
       expect(interrupted).toMatchObject({ exitCode: null, signal: "SIGTERM" });
+      await harness.waitForLedgerRecoverable(31_000);
 
       await harness.expectOneRun();
       await harness.expectStableLineage();

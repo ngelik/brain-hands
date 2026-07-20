@@ -40,9 +40,13 @@ import {
   buildReflectionEvidenceIndex,
   buildVerifierEvidenceIndex,
 } from "../../src/workflow/evidence-index.js";
+import { verificationContextCandidates } from "../../src/workflow/verification-context-fragments.js";
 import { persistWorkItemSummary } from "../../src/workflow/work-item-summaries.js";
 import { recordFindingRevision } from "../../src/workflow/findings.js";
 import {
+  boundedGeneratedLockfileDiff,
+  boundedHandsDiff,
+  boundedVerifierDiff,
   CONTEXT_LIMITS_V1,
   buildHandsContext,
   buildReflectionContext,
@@ -476,6 +480,9 @@ async function setVerificationAuthority(
         status: "in_progress",
         attempts: attempt,
         verification_path: evidencePath,
+        verification_scope: identity.scope,
+        verification_work_item_id: identity.work_item_id,
+        ...(identity.scope === "github" ? { verification_issue_number: identity.issue_number } : {}),
       },
     },
   });
@@ -559,6 +566,42 @@ describe("bounded role contexts", () => {
       .toEqual(first.bounded_evidence.map((record) => record.value));
   });
 
+  it("accepts an exact owned quality-gate evidence pointer between reviewer actions", async () => {
+    const run = await runDir();
+    const qualityIdentity: VerificationIdentity = {
+      scope: "local",
+      work_item_id: "BH-001:quality-gate:2000101:1:authority-0123456789abcdef",
+    };
+    await setVerificationAuthority(run, "BH-001", 2000101, {
+      identity: qualityIdentity,
+      commands: [{ command: "quality gate passed" }],
+    });
+    const manifest = await readManifestV2(run);
+    await updateManifestV2(run, {
+      work_item_progress: {
+        ...manifest.work_item_progress,
+        "BH-001": { ...manifest.work_item_progress["BH-001"]!, attempts: 1 },
+      },
+    });
+
+    const ref = await buildHandsContext(handsInput(run, { attempt: 2 }));
+    const context = await loadRoleContext(run, ref, "hands");
+    expect(context.role === "hands" ? context.bounded_evidence : [])
+      .toEqual(expect.arrayContaining([expect.objectContaining({ value: expect.objectContaining({ command: "quality gate passed" }) })]));
+  });
+
+  it("uses a fixed-length fragment namespace for long verification identities", async () => {
+    const run = await runDir();
+    const identity: VerificationIdentity = { scope: "local", work_item_id: "quality-gate-".repeat(8) };
+    const ref = await setVerificationAuthority(run, "BH-001", 1, {
+      identity,
+      commands: [{ command: "long identity passed" }],
+    });
+    const candidates = await verificationContextCandidates(run, ref, identity, true);
+    expect(candidates[0]!.ref.path).toMatch(/^contexts\/fragments\/verification\/sha256-[a-f0-9]{64}\//);
+    expect(candidates[0]!.ref.path.split("/")[3]!.length).toBeLessThanOrEqual(200);
+  });
+
   it("enforces exact UTF-8 diff and total-byte boundaries", async () => {
     const run = await runDir();
     const exactMultibyteDiff = "é".repeat(CONTEXT_LIMITS_V1.hands_diff_bytes / 2);
@@ -595,6 +638,77 @@ describe("bounded role contexts", () => {
       workItem: overItem,
       diff: "",
     }))).rejects.toThrow("Hands required context exceeds 65536 UTF-8 bytes");
+  });
+
+  it("summarizes an oversized generated lockfile section while preserving adjacent source patches", () => {
+    const source = [
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      "@@ -1 +1 @@",
+      "-{}",
+      "+{\"name\":\"example\"}",
+      "",
+    ].join("\n");
+    const lockSection = [
+      "diff --git a/package-lock.json b/package-lock.json",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/package-lock.json",
+      "@@ -0,0 +1 @@",
+      `+${"x".repeat(CONTEXT_LIMITS_V1.verifier_diff_bytes + 1)}`,
+      "",
+    ].join("\n");
+    const bounded = boundedGeneratedLockfileDiff(`${source}${lockSection}`);
+    expect(bounded).toContain("+{\"name\":\"example\"}");
+    expect(bounded).toContain("Generated lockfile diff summarized");
+    expect(bounded).toContain("Git patch section sha256 (not file content sha256):");
+    expect(bounded).toContain("Do not compare this patch-section metadata with the worktree file size or digest.");
+    expect(bounded).not.toContain("x".repeat(100));
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(CONTEXT_LIMITS_V1.verifier_diff_bytes);
+  });
+
+  it("summarizes the largest source patch sections until the Verifier diff is bounded", () => {
+    const smallSource = [
+      "diff --git a/src/App.tsx b/src/App.tsx",
+      "--- a/src/App.tsx",
+      "+++ b/src/App.tsx",
+      "@@ -1 +1 @@",
+      "-export const App = null;",
+      "+export const App = () => <main />;",
+      "",
+    ].join("\n");
+    const largeStyles = [
+      "diff --git a/src/styles.css b/src/styles.css",
+      "--- a/src/styles.css",
+      "+++ b/src/styles.css",
+      "@@ -0,0 +1 @@",
+      `+${"x".repeat(CONTEXT_LIMITS_V1.verifier_diff_bytes + 1)}`,
+      "",
+    ].join("\n");
+    const bounded = boundedVerifierDiff(`${smallSource}${largeStyles}`);
+    expect(bounded).toContain("+export const App = () => <main />;");
+    expect(bounded).toContain("Source patch section summarized for bounded Verifier context.");
+    expect(bounded).toContain("Path: src/styles.css");
+    expect(bounded).toContain("Git patch section sha256 (not file content sha256):");
+    expect(bounded).not.toContain("x".repeat(100));
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(CONTEXT_LIMITS_V1.verifier_diff_bytes);
+  });
+
+  it("summarizes structured source patches for a bounded Hands context", () => {
+    const patch = [
+      "diff --git a/src/styles.css b/src/styles.css",
+      "--- a/src/styles.css",
+      "+++ b/src/styles.css",
+      "@@ -0,0 +1 @@",
+      `+${"x".repeat(CONTEXT_LIMITS_V1.hands_diff_bytes + 1)}`,
+      "",
+    ].join("\n");
+    const bounded = boundedHandsDiff(patch);
+    expect(bounded).toContain("Source patch section summarized for bounded Hands context.");
+    expect(bounded).toContain("Path: src/styles.css");
+    expect(bounded).not.toContain("x".repeat(100));
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_diff_bytes);
   });
 
   it("omits semantic verification evidence when it exceeds the Hands evidence cap", async () => {

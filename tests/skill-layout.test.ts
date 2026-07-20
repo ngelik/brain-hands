@@ -400,9 +400,63 @@ describe("Brain Hands skill distribution", () => {
     expect(skill).toMatch(/`pending_action`.*separate from.*`plan_approval_request`/is);
   });
 
-  it("documents deterministic approval counts and same-run recovery", async () => {
-    const [readme, cliContract] = await Promise.all([
+  it("keeps the public README concise and routes detailed guidance to stable documents", async () => {
+    const [readme, userGuide, workflowDesign] = await Promise.all([
       readFile(join(root, "README.md"), "utf8"),
+      readFile(join(root, "docs", "USER-GUIDE.md"), "utf8"),
+      readFile(join(root, "agentic-codex-workflow.md"), "utf8"),
+    ]);
+
+    expect(readme.split(/\r?\n/).length).toBeLessThanOrEqual(300);
+
+    const mermaidDiagrams = readme.match(/```mermaid\n[\s\S]*?\n```/g) ?? [];
+    expect(mermaidDiagrams).toHaveLength(3);
+    for (const diagram of mermaidDiagrams) expect(diagram).toMatch(/^```mermaid\nflowchart /);
+
+    for (const workflow of ["Vanilla Codex", "Superpowers", "Brain Hands"]) {
+      expect(readme).toContain(workflow);
+    }
+    for (const command of [
+      "npm install -g @ngelik/brain-hands",
+      "codex plugin add brain-hands@brain-hands --json",
+      "brain-hands init --repo .",
+      "brain-hands preview --repo .",
+    ]) {
+      expect(readme).toContain(command);
+    }
+
+    for (const roleDefault of [
+      "| **Brain** | `gpt-5.6-sol`, high reasoning, read-only |",
+      "| **Hands** | `gpt-5.6-luna`, high reasoning, workspace-write |",
+      "| **Verifier** | `gpt-5.6-sol`, high reasoning, read-only |",
+      "| **Hands self-review** | Hands model, medium reasoning, 1 pass by default |",
+      "| **Reflection** | Brain model, medium reasoning, optional single pass |",
+    ]) {
+      expect(readme).toContain(roleDefault);
+    }
+    expect(readme).toContain("nested subagents and fan-out");
+    expect(readme).toContain("This is a cost-control strategy, not a fixed savings guarantee.");
+    expect(readme).toContain("usually makes more calls and can take longer than a one-shot Codex task");
+    expect(readme).toContain("https://learn.chatgpt.com/docs/agent-configuration/subagents");
+
+    expect(readme).toContain("https://github.com/ngelik/brain-hands/blob/main/docs/USER-GUIDE.md");
+    expect(readme).toContain("(agentic-codex-workflow.md)");
+    expect(userGuide.length).toBeGreaterThan(0);
+    expect(workflowDesign.length).toBeGreaterThan(0);
+
+    for (const deepHeading of [
+      "Run Artifacts",
+      "Same-run recovery order",
+      "ExecutionSpecV2 Contract",
+      "Remote synchronization assurance",
+    ]) {
+      expect(readme).not.toMatch(new RegExp(`^#{2,6} ${deepHeading}$`, "im"));
+    }
+  });
+
+  it("documents deterministic approval counts and same-run recovery", async () => {
+    const [userGuide, cliContract] = await Promise.all([
+      readFile(join(root, "docs", "USER-GUIDE.md"), "utf8"),
       readFile(join(skillRoot, "references", "cli-contract.md"), "utf8"),
     ]);
     const approvalRows = [
@@ -416,8 +470,8 @@ describe("Brain Hands skill distribution", () => {
       "| GitHub merge | Separate manual action |",
     ];
 
-    for (const row of approvalRows) expect(readme).toContain(row);
-    for (const surface of [readme, cliContract]) {
+    for (const row of approvalRows) expect(userGuide).toContain(row);
+    for (const surface of [userGuide, cliContract]) {
       expect(surface).toMatch(/same-run `resume`.*(?:does not ask|without asking).*again/is);
       expect(surface).toMatch(/cross-run (?:approval\s+)?carry-forward is unsupported/i);
       expect(surface).toMatch(/delta-first/i);
@@ -436,7 +490,7 @@ describe("Brain Hands skill distribution", () => {
 
   it("documents the same read-only preview contract on operator surfaces", async () => {
     const surfaces = await Promise.all([
-      readFile(join(root, "README.md"), "utf8"),
+      readFile(join(root, "docs", "USER-GUIDE.md"), "utf8"),
       readFile(join(skillRoot, "references", "cli-contract.md"), "utf8"),
     ]);
 
@@ -454,7 +508,7 @@ describe("Brain Hands skill distribution", () => {
     const surfaces = await Promise.all([
       readFile(join(skillRoot, "SKILL.md"), "utf8"),
       readFile(join(skillRoot, "references", "cli-contract.md"), "utf8"),
-      readFile(join(root, "README.md"), "utf8"),
+      readFile(join(root, "docs", "USER-GUIDE.md"), "utf8"),
       readFile(join(root, "agentic-codex-workflow.md"), "utf8"),
     ]);
     const commands = [
@@ -548,7 +602,7 @@ Risk acceptance never waives a remote synchronization blocker.
 
   it("documents one bounded non-waivable remote synchronization assurance section", async () => {
     const surfaces = await Promise.all([
-      readFile(join(root, "README.md"), "utf8"),
+      readFile(join(root, "docs", "USER-GUIDE.md"), "utf8"),
       readFile(join(root, "agentic-codex-workflow.md"), "utf8"),
     ]);
 
@@ -560,7 +614,7 @@ Risk acceptance never waives a remote synchronization blocker.
   it("documents the same same-run recovery order on every operator surface", async () => {
     const surfaces = await Promise.all([
       readFile(join(skillRoot, "SKILL.md"), "utf8"),
-      readFile(join(root, "README.md"), "utf8"),
+      readFile(join(root, "docs", "USER-GUIDE.md"), "utf8"),
       readFile(join(root, "agentic-codex-workflow.md"), "utf8"),
     ]);
     const ordered = [
@@ -606,7 +660,7 @@ Risk acceptance never waives a remote synchronization blocker.
         heading: "Local Development vs Stable CLI",
       },
       {
-        document: await readFile(join(root, "README.md"), "utf8"),
+        document: await readFile(join(root, "docs", "USER-GUIDE.md"), "utf8"),
         heading: "Development",
       },
     ];

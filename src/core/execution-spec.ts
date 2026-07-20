@@ -14,6 +14,7 @@ import type {
 import { usesDurableDiscoveryProtocol } from "./run-state.js";
 
 const VAGUE_REQUIREMENT = /\b(as needed|where appropriate|if necessary|properly|related changes?|and so on|etc\.)\b/i;
+const NO_OP_CHANGE_REQUIREMENT = /\b(?:perform no (?:content|byte) change|no (?:content|byte) change|remain(?:s)? (?:byte-for-byte )?unchanged)\b/i;
 const PATH_GLOB = /[*?\[\]]/;
 const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/;
 const CONTROL_CHARACTER = /\p{Cc}/u;
@@ -134,6 +135,8 @@ function readinessErrors(spec: ExecutionSpecV2, includeTestingFunnel: boolean): 
     for (const requirement of unit.requirements) {
       const vague = requirement.match(VAGUE_REQUIREMENT)?.[0];
       if (vague) errors.push(`${unit.id} contains vague requirement "${requirement}" (${vague})`);
+      const noOp = requirement.match(NO_OP_CHANGE_REQUIREMENT)?.[0];
+      if (noOp) errors.push(`${unit.id} change requirement contradicts operation ${unit.operation}: "${requirement}" (${noOp})`);
     }
   }
   for (const entry of spec.file_contract) {
@@ -271,6 +274,8 @@ function planReadinessErrorsWithFunnelPolicy(
       .map((error) => `${item.id}: ${error}`));
   const byId = new Map<string, ExecutionSpecV2>();
   const artifactKeys = new Map<string, string>();
+  const browserCheckNames = new Map<string, string>();
+  const browserScreenshotArtifacts = new Map<string, string>();
   for (const item of plan.work_items) {
     if (byId.has(item.id)) errors.push(`duplicate work item id ${item.id}`);
     byId.set(item.id, item);
@@ -278,6 +283,20 @@ function planReadinessErrorsWithFunnelPolicy(
     const existing = artifactKeys.get(artifactKey);
     if (existing && existing !== item.id) errors.push(`work item ids collide as artifact key ${artifactKey}: ${existing}, ${item.id}`);
     artifactKeys.set(artifactKey, item.id);
+    for (const check of item.browser_checks) {
+      const existingNameOwner = browserCheckNames.get(check.name);
+      if (existingNameOwner !== undefined) {
+        errors.push(`duplicate browser check name ${check.name} across work items ${existingNameOwner} and ${item.id}`);
+      } else {
+        browserCheckNames.set(check.name, item.id);
+      }
+      const existingScreenshotOwner = browserScreenshotArtifacts.get(check.screenshot_artifact);
+      if (existingScreenshotOwner !== undefined) {
+        errors.push(`duplicate browser screenshot artifact ${check.screenshot_artifact} across work items ${existingScreenshotOwner} and ${item.id}`);
+      } else {
+        browserScreenshotArtifacts.set(check.screenshot_artifact, item.id);
+      }
+    }
   }
   for (const item of plan.work_items) {
     for (const dependency of item.dependencies) {

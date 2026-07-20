@@ -94,8 +94,10 @@ exact slug, pass that wording to the matching model override flag. The engine
 resolves `Sol`, `flagship`, or `best` to `gpt-5.6-sol`; `Terra`, `balanced`, or
 `everyday` to `gpt-5.6-terra`; `Luna`, `fast`, or `efficient` to
 `gpt-5.6-luna`; `5.5` to `gpt-5.5`; and `5.5 Pro` to `gpt-5.5-pro`. Always
-display the resulting full preview so the user sees the canonical slug before
-the run starts.
+`Spark` or `Codex Spark` resolves to the text-only research-preview model
+`gpt-5.3-codex-spark`, for which Brain Hands recommends `high` reasoning.
+Always display the resulting full preview so the user sees the canonical slug
+and effective reasoning effort before the run starts.
 
 Do not infer which role an unscoped model request should change. Do not guess
 when wording does not resolve to one deterministic built-in choice; report the

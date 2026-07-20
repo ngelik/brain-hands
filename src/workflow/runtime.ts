@@ -228,6 +228,7 @@ import {
   commitReservedFixSlot,
   assertChargedFixSlot,
   requireClaimedReviewEffect,
+  recoverClaimedReviewEffectBeforeQueue,
   requireCompletedAdvanceEffect,
   loadPolicyCommitResult,
   recordPolicyCommitResult,
@@ -263,6 +264,8 @@ import {
   type VerifierEvidenceIndexPhase,
 } from "./evidence-index.js";
 import {
+  boundedGeneratedLockfileDiff,
+  boundedVerifierDiff,
   buildHandsContext,
   buildVerifierContext,
   handsContextPath,
@@ -312,9 +315,11 @@ export type RuntimeCheckpoint =
   | "after_queue_full_review"
   | "after_work_item_decision"
   | "after_work_item_cycle_started"
+  | "after_work_item_fix_effect_claim"
   | "after_work_item_convergence_report"
   | "after_work_item_effect"
   | "after_ordered_fix_effect_complete"
+  | "after_ordered_fix_effect_progress"
   | "after_ordered_recovery_outcome"
   | "after_work_item_advance_commit"
   | "after_work_item_commit_intent"
@@ -573,6 +578,23 @@ export async function bindApprovedRuntimeAuthority<T extends RunLocalWorkflowInp
   const requiresExactSnapshots = await requiresPinnedRuntimeAuthority(input.runDir, manifest);
   const deterministicWorktreePath = runWorktreePath(manifest.repo_root, manifest.run_id);
   const deterministicBranchName = runWorktreeBranchName(manifest.run_id);
+  if (manifest.approved_revision !== null && manifest.worktree_path !== null && !("repoRoot" in input)) {
+    const expectedCallerWorktree = manifest.worktree_path;
+    let callerMatchesManifest = false;
+    try {
+      callerMatchesManifest = await realpath(input.worktreePath) === await realpath(expectedCallerWorktree);
+    } catch {
+      // Missing or otherwise unreadable caller paths are authority mismatches,
+      // not raw filesystem errors that leak past the workflow boundary.
+    }
+    if (!callerMatchesManifest) {
+      throw new Error("Caller worktree differs from the canonical manifest checkout");
+    }
+  }
+  if (manifest.approved_revision !== null && "repoRoot" in input
+    && manifest.branch_name !== null && input.branchName !== manifest.branch_name) {
+    throw new Error("Caller branch differs from the canonical manifest branch");
+  }
   if (manifest.approved_revision !== null && requiresExactSnapshots) {
     if (manifest.source_commit === null) {
       throw new Error("Approved execution requires an immutable source commit");
@@ -582,9 +604,6 @@ export async function bindApprovedRuntimeAuthority<T extends RunLocalWorkflowInp
     }
     if (manifest.branch_name !== deterministicBranchName) {
       throw new Error("Manifest branch differs from the deterministic approved run branch");
-    }
-    if (await realpath(input.worktreePath) !== await realpath(deterministicWorktreePath)) {
-      throw new Error("Caller worktree differs from the canonical manifest checkout");
     }
     if ("repoRoot" in input && resolve(input.repoRoot) !== resolve(manifest.repo_root)) {
       throw new Error("Caller repository differs from the immutable run repository");
@@ -619,7 +638,13 @@ export async function bindApprovedRuntimeAuthority<T extends RunLocalWorkflowInp
     throw new Error("Manifest checkout differs from the deterministic approved run worktree");
   }
   const expectedWorktreePath = deterministicWorktreePath;
-  if (await realpath(input.worktreePath) !== await realpath(expectedWorktreePath)) {
+  let callerMatchesExpectedWorktree = false;
+  try {
+    callerMatchesExpectedWorktree = await realpath(input.worktreePath) === await realpath(expectedWorktreePath);
+  } catch {
+    // Normalize unreadable caller paths to the authority boundary below.
+  }
+  if (!callerMatchesExpectedWorktree) {
     throw new Error("Caller worktree differs from the canonical manifest checkout");
   }
   if ("repoRoot" in input && resolve(input.repoRoot) !== resolve(manifest.repo_root)) {
@@ -748,7 +773,12 @@ async function bindGithubRuntimePaths(input: Pick<RunGithubWorkflowInput, "repoR
     throw new Error("Run directory is not bound to the current GitHub repository root");
   }
   const translatedRunWorktree = join(control.path, "worktrees", basename(run.path));
-  const worktree = await captureRuntimeDirectory(input.worktreePath, "GitHub worktree", true, translatedRunWorktree);
+  let worktree: Awaited<ReturnType<typeof captureRuntimeDirectory>>;
+  try {
+    worktree = await captureRuntimeDirectory(input.worktreePath, "GitHub worktree", true, translatedRunWorktree);
+  } catch (error) {
+    throw new Error("GitHub worktree does not match the canonical manifest checkout", { cause: error });
+  }
   const worktreeRelative = relative(repository.realPath, worktree.realPath);
   if (worktreeRelative === ".." || worktreeRelative.startsWith(`..${sep}`) || isAbsolute(worktreeRelative)) {
     throw new Error("GitHub worktree is not bound to the current repository root");
@@ -1212,6 +1242,22 @@ function verificationProgressIdentity(identity: VerificationIdentity): Record<st
     verification_work_item_id: identity.work_item_id,
     ...(identity.scope === "github" ? { verification_issue_number: identity.issue_number } : {}),
   };
+}
+
+function identityFromVerificationEvidence(evidence: VerificationEvidence): VerificationIdentity {
+  if (evidence.verification_scope === "github") {
+    if (evidence.issue_number === undefined) {
+      throw new Error("GitHub verification evidence is missing its issue identity");
+    }
+    return { scope: "github", work_item_id: evidence.work_item_id, issue_number: evidence.issue_number };
+  }
+  if (evidence.verification_scope === "integrated") {
+    if (evidence.work_item_id !== "integrated") {
+      throw new Error("Integrated verification evidence has an invalid work-item identity");
+    }
+    return { scope: "integrated", work_item_id: "integrated" };
+  }
+  return { scope: "local", work_item_id: evidence.work_item_id };
 }
 
 function errorMessage(error: unknown): string {
@@ -3651,7 +3697,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       baseCommit,
       workItem,
     });
-    return scoped.patch.length > 0 ? scoped.patch : "# No local diff was detected.\n";
+    const patch = boundedGeneratedLockfileDiff(scoped.patch);
+    return patch.length > 0 ? patch : "# No local diff was detected.\n";
   };
   const currentDiff = async (workItem: WorkItem): Promise<string> => {
     if (legacyDiff) return legacyDiff(input.worktreePath);
@@ -3842,6 +3889,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     item: WorkItem,
     attempt: number,
     attemptKind: HandsAttemptKind,
+    diffScope: WorkItem = item,
   ): Promise<Pick<HandsWorkItemInput, "contextRef" | "context" | "contextPlanRevision"> | null> => {
     const authority = await captureBoundedWorkItemContext(item, attempt);
     if (authority === null) return null;
@@ -3858,7 +3906,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         attempt,
         attemptKind,
         workItem: item,
-        diff: await scopedDiffFromBase(item, authority.baseCommit),
+        diff: await scopedDiffFromBase(diffScope, authority.baseCommit),
       });
     }
     return {
@@ -3879,6 +3927,10 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       baseCommit: authority.baseCommit,
       workItem: item,
     });
+    const boundedSnapshot = {
+      ...snapshot,
+      patch: boundedVerifierDiff(snapshot.patch),
+    };
     const path = verifierContextPath(item.id, phase, attempt);
     let contextRef: ArtifactRefV1;
     try {
@@ -3901,8 +3953,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         phase,
         attempt,
         acceptanceContract: item.acceptance,
-        changedFiles: snapshot.changed_files,
-        diff: snapshot.patch,
+        changedFiles: boundedSnapshot.changed_files,
+        diff: boundedSnapshot.patch,
         evidenceIndexRef,
       });
     }
@@ -3914,7 +3966,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       attempt,
       evidenceIndexRef: context.evidence_index_ref,
     });
-    assertVerifierScopeSnapshot(context, snapshot, scopeAuthority);
+    assertVerifierScopeSnapshot(context, boundedSnapshot, scopeAuthority);
     return {
       contextRef,
       context,
@@ -4361,6 +4413,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     attempt: number,
     claimTransferCapable: boolean,
     invoke: (profile: HandsSelfReviewInput["profile"] | undefined, resumeBlockedClaim: boolean) => Promise<T>,
+    resumePrimaryBlockedClaim = false,
   ): Promise<T> => {
     const activeProfile = manifest.active_hands_profile === "backup" ? handsBackupPolicy?.profile : undefined;
     const completeClaimTransfer = async (): Promise<void> => {
@@ -4384,7 +4437,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       return result;
     }
     try {
-      return await invoke(undefined, false);
+      return await invoke(undefined, resumePrimaryBlockedClaim);
     } catch (error) {
       const usageLimited = error instanceof CodexInvocationError && error.result !== undefined && classifyCodexFailure(error.result) === "primary_usage_limit";
       const backup = handsBackupPolicy;
@@ -4607,6 +4660,30 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     let implementation = gateInput.implementation;
     let verification: VerificationEvidence;
     const reports: HandsSelfReviewReport[] = [];
+    const currentVerificationCommands = gateInput.workItem.verification_commands.map((command) => command.argv);
+    const originalActionCommands = gateInput.activeAction
+      ? gateInput.activeAction.re_verification
+        ?? gateInput.activeAction.remediation?.verification.commands.map((command) => command.argv)
+        ?? []
+      : currentVerificationCommands;
+    const originalActionArtifacts = gateInput.activeAction?.remediation?.verification.required_evidence
+      .filter((evidence) => evidence.kind === "artifact")
+      .map((evidence) => evidence.output_path) ?? expectedArtifacts;
+    const currentVerificationAuthority = {
+      commands: currentVerificationCommands,
+      expectedArtifacts,
+      browserChecks,
+      browser_evidence_identity_revision: browserChecks.length > 0 ? 3 : null,
+    };
+    const verificationAuthoritySuffix = JSON.stringify(originalActionCommands) === JSON.stringify(currentVerificationCommands)
+        && JSON.stringify(originalActionArtifacts) === JSON.stringify(expectedArtifacts)
+        && browserChecks.length === 0
+      ? ""
+      : `:authority-${createHash("sha256").update(JSON.stringify(currentVerificationAuthority)).digest("hex").slice(0, 16)}`;
+    const intermediateIdentity = (pass: number): VerificationIdentity => ({
+      scope: "local",
+      work_item_id: `${gateInput.workItem.id}:quality-gate:${gateInput.parentAttempt}:${pass === 0 ? "baseline" : pass}${verificationAuthoritySuffix}`,
+    });
 
     const accountSelfReviewMutation = async (report: HandsSelfReviewReport): Promise<void> => {
       if ((await readManifestV2(input.runDir)).review_policy_snapshot === undefined || report.changed_files.length === 0) return;
@@ -4647,9 +4724,9 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       const pass = currentProgress.self_review_pass ?? 0;
       const completedPass = currentProgress.self_review_state === "complete" ? pass : Math.max(0, pass - 1);
       const isFinal = configuredPasses === 0 || (completedPass === configuredPasses && configuredPasses > 0);
-      const identity: VerificationIdentity = isFinal
+      const identity: VerificationIdentity = isFinal && verificationAuthoritySuffix === ""
         ? finalIdentity
-        : { scope: "local", work_item_id: `${gateInput.workItem.id}:quality-gate:${gateInput.parentAttempt}:${completedPass === 0 ? "baseline" : completedPass}` };
+        : intermediateIdentity(completedPass);
       const attempt = isFinal ? gateInput.parentAttempt : 1;
       try {
         return await loadPersistedEvidence(input.runDir, currentProgress, identity, attempt);
@@ -4660,9 +4737,9 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
 
     const runAndPersistVerification = async (selfReviewPass?: number): Promise<VerificationEvidence> => {
       const isFinal = configuredPasses === 0 || selfReviewPass === configuredPasses;
-      const identity: VerificationIdentity = isFinal
+      const identity: VerificationIdentity = isFinal && verificationAuthoritySuffix === ""
         ? finalIdentity
-        : { scope: "local", work_item_id: `${gateInput.workItem.id}:quality-gate:${gateInput.parentAttempt}:${selfReviewPass ?? "baseline"}` };
+        : intermediateIdentity(selfReviewPass ?? 0);
       const attempt = isFinal ? gateInput.parentAttempt : 1;
       const raw = await verificationRunner({
         repoRoot: input.worktreePath,
@@ -4676,6 +4753,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         expectedArtifacts,
         browserChecks,
         attempt,
+        resumeExistingNamespace: true,
         progress: input.progress,
         progressContext: { workItem: { index: workItemIndex, total: gateInput.workItem.id === "integrated" ? orderedWorkItems.length + 1 : orderedWorkItems.length, attempt: gateInput.parentAttempt, final: gateInput.workItem.id === "integrated" } },
       });
@@ -4713,9 +4791,18 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       && progress.self_review_state !== undefined
       && typeof progress.verification_path === "string"
       && typeof progress.verification_path === "string";
-    verification = resumableQualityState
-      ? await loadQualityEvidence(progress)
-      : await runAndPersistVerification();
+    if (resumableQualityState) {
+      try {
+        verification = await loadQualityEvidence(progress);
+      } catch (error) {
+        if (verificationAuthoritySuffix === "" || !errorMessage(error).includes("Persisted verification")) throw error;
+        verification = await runAndPersistVerification((progress.self_review_pass ?? 0) > 0
+          ? progress.self_review_pass
+          : undefined);
+      }
+    } else {
+      verification = await runAndPersistVerification();
+    }
 
     for (let pass = 1; pass <= configuredPasses; pass += 1) {
       progress = (await readManifestV2(input.runDir)).work_item_progress[gateInput.workItem.id];
@@ -4785,7 +4872,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             resumeBlockedClaim,
             contextPlanRevision: budgetPlanRevision(),
             budget,
-          }));
+          }), passAlreadyStarted && progress?.self_review_state === "invoking");
           report = handsSelfReviewReportSchema.parse(result.report);
         } catch (error) {
           throw new HandsSelfReviewQualityGateError(`Hands self-review pass ${pass} failed: ${errorMessage(error)}`, { cause: error });
@@ -4836,7 +4923,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       }, [reportPath, ...(verification.evidence_path ? [verification.evidence_path] : [])]);
     }
 
-    if (verification.verification_scope !== finalIdentity.scope || verification.work_item_id !== finalIdentity.work_item_id || verification.attempt !== gateInput.parentAttempt) {
+    const expectedFinalIdentity = verificationAuthoritySuffix === "" ? finalIdentity : intermediateIdentity(configuredPasses);
+    if (verification.verification_scope !== expectedFinalIdentity.scope || verification.work_item_id !== expectedFinalIdentity.work_item_id || verification.attempt !== gateInput.parentAttempt) {
       verification = await runAndPersistVerification(configuredPasses);
     }
 
@@ -4859,11 +4947,35 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     const finalIdentity = validationInput.workItem.id === "integrated"
       ? integratedVerificationIdentity()
       : verificationIdentityForWorkItem(validationInput.workItem, githubDelivery, manifest);
+    const currentVerificationCommands = validationInput.workItem.verification_commands.map((command) => command.argv);
+    const originalActionCommands = validationInput.activeAction
+      ? validationInput.activeAction.re_verification
+        ?? validationInput.activeAction.remediation?.verification.commands.map((command) => command.argv)
+        ?? []
+      : currentVerificationCommands;
+    const expectedArtifacts = validationInput.workItem.expected_artifacts;
+    const originalActionArtifacts = validationInput.activeAction?.remediation?.verification.required_evidence
+      .filter((evidence) => evidence.kind === "artifact")
+      .map((evidence) => evidence.output_path) ?? expectedArtifacts;
+    const currentVerificationAuthority = {
+      commands: currentVerificationCommands,
+      expectedArtifacts,
+      browserChecks: validationInput.workItem.browser_checks,
+      browser_evidence_identity_revision: validationInput.workItem.browser_checks.length > 0 ? 3 : null,
+    };
+    const verificationAuthoritySuffix = JSON.stringify(originalActionCommands) === JSON.stringify(currentVerificationCommands)
+        && JSON.stringify(originalActionArtifacts) === JSON.stringify(expectedArtifacts)
+        && validationInput.workItem.browser_checks.length === 0
+      ? ""
+      : `:authority-${createHash("sha256").update(JSON.stringify(currentVerificationAuthority)).digest("hex").slice(0, 16)}`;
     const identityForPass = (pass: number): { identity: VerificationIdentity; attempt: number } => {
       const isFinal = configuredPasses === 0 || pass === configuredPasses;
-      return isFinal
+      return isFinal && verificationAuthoritySuffix === ""
         ? { identity: finalIdentity, attempt: validationInput.parentAttempt }
-        : { identity: { scope: "local", work_item_id: `${validationInput.workItem.id}:quality-gate:${validationInput.parentAttempt}:${pass === 0 ? "baseline" : pass}` }, attempt: 1 };
+        : { identity: {
+            scope: "local",
+            work_item_id: `${validationInput.workItem.id}:quality-gate:${validationInput.parentAttempt}:${pass === 0 ? "baseline" : pass}${verificationAuthoritySuffix}`,
+          }, attempt: isFinal ? validationInput.parentAttempt : 1 };
     };
     const mutationIdentity = identityForPass(0);
     const mutationPath = verificationEvidencePath(mutationIdentity.identity, mutationIdentity.attempt);
@@ -4917,16 +5029,18 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         finalVerification = await loadAtPath(evidencePath, passIdentity.identity, passIdentity.attempt);
       } else {
         const persistedPath = progress.self_review_verification_paths?.[String(pass)];
-        const finalFallbackPath = verificationEvidencePath(finalIdentity, validationInput.parentAttempt);
+        const finalPassIdentity = identityForPass(pass);
+        const finalFallbackPath = verificationEvidencePath(finalPassIdentity.identity, finalPassIdentity.attempt);
         if (persistedPath !== undefined && !(pass === configuredPasses && persistedPath === finalFallbackPath)) {
           throw new HandsSelfReviewQualityGateError(`Unchanged self-review pass ${pass} has unexpected verification evidence`);
         }
         if (persistedPath === finalFallbackPath) {
-          finalVerification = await loadAtPath(finalFallbackPath, finalIdentity, validationInput.parentAttempt);
+          finalVerification = await loadAtPath(finalFallbackPath, finalPassIdentity.identity, finalPassIdentity.attempt);
         }
       }
     }
-    const expectedFinalPath = verificationEvidencePath(finalIdentity, validationInput.parentAttempt);
+    const expectedFinalIdentity = identityForPass(configuredPasses);
+    const expectedFinalPath = verificationEvidencePath(expectedFinalIdentity.identity, expectedFinalIdentity.attempt);
     if (
       (configuredPasses > 0 && progress.self_review_pass !== configuredPasses)
       || (configuredPasses > 0 && progress.self_review_state !== "complete")
@@ -4963,8 +5077,16 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     workItem: WorkItem,
     active: ReviewerAction,
     completed: readonly ReviewerAction[],
+    packet?: ReviewFixPacketV1,
   ): WorkItem => {
-    const commands = actionCommands(active, completed);
+    const commands = packet
+      ? packet.verification.commands.map((command) => command.argv)
+      : actionCommands(active, completed);
+    const packetArtifacts = packet
+      ? packet.verification.required_evidence
+          .filter((evidence) => evidence.kind === "artifact")
+          .map((evidence) => evidence.output_path)
+      : [];
     return {
       ...workItem,
       objective: [
@@ -4977,6 +5099,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       verification_commands: commands.length > 0
         ? commands.map((argv, index) => ({ id: `review-action-${active.action_id}-${index + 1}`, argv, expected_exit_code: 0 as const }))
         : workItem.verification_commands,
+      expected_artifacts: [...new Set([...workItem.expected_artifacts, ...packetArtifacts])],
     };
   };
 
@@ -5050,6 +5173,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     completedActions: ReviewerAction[],
     supplement: FixAttemptSupplementV1 | null,
     claimedProfile?: PersistedHandsProfile,
+    recoverStartedInvocation = false,
   ): Promise<HandsWorkItemResult & { invocationProfile: HandsFixPacketInvocationProfile }> => {
     const itemIndex = orderedWorkItems.findIndex((candidate) => candidate.id === workItem.id) + 1;
     await input.progress?.emit({
@@ -5067,7 +5191,16 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     let invocation = {} as never;
     let invocationProfile: HandsFixPacketInvocationProfile;
     if (!packetResult) {
-      const boundedContext = await boundedHandsInvocationContext(workItem, mutationAttempt, "fix_packet");
+      const packetPaths = new Set(packet.remediation.allowed_files);
+      const packetDiffScope: WorkItem = {
+        ...workItem,
+        file_contract: workItem.file_contract.filter((contract) => packetPaths.has(contract.path)),
+        completion_contract: {
+          ...workItem.completion_contract,
+          expected_changed_files: packet.completion_contract.expected_changed_files,
+        },
+      };
+      const boundedContext = await boundedHandsInvocationContext(workItem, mutationAttempt, "fix_packet", packetDiffScope);
       const sourceContext = boundedContext ? [] : await Promise.all(packet.remediation.allowed_files.map(async (path) => ({
           path,
           content: await readFile(resolve(input.worktreePath, path), "utf8").catch(() => "[file unavailable]"),
@@ -5083,7 +5216,11 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         currentDiff: boundedContext ? "" : await currentDiff(workItem), supplement,
         ...(boundedContext ? { contextAttempt: mutationAttempt } : {}),
         ...(boundedContext ?? {}),
-        ...(claimedProfile ? { profile: { model: claimedProfile.model, reasoning_effort: claimedProfile.reasoning_effort } } : {}),
+        ...(claimedProfile ? {
+          profile: { model: claimedProfile.model, reasoning_effort: claimedProfile.reasoning_effort },
+          profileKind: claimedProfile.kind,
+        } : {}),
+        recoverStartedInvocation,
         budget,
       });
       packetResult = invoked.result;
@@ -5332,6 +5469,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     effectOwner?: string;
     policyCriterionAliases?: Readonly<Record<string, string>>;
     legacyQualityRecovery?: boolean;
+    recoverStartedPacketInvocation?: boolean;
   }): Promise<OrderedQueueResult> => {
     const policyEffect = queueInput.cycle !== undefined;
     const policyEffectAction = queueInput.cycle && isReviewEffectAction(queueInput.cycle.decision.action)
@@ -5645,7 +5783,10 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       const resumeQualityGate = (latestProgress?.mutation_kind === "reviewer_action"
           || latestProgress?.mutation_kind === "quality_recovery")
         && latestProgress.attempts === mutationAttempt
-        && typeof latestProgress.implementation_path === "string";
+        && latestProgress.active_action_id === activeAction.action_id
+        && latestProgress.active_action_attempt === activeAttempt
+        && typeof latestProgress.implementation_path === "string"
+        && latestProgress.implementation_path.endsWith(`/attempt-${mutationAttempt}.json`);
       if (!policyEffect && !resumeQualityGate && manifest.stage !== "fixing") {
         manifest = await transitionRun(input.runDir, "fixing", {
           actor: "runtime",
@@ -5678,8 +5819,9 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         });
       }
 
-      const scopedItem = actionScopedWorkItem(queueInput.workItem, activeAction, completed);
+      const scopedItem = actionScopedWorkItem(queueInput.workItem, activeAction, completed, packetState?.packet);
       const beforeDiffPath = `action-diffs/${queueArtifactId}/revision-${reviewRevision}/${activeAction.action_id}/attempt-${activeAttempt}-before.diff`;
+      const beforeFilesPath = `action-diffs/${queueArtifactId}/revision-${reviewRevision}/${activeAction.action_id}/attempt-${activeAttempt}-before-files.json`;
       let beforeDiff: string;
       try {
         beforeDiff = await readFile(resolve(input.runDir, beforeDiffPath), "utf8");
@@ -5687,6 +5829,21 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         beforeDiff = await currentDiff(scopedItem);
         await writeImmutableTextArtifact(input.runDir, beforeDiffPath, beforeDiff);
+      }
+      beforeDiff = boundedGeneratedLockfileDiff(beforeDiff);
+      let beforeFiles: string[];
+      try {
+        const persistedBeforeFiles = JSON.parse(await readFile(resolve(input.runDir, beforeFilesPath), "utf8")) as unknown;
+        if (!Array.isArray(persistedBeforeFiles)
+          || persistedBeforeFiles.some((path) => typeof path !== "string" || path.trim() === "")
+          || JSON.stringify(persistedBeforeFiles) !== JSON.stringify([...persistedBeforeFiles].sort())) {
+          throw new Error(`Persisted Reviewer action changed-file baseline is invalid: ${beforeFilesPath}`);
+        }
+        beforeFiles = persistedBeforeFiles;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        beforeFiles = [...await changedFiles(input.worktreePath)].sort();
+        await writeImmutableTextArtifact(input.runDir, beforeFilesPath, `${JSON.stringify(beforeFiles, null, 2)}\n`);
       }
       try {
         const actionMutationId = `${activeAction.action_id}:attempt-${activeAttempt}`;
@@ -5755,7 +5912,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
                   actionAttempt: activeAttempt, mutationAttempt,
                   invokeMutation: (profile) => invokePacketHands(
                     handsItem, packetState!.packet, activeAttempt, mutationAttempt,
-                    completed, packetSupplement, profile,
+                    completed, packetSupplement, profile, queueInput.recoverStartedPacketInvocation,
                   ),
                 })
               : await invokePacketHands(handsItem, packetState.packet, activeAttempt, mutationAttempt, completed, packetSupplement)
@@ -5780,10 +5937,13 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           if (packetState) {
             const completedOnlyFiles = new Set(completed.flatMap((action) => action.remediation?.completion_contract.expected_changed_files ?? []));
             const activeExpected = new Set(packetState.packet.completion_contract.expected_changed_files);
+            const existedBeforeAction = new Set(beforeFiles);
             const actual = await changedFiles(input.worktreePath);
             assertFixPacketChangedFiles(
               packetState.packet,
-              actual.filter((path) => activeExpected.has(path) || !completedOnlyFiles.has(path)),
+              actual.filter((path) =>
+                activeExpected.has(path)
+                || (!existedBeforeAction.has(path) && !completedOnlyFiles.has(path))),
             );
           }
           manifest = await setProgress(input.runDir, queueInput.workItem.id, {
@@ -6006,6 +6166,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       status: "in_progress",
       attempts: nextReviewPass,
       verification_path: savedEvidencePath,
+      ...verificationProgressIdentity(queueIdentity),
     }, [savedEvidencePath]);
     if (!policyEffect && manifest.stage !== "verifier_review") {
       manifest = await transitionRun(input.runDir, "verifier_review", {
@@ -6484,8 +6645,28 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
   };
 
   workItems: for (const [index, item] of orderedWorkItems.entries()) {
-    const progress = manifest.work_item_progress[item.id];
+    let progress = manifest.work_item_progress[item.id];
     const itemIdentity = verificationIdentityForWorkItem(item, githubDelivery, manifest);
+    if (
+      progress?.queue_state === "complete"
+      && typeof progress.verification_path === "string"
+      && progress.verification_scope === itemIdentity.scope
+      && typeof progress.verification_work_item_id === "string"
+      && progress.verification_work_item_id.startsWith(`${item.id}:quality-gate:`)
+      && progress.verification_work_item_id !== itemIdentity.work_item_id
+    ) {
+      const evidenceAttempt = Math.max(1, progress.attempts);
+      if (progress.verification_path !== verificationEvidencePath(itemIdentity, evidenceAttempt)) {
+        throw new Error(`Completed ordered fix queue evidence identity is invalid: ${item.id}`);
+      }
+      const correctedProgress = {
+        ...progress,
+        ...verificationProgressIdentity(itemIdentity),
+      };
+      await loadPersistedEvidence(input.runDir, correctedProgress, itemIdentity, evidenceAttempt);
+      manifest = await setProgress(input.runDir, item.id, correctedProgress, [progress.verification_path]);
+      progress = manifest.work_item_progress[item.id];
+    }
     const policyEnabled = manifest.review_policy_snapshot !== undefined;
     const provenanceIssue = policyEnabled
       ? workItemPolicyProvenanceIssue(manifest, approvedCriteria, item.id)
@@ -6629,7 +6810,15 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         }
         const attemptMatch = evidencePath.match(/\/attempt-(\d+)\//);
         if (!attemptMatch) throw new Error(`Completed ordered fix effect evidence attempt is invalid: ${item.id}`);
-        await loadPersistedEvidence(input.runDir, progress, itemIdentity, Number(attemptMatch[1]));
+        const evidenceAttempt = Number(attemptMatch[1]);
+        if (evidencePath !== verificationEvidencePath(itemIdentity, evidenceAttempt)) {
+          throw new Error(`Completed ordered fix effect evidence identity is invalid: ${item.id}`);
+        }
+        const baseVerificationProgress = {
+          ...progress,
+          ...verificationProgressIdentity(itemIdentity),
+        };
+        await loadPersistedEvidence(input.runDir, baseVerificationProgress, itemIdentity, evidenceAttempt);
         manifest = await readManifestV2(input.runDir);
         if (manifest.stage === "fixing") {
           manifest = await transitionRun(input.runDir, "verifying", { actor: "runtime", payload: { work_item_id: item.id, review_revision: cycle.review_revision, effect_complete: true } });
@@ -6638,9 +6827,9 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           manifest = await transitionRun(input.runDir, "verifier_review", { actor: "runtime", payload: { work_item_id: item.id, review_revision: cycle.review_revision, effect_complete: true } });
         }
         manifest = await setProgress(input.runDir, item.id, {
-          ...progress,
+          ...baseVerificationProgress,
           status: "in_progress",
-          attempts: Number(attemptMatch[1]),
+          attempts: evidenceAttempt,
           queue_state: "complete",
           active_action_id: null,
           active_action_attempt: 0,
@@ -6696,6 +6885,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           reportPath: runArtifactRelativePath(input.runDir, progress.implementation_path as string),
           invocation: {} as never,
         },
+        recoverStartedPacketInvocation: orderedRecoveryContext.gate.mode === "authorized_attempt",
       }, policyEffectOwner);
       if (queueResult.kind === "operationally_blocked") {
         const blocker = queueResult.blocker.message;
@@ -6754,11 +6944,13 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         attempts: queueResult.reviewPass,
         implementation_path: queueResult.implementationResult.reportPath,
         verification_path: queueResult.savedEvidencePath,
+        ...verificationProgressIdentity(itemIdentity),
         queue_state: "complete",
         review_path: undefined,
         review_cycle_path: undefined,
         review_effect_id: undefined,
       }, [queueResult.implementationResult.reportPath, queueResult.savedEvidencePath]);
+      await input.dependencies?.afterCheckpoint?.("after_ordered_fix_effect_progress");
       return runLocalWorkflowUnsafe(input);
     }
 
@@ -6998,10 +7190,26 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       && typeof progress.verification_path === "string"
       && typeof progress.blocker === "string"
       && progress.blocker.startsWith(`Verification failed for work item ${item.id}:`);
+    const retryInvalidVerifierContract = resumeStage === "verifier_review"
+      && progress?.status === "blocked"
+      && typeof progress.review_path === "string"
+      && typeof progress.blocker === "string"
+      && progress.blocker.startsWith("invalid_verifier_contract:");
+    const retryOperationalVerifierReview = resumeStage === "verifier_review"
+      && progress?.status === "blocked"
+      && (progress.blocker_code === "operational_blocker" || progress.blocker_code === "test_infrastructure_blocker");
+    const retryCompletedOperationalVerifierReview = retryOperationalVerifierReview
+      && typeof progress?.review_path === "string";
     let pass = retryBlockedVerification
       ? Math.max(1, progress.attempts)
+      : retryCompletedOperationalVerifierReview
+        ? Math.max(1, progress?.attempts ?? 1)
+      : retryOperationalVerifierReview
+        ? Math.max(0, (progress?.attempts ?? 1) - 1)
       : Math.max(0, (progress?.attempts ?? 1) - 1);
-    let resumeReview = ["verifier_review", "replanning", "awaiting_plan_approval"].includes(resumeStage);
+    let resumeReview = ["verifier_review", "replanning", "awaiting_plan_approval"].includes(resumeStage)
+      && !retryCompletedOperationalVerifierReview;
+    let resumeClaimedQueue = false;
     if (resumeStage === "fixing") {
       const recordedAttempts = Math.max(1, progress?.attempts ?? 1);
       const implementationPath = typeof progress?.implementation_path === "string"
@@ -7010,6 +7218,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       const implementationAttempt = implementationPath?.match(/\/attempt-(\d+)\.json$/)?.[1];
       const persistedFix = recordedAttempts > 1 && implementationAttempt === String(recordedAttempts);
       const previousReviewAttempt = persistedFix ? recordedAttempts - 1 : recordedAttempts;
+      let resumeClaimedReviewAttempt: number | null = null;
       if (policyEnabled && progress?.review_revision) {
         const cycle = reviewCycleStateSchema.parse(await readRunArtifact<unknown>(
           input.runDir,
@@ -7018,32 +7227,58 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         if (!isReviewEffectAction(cycle.decision.action)) {
           throw new Error(`Persisted work-item fix effect action is invalid: ${cycle.effect_id}`);
         }
-        const claimed = await claimReviewEffect({
-          run_dir: input.runDir,
-          cycle,
-          owner: policyEffectOwner,
-        });
-        if (claimed.status !== "complete") {
+        let claimed: Awaited<ReturnType<typeof claimReviewEffect>>;
+        try {
+          claimed = await claimReviewEffect({
+            run_dir: input.runDir,
+            cycle,
+            owner: policyEffectOwner,
+          });
+        } catch (error) {
+          if (!(error instanceof AmbiguousEffectError) || typeof progress.queue_path === "string") throw error;
+          claimed = await recoverClaimedReviewEffectBeforeQueue({
+            run_dir: input.runDir,
+            cycle,
+            owner: policyEffectOwner,
+            queue_persisted: false,
+          });
+        }
+        if (claimed.status === "complete") {
+          await incrementSuccessfulFix({
+            run_dir: input.runDir,
+            cycle,
+            owner: policyEffectOwner,
+            mutation_id: typeof progress.implementation_path === "string"
+              ? progress.implementation_path
+              : cycle.effect_id,
+            kind: "successful_fix",
+            effect_action: cycle.decision.action,
+          });
+          const afterFix = await readManifestV2(input.runDir);
+          manifest = await setProgress(input.runDir, item.id, {
+            ...(afterFix.work_item_progress[item.id] ?? progress),
+            review_cycle_path: undefined,
+            review_effect_id: undefined,
+          });
+        } else if (typeof progress.queue_path !== "string" && !persistedFix) {
+          const referencedAttempt = cycle.work_item_progress_reference?.attempts;
+          if (!Number.isInteger(referencedAttempt) || referencedAttempt! < 1) {
+            throw new Error(`Persisted work-item fix effect ${cycle.effect_id} is missing its review attempt`);
+          }
+          resumeClaimedQueue = true;
+          resumeClaimedReviewAttempt = referencedAttempt!;
+        } else {
           throw new Error(`Persisted work-item fix effect ${cycle.effect_id} is not complete`);
         }
-        await incrementSuccessfulFix({
-          run_dir: input.runDir,
-          cycle,
-          owner: policyEffectOwner,
-          mutation_id: typeof progress.implementation_path === "string"
-            ? progress.implementation_path
-            : cycle.effect_id,
-          kind: "successful_fix",
-          effect_action: cycle.decision.action,
-        });
-        const afterFix = await readManifestV2(input.runDir);
-        manifest = await setProgress(input.runDir, item.id, {
-          ...(afterFix.work_item_progress[item.id] ?? progress),
-          review_cycle_path: undefined,
-          review_effect_id: undefined,
-        });
       }
-      if (persistedFix) {
+      if (resumeClaimedQueue) {
+        const implementation = await loadPersistedImplementation(input.runDir, progress, item);
+        implementationResult = {
+          implementation,
+          reportPath: runArtifactRelativePath(input.runDir, progress!.implementation_path as string),
+          invocation: {} as never,
+        };
+      } else if (persistedFix) {
         try {
           if (progress?.mutation_kind === "quality_recovery") {
             await validateLegacyQualityRecoveryReport(item, progress.implementation_path as string);
@@ -7085,8 +7320,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           implementation_path: implementationResult.reportPath,
         }, [implementationResult.reportPath]);
       }
-      pass = previousReviewAttempt;
-      resumeReview = false;
+      pass = resumeClaimedQueue ? resumeClaimedReviewAttempt! - 1 : previousReviewAttempt;
+      resumeReview = resumeClaimedQueue;
     } else {
       const persistedImplementation = typeof progress?.implementation_path === "string"
         || resumeStage === "verifying"
@@ -7166,12 +7401,23 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     }
 
     if (["verifier_review", "replanning", "awaiting_plan_approval"].includes(resumeStage)) {
-      const validatedGate = qualityGatePolicy && progress?.queue_state !== "complete"
+      const validatedGate = qualityGatePolicy && progress?.queue_state !== "complete" && !retryOperationalVerifierReview
         ? await validatePersistedMutationQualityGate({ workItem: item, parentAttempt: Math.max(1, progress?.attempts ?? 1), expectedMutationKind: expectedMutationKind(Math.max(1, progress?.attempts ?? 1)), activeAction: null })
         : undefined;
       const persistedEvidence = validatedGate
         ? validatedGate.finalVerification
-        : await loadPersistedEvidence(input.runDir, progress, itemIdentity, Math.max(1, progress?.attempts ?? 1));
+        : retryOperationalVerifierReview
+          ? await loadPersistedEvidence(input.runDir, progress)
+          : await loadPersistedEvidence(input.runDir, progress, itemIdentity, Math.max(1, progress?.attempts ?? 1));
+      if (retryOperationalVerifierReview) {
+        const recoveredIdentity = identityFromVerificationEvidence(persistedEvidence);
+        validateEvidenceForIdentity(persistedEvidence, recoveredIdentity, Math.max(1, progress?.attempts ?? 1));
+        manifest = await setProgress(input.runDir, item.id, {
+          ...progress!,
+          ...verificationProgressIdentity(recoveredIdentity),
+        }, [persistedEvidence.evidence_path]);
+        progress = manifest.work_item_progress[item.id];
+      }
       if (validatedGate) implementationResult = { ...implementationResult, implementation: validatedGate.implementation };
       evidenceByItem[item.id] = persistedEvidence;
     }
@@ -7181,11 +7427,24 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       const resumingReview = resumeReview;
       let normalizedEvidence: VerificationEvidence;
       let savedEvidencePath: string;
+      let escalateFailedVerificationToVerifier = false;
       if (resumeReview) {
         normalizedEvidence = evidenceByItem[item.id] ?? (qualityGatePolicy && progress?.queue_state !== "complete"
           ? (await validatePersistedMutationQualityGate({ workItem: item, parentAttempt: reviewPass, expectedMutationKind: expectedMutationKind(reviewPass), activeAction: null })).finalVerification
           : await loadPersistedEvidence(input.runDir, progress, itemIdentity, reviewPass));
-        normalizedEvidence = validateEvidenceForIdentity(normalizedEvidence, itemIdentity, reviewPass);
+        normalizedEvidence = validateEvidenceForIdentity(
+          normalizedEvidence,
+          identityFromVerificationEvidence(normalizedEvidence),
+          reviewPass,
+        );
+        if (progress?.self_review_state === "complete" && typeof progress.self_review_pass === "number") {
+          const selfReviewPath = progress.self_review_paths?.[String(progress.self_review_pass)];
+          if (typeof selfReviewPath === "string") {
+            const lastSelfReview = await readHandsSelfReviewReportArtifact(input.runDir, selfReviewPath);
+            escalateFailedVerificationToVerifier = lastSelfReview.ready_for_resolution_check === false
+              && lastSelfReview.remaining_findings.length > 0;
+          }
+        }
         evidenceByItem[item.id] = normalizedEvidence;
         savedEvidencePath = normalizedEvidence.evidence_path;
         resumeReview = false;
@@ -7248,19 +7507,23 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
         }
         implementationResult = { ...implementationResult, implementation: gateResult.implementation };
+        const lastSelfReview = gateResult.selfReviews.at(-1);
+        escalateFailedVerificationToVerifier = lastSelfReview !== undefined
+          && lastSelfReview.ready_for_resolution_check === false
+          && lastSelfReview.remaining_findings.length > 0;
         normalizedEvidence = gateResult.finalVerification;
         savedEvidencePath = normalizedEvidence.evidence_path;
         evidenceByItem[item.id] = normalizedEvidence;
       }
       evidenceByItem[item.id] = normalizedEvidence;
       const verificationFailures = verificationFailureReasons(normalizedEvidence, item.browser_checks);
-      if (verificationFailures.length > 0) {
+      if (verificationFailures.length > 0 && !escalateFailedVerificationToVerifier) {
         const blocker = `Verification failed for work item ${item.id}: ${verificationFailures.join("; ")}`;
         manifest = await setProgress(input.runDir, item.id, {
           status: "blocked",
           attempts: reviewPass,
           verification_path: savedEvidencePath,
-          ...verificationProgressIdentity(itemIdentity),
+          ...verificationProgressIdentity(identityFromVerificationEvidence(normalizedEvidence)),
           blocker,
         }, [savedEvidencePath]);
         manifest = await updateManifestV2(input.runDir, {
@@ -7283,7 +7546,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           status: "in_progress",
           attempts: reviewPass,
           verification_path: savedEvidencePath,
-          ...verificationProgressIdentity(itemIdentity),
+          ...verificationProgressIdentity(identityFromVerificationEvidence(normalizedEvidence)),
         }, [savedEvidencePath]);
         manifest = await transitionRun(input.runDir, "verifier_review", {
           actor: "runtime",
@@ -7300,6 +7563,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         classification: { failure_class: "invocation_failure", blocker_code: "verifier_invocation_failed" },
       };
       const verifierRecoveryContext = policyEnabled && resumingReview && typeof progress?.review_path === "string"
+        && !retryInvalidVerifierContract && !retryOperationalVerifierReview
         ? null
         : await gateRetryableRuntimeOperation(verifierRecoveryOperation);
       if (verifierRecoveryContext?.gate.mode === "blocked") {
@@ -7311,6 +7575,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       }
       try {
         const persistedReviewPath = resumingReview && typeof progress?.review_path === "string"
+          && !retryInvalidVerifierContract && !retryOperationalVerifierReview
           ? progress.review_path
           : null;
         const recoverBoundedCompletionReview = !policyEnabled
@@ -7729,25 +7994,38 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             await input.dependencies?.afterCheckpoint?.("after_replan_effect_claim");
           }
         } catch (error) {
-          if (cycle.decision.action !== "create_replan" || !(error instanceof AmbiguousEffectError)) {
-            throw error;
+          if (isReviewEffectAction(cycle.decision.action) && error instanceof AmbiguousEffectError) {
+            const current = await readManifestV2(input.runDir);
+            const progress = current.work_item_progress[item.id];
+            if (progress?.review_effect_id !== cycle.effect_id) throw error;
+            claim = await recoverClaimedReviewEffectBeforeQueue({
+              run_dir: input.runDir,
+              cycle,
+              owner: policyEffectOwner,
+              queue_persisted: typeof progress.queue_path === "string",
+            });
+          } else {
+            if (cycle.decision.action !== "create_replan" || !(error instanceof AmbiguousEffectError)) {
+              throw error;
+            }
+            const { replan } = await loadReplan(true);
+            const replanPatchPath = controllerArtifactRelativePath(input.runDir, replanArtifactPathForValidation(input.runDir, replan.path));
+            const completed = await completeReviewEffect({
+              run_dir: input.runDir,
+              cycle,
+              owner: policyEffectOwner,
+              outcome: "complete",
+              result: { blocker: replanBlocker, replan_patch_path: replanPatchPath },
+            });
+            claim = { status: "complete", cycle: completed };
           }
-          const { replan } = await loadReplan(true);
-          const replanPatchPath = controllerArtifactRelativePath(input.runDir, replanArtifactPathForValidation(input.runDir, replan.path));
-          const completed = await completeReviewEffect({
-            run_dir: input.runDir,
-            cycle,
-            owner: policyEffectOwner,
-            outcome: "complete",
-            result: { blocker: replanBlocker, replan_patch_path: replanPatchPath },
-          });
-          claim = { status: "complete", cycle: completed };
         }
         const transition = workItemDecisionTransition(cycle.decision.action);
 
         if (isReviewEffectAction(cycle.decision.action)) {
           if (claim.status === "blocked") throw new Error(`Work-item fix effect ${cycle.effect_id} is blocked`);
           if (claim.status === "acquired") {
+            await input.dependencies?.afterCheckpoint?.("after_work_item_fix_effect_claim");
             manifest = await readManifestV2(input.runDir);
             const recoveryScopeId = `work-item:${item.id}`;
             const recoveryProgress = await buildRecoveryProgressSubject({
@@ -7789,6 +8067,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
                   operation: "work-item-fix",
                   effectAttemptId: cycle.effect_id,
                   decision: cycle.decision,
+                  ...(resumeClaimedQueue ? { observationStage: "verifier_review" as const } : {}),
                   reviewCyclePath: cycle.decision_path,
                   progress: recoveryProgress,
                   ownedEvidenceRefs: {
@@ -7843,6 +8122,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
                 reviewPass: pass,
                 policyCriterionAliases: criterionAliasesForAcceptance(item.acceptance, activePolicyCriteria),
                 implementationResult,
+                recoverStartedPacketInvocation: orderedRecoveryContext.gate.mode === "authorized_attempt",
               }, policyEffectOwner);
               if (queueResult.kind === "operationally_blocked") {
                 const blocker = queueResult.blocker.message;
@@ -7912,6 +8192,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
                   review_cycle_path: undefined,
                   review_effect_id: undefined,
                 }, [implementationResult.reportPath, savedEvidencePath]);
+                progress = manifest.work_item_progress[item.id];
                 pass = queueResult.reviewPass - 1;
                 resumeReview = true;
                 continue;
@@ -8226,6 +8507,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             manifest = await setProgress(input.runDir, item.id, {
               ...completionProgress,
               status: "complete",
+              blocker: undefined,
+              blocker_code: undefined,
               policy_commit_pending: false,
               summary_path: summary.path,
               summary_sha256: summary.sha256,
@@ -8236,6 +8519,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             manifest = await setProgress(input.runDir, item.id, {
               ...completionProgress,
               status: "complete",
+              blocker: undefined,
+              blocker_code: undefined,
               policy_commit_pending: false,
             }, completionArtifacts);
           }
@@ -8412,6 +8697,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           manifest = await setProgress(input.runDir, item.id, {
             ...completionProgress,
             status: "complete",
+            blocker: undefined,
+            blocker_code: undefined,
             review_revision: pass,
             summary_path: summary.path,
             summary_sha256: summary.sha256,
@@ -8421,6 +8708,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           manifest = await setProgress(input.runDir, item.id, {
             ...completionProgress,
             status: "complete",
+            blocker: undefined,
+            blocker_code: undefined,
           }, completionArtifacts);
         }
         await publishWorkItemStatus(item, index, "complete", pass, normalizedEvidence, reviewResult.review);
@@ -10659,6 +10948,9 @@ async function pinHistoricalCheckoutIfRequired(
     || approvalStart <= 1) return;
   if (manifest.source_commit === null) {
     throw new Error("Historical checkout migration requires a pinned source commit before worktree allocation");
+  }
+  if (await loadApprovedRuntimeSnapshot(input.runDir, input.config ?? defaultConfig()) === null) {
+    throw new Error("Historical checkout migration requires complete immutable approval evidence");
   }
   const sourceCommit = manifest.source_commit;
   const worktreePath = runWorktreePath(manifest.repo_root, manifest.run_id);

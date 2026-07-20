@@ -129,7 +129,12 @@ import {
   reconcileRecoveryJournal,
 } from "./workflow/recovery-ledger.js";
 import { recordControllerRecovery } from "./workflow/controller-recovery.js";
-import { advancePreparedRunToDiscovery, prepareFreshRun } from "./workflow/run-start.js";
+import { reconcileInterruptedResourceBudgetModelInvocation, reconcileResourceBudgetModelInvocation } from "./workflow/resource-budget.js";
+import {
+  advancePreparedRunToDiscovery,
+  prepareFreshRun,
+  retryRunPreflightToDiscovery,
+} from "./workflow/run-start.js";
 import * as replacementWorkflow from "./workflow/replacement.js";
 import { usesDurableDiscoveryProtocol } from "./core/run-state.js";
 
@@ -581,6 +586,13 @@ function parsePositiveInteger(value: string, flagName: string): number {
   if (!/^\d+$/.test(value)) throw new Error(`${flagName} must be a positive integer`);
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${flagName} must be a positive integer`);
+  return parsed;
+}
+
+function parseNonnegativeInteger(value: string, flagName: string): number {
+  if (!/^\d+$/.test(value)) throw new Error(`${flagName} must be a nonnegative integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${flagName} must be a nonnegative integer`);
   return parsed;
 }
 
@@ -1194,9 +1206,9 @@ function createDryRunLifecycleCodex(
           fixture = dryRunImplementation(match?.[1] ?? "integrated");
         }
       } else if (input.role === "verifier" && rehearsalScenario === "verifier-fix"
-        && /^verifier-fix-packet-.+-attempt-\d+$/.test(artifact)) {
+        && /^verifier-fix-packet-.+-attempt-\d+(?:-invocation-[a-zA-Z0-9-]+)?$/.test(artifact)) {
         const packetId = input.prompt.match(/"packet_id"\s*:\s*"([^"]+)"/)?.[1];
-        const actionAttempt = Number(artifact.match(/-attempt-(\d+)$/)?.[1]);
+        const actionAttempt = Number(artifact.match(/-attempt-(\d+)(?:-invocation-[a-zA-Z0-9-]+)?$/)?.[1]);
         if (!packetId || !Number.isSafeInteger(actionAttempt)) throw new Error("Dry-run fix packet review is missing its provenance");
         const packetSha256 = (await readFile(
           join(input.runDir, "reviews", "fix-packets", Buffer.from(packetId).toString("base64url"), "packet.sha256"),
@@ -2270,6 +2282,11 @@ export function buildCli(): Command {
       await assertCurrentControllerMatches(runDir, manifest);
       await reconcileClaimedInitialPlanBoundary(runDir);
       manifest = await requireV2Manifest(runDir, "resume");
+      if (manifest.stage === "preflight") {
+        manifest = await retryRunPreflightToDiscovery(runDir, {
+          dryRun: options.dryRun === true,
+        });
+      }
       if (manifest.stage === "brain_discovery") {
         const context = await loadDiscoveryCommandContext(runDir, options.dryRun === true);
         await runDiscoveryTurn({ runDir, ...context, progress: progress! });
@@ -2461,6 +2478,76 @@ export function buildCli(): Command {
       const status = await readOperatorStatus(runDir);
       console.log(options.json
         ? JSON.stringify({ transition: transition.artifact, transition_path: transition.artifact_path, status }, null, 2)
+        : renderRunStatus(status));
+    });
+
+  program.command("reconcile-budget-zero-token")
+    .description("Record evidence that a structured terminal provider error consumed zero model tokens")
+    .requiredOption("--run <runDir>", "Run directory")
+    .requiredOption("--claim <claimId>", "Uncertain model-invocation claim ID")
+    .requiredOption("--actor <actor>", "Operator recording the reconciliation")
+    .requiredOption("--reason <reason>", "Reason the evidence proves zero token usage")
+    .requiredOption("--evidence <path...>", "Owned run evidence paths proving the provider rejection")
+    .option("--json", "Print machine-readable output", false)
+    .action(async (options: {
+      run: string;
+      claim: string;
+      actor: string;
+      reason: string;
+      evidence: string[];
+      json: boolean;
+    }) => {
+      const runDir = await resolveRunDirectory(options.run);
+      const reconciliation = await reconcileResourceBudgetModelInvocation({
+        runDir,
+        claimId: options.claim,
+        actor: options.actor,
+        reason: options.reason,
+        evidenceRefs: options.evidence,
+        tokenUsage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 },
+      });
+      const status = await readOperatorStatus(runDir);
+      console.log(options.json
+        ? JSON.stringify({ reconciliation, status }, null, 2)
+        : renderRunStatus(status));
+    });
+
+  program.command("reconcile-budget-interrupted-model")
+    .description("Settle an interrupted started model invocation with explicit conservative usage")
+    .requiredOption("--run <runDir>", "Run directory")
+    .requiredOption("--claim <claimId>", "Open model-invocation claim ID")
+    .requiredOption("--actor <actor>", "Operator recording the reconciliation")
+    .requiredOption("--reason <reason>", "Reason for the conservative usage charge")
+    .requiredOption("--evidence <path...>", "Owned run evidence paths supporting the charge")
+    .requiredOption("--duration-ms <number>", "Conservative active duration in milliseconds", (value) => parsePositiveInteger(value, "--duration-ms"))
+    .requiredOption("--input-tokens <number>", "Conservative input token charge", (value) => parseNonnegativeInteger(value, "--input-tokens"))
+    .requiredOption("--cached-input-tokens <number>", "Conservative cached input token charge", (value) => parseNonnegativeInteger(value, "--cached-input-tokens"))
+    .requiredOption("--output-tokens <number>", "Conservative output token charge", (value) => parseNonnegativeInteger(value, "--output-tokens"))
+    .requiredOption("--reasoning-output-tokens <number>", "Conservative reasoning output token charge", (value) => parseNonnegativeInteger(value, "--reasoning-output-tokens"))
+    .option("--json", "Print machine-readable output", false)
+    .action(async (options: {
+      run: string; claim: string; actor: string; reason: string; evidence: string[];
+      durationMs: number; inputTokens: number; cachedInputTokens: number;
+      outputTokens: number; reasoningOutputTokens: number; json: boolean;
+    }) => {
+      const runDir = await resolveRunDirectory(options.run);
+      const settlement = await reconcileInterruptedResourceBudgetModelInvocation({
+        runDir,
+        claimId: options.claim,
+        actor: options.actor,
+        reason: options.reason,
+        evidenceRefs: options.evidence,
+        durationMs: options.durationMs,
+        tokenUsage: {
+          input_tokens: options.inputTokens,
+          cached_input_tokens: options.cachedInputTokens,
+          output_tokens: options.outputTokens,
+          reasoning_output_tokens: options.reasoningOutputTokens,
+        },
+      });
+      const status = await readOperatorStatus(runDir);
+      console.log(options.json
+        ? JSON.stringify({ ...settlement, status }, null, 2)
         : renderRunStatus(status));
     });
 

@@ -14,6 +14,7 @@ const requiredScripts = {
   "test:built-cli": "vitest run tests/workflow/e2e-dry-run.test.ts tests/workflow/canonical-session-built-cli.test.ts",
   "test:all:no-build": "vitest run",
   "verify:funnel": "node scripts/verify-repository.mjs",
+  "verify:focused": "node scripts/verify-repository.mjs --focused",
 } as const;
 
 async function loadPackageJson(): Promise<PackageJson> {
@@ -26,6 +27,7 @@ describe("package verification scripts", () => {
 
     expect(scripts.test).toBe(requiredScripts.test);
     expect(scripts["verify:funnel"]).toBe(requiredScripts["verify:funnel"]);
+    expect(scripts["verify:focused"]).toBe(requiredScripts["verify:focused"]);
   });
 
   it("defines the exact non-overlapping verification layers", async () => {
@@ -43,6 +45,7 @@ describe("package verification scripts", () => {
     const funnelScripts = [
       "test",
       "verify:funnel",
+      "verify:focused",
       "test:static-contract",
       "test:cross-cutting",
       "test:built-cli",

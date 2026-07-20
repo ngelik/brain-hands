@@ -247,6 +247,47 @@ describe("writeConvergenceReport", () => {
     ]);
   });
 
+  it("accepts an immutable resumed Verifier artifact for the same work item and attempt", async () => {
+    const input = await exhaustedInput();
+    const reference = input.cycle.work_item_progress_reference!;
+    const resumedPath = reference.review_path.replace(/\.json$/, "-resume-2.json");
+    await writeFile(join(input.run_dir, resumedPath), await readFile(join(input.run_dir, reference.review_path)));
+
+    await expect(loadCurrentCycleEvidence(input.run_dir, {
+      ...input.cycle,
+      work_item_progress_reference: { ...reference, review_path: resumedPath },
+    })).resolves.toEqual([resumedPath, reference.verification_path]);
+  });
+
+  it("accepts legacy bounded reviews that name owned command evidence from the canonical attempt", async () => {
+    const input = await exhaustedInput();
+    const reference = input.cycle.work_item_progress_reference!;
+    const reviewPath = join(input.run_dir, reference.review_path);
+    const persisted = JSON.parse(await readFile(reviewPath, "utf8")) as Record<string, unknown>;
+    await writeFile(reviewPath, `${JSON.stringify({
+      ...persisted,
+      evidence_reviewed: [`${dirname(reference.verification_path)}/command-1.json`],
+    })}\n`);
+
+    await expect(loadCurrentCycleEvidence(input.run_dir, input.cycle)).resolves.toEqual([
+      reference.review_path,
+      reference.verification_path,
+    ]);
+  });
+
+  it("rejects a resumed Verifier artifact outside the owned attempt namespace", async () => {
+    const input = await exhaustedInput();
+    const reference = input.cycle.work_item_progress_reference!;
+
+    await expect(loadCurrentCycleEvidence(input.run_dir, {
+      ...input.cycle,
+      work_item_progress_reference: {
+        ...reference,
+        review_path: `reviews/item_with_spaces/attempt-${reference.attempts + 1}-resume-2.json`,
+      },
+    })).rejects.toThrow("Cycle-owned review path");
+  });
+
   it("records exhausted convergence without rewriting history", async () => {
     const input = await exhaustedInput();
     const path = await writeConvergenceReport(input);

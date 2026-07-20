@@ -100,11 +100,22 @@ export const resourceBudgetCompletionV1Schema = z.object({
   }
 });
 
+export const resourceBudgetReconciliationV1Schema = z.object({
+  schema_version: z.literal(1),
+  claim_id: z.string().regex(/^budget-claim:[a-f0-9]{64}$/),
+  reconciled_at: z.string().datetime({ offset: true }),
+  actor: z.string().trim().min(1).max(200),
+  reason: z.string().trim().min(1).max(1_000),
+  evidence_refs: z.array(z.string().trim().min(1).max(512)).min(1),
+  token_usage: tokenUsageSchema,
+}).strict();
+
 export type ResourceBudgetPolicyV1 = z.infer<typeof resourceBudgetPolicyV1Schema>;
 export type ResourceBudgetClaimKind = z.infer<typeof resourceBudgetClaimKindSchema>;
 export type ResourceBudgetClaimV1 = z.infer<typeof resourceBudgetClaimV1Schema>;
 export type TokenUsage = z.infer<typeof tokenUsageSchema>;
 export type ResourceBudgetCompletionV1 = z.infer<typeof resourceBudgetCompletionV1Schema>;
+export type ResourceBudgetReconciliationV1 = z.infer<typeof resourceBudgetReconciliationV1Schema>;
 
 export interface ResourceBudgetUsage {
   model_invocations: number;
@@ -181,6 +192,7 @@ export function reduceResourceBudgetArtifacts(
   rawPolicy: ResourceBudgetPolicyV1,
   rawClaims: readonly ResourceBudgetClaimV1[],
   rawCompletions: readonly ResourceBudgetCompletionV1[],
+  rawReconciliations: readonly ResourceBudgetReconciliationV1[] = [],
 ): ResourceBudgetUsage {
   const policy = resourceBudgetPolicyV1Schema.parse(rawPolicy);
   const claimsByIdentity = new Map<string, ResourceBudgetClaimV1>();
@@ -232,6 +244,24 @@ export function reduceResourceBudgetArtifacts(
     completionsByClaimId.set(completion.claim_id, completion);
   }
 
+  const reconciliationsByClaimId = new Map<string, ResourceBudgetReconciliationV1>();
+  for (const rawReconciliation of rawReconciliations) {
+    const reconciliation = resourceBudgetReconciliationV1Schema.parse(rawReconciliation);
+    const claim = claimsById.get(reconciliation.claim_id);
+    const completion = completionsByClaimId.get(reconciliation.claim_id);
+    if (claim?.kind !== "model_invocation" || completion === undefined) {
+      throw new Error(`Resource budget reconciliation ${reconciliation.claim_id} requires a completed model claim`);
+    }
+    if (completion.token_usage !== null || !completion.structured_terminal_error) {
+      throw new Error(`Resource budget reconciliation ${reconciliation.claim_id} requires an uncertain structured terminal error`);
+    }
+    const existing = reconciliationsByClaimId.get(reconciliation.claim_id);
+    if (existing !== undefined && artifactBytes(existing) !== artifactBytes(reconciliation)) {
+      throw new Error(`Conflicting resource budget reconciliation for ${reconciliation.claim_id}`);
+    }
+    reconciliationsByClaimId.set(reconciliation.claim_id, reconciliation);
+  }
+
   let modelInvocations = 0;
   let workflowAttempts = 0;
   let totalTokens = 0;
@@ -256,11 +286,12 @@ export function reduceResourceBudgetArtifacts(
     }
 
     if (claim.kind !== "model_invocation") continue;
-    if (completion?.token_usage !== null && completion?.token_usage !== undefined) {
-      totalTokens = safeAdd(totalTokens, completion.token_usage.input_tokens, "total tokens");
-      totalTokens = safeAdd(totalTokens, completion.token_usage.output_tokens, "total tokens");
-      cachedInputTokens = safeAdd(cachedInputTokens, completion.token_usage.cached_input_tokens, "cached input tokens");
-      reasoningOutputTokens = safeAdd(reasoningOutputTokens, completion.token_usage.reasoning_output_tokens, "reasoning output tokens");
+    const tokenUsage = completion?.token_usage ?? reconciliationsByClaimId.get(claim.claim_id)?.token_usage;
+    if (tokenUsage !== undefined && tokenUsage !== null) {
+      totalTokens = safeAdd(totalTokens, tokenUsage.input_tokens, "total tokens");
+      totalTokens = safeAdd(totalTokens, tokenUsage.output_tokens, "total tokens");
+      cachedInputTokens = safeAdd(cachedInputTokens, tokenUsage.cached_input_tokens, "cached input tokens");
+      reasoningOutputTokens = safeAdd(reasoningOutputTokens, tokenUsage.reasoning_output_tokens, "reasoning output tokens");
       continue;
     }
     const provenZero = completion !== undefined

@@ -531,6 +531,37 @@ describe("createReplanPatch", () => {
     await expect(createReplanPatch(input)).rejects.toThrow(/not cross[_ -]cutting/i);
   });
 
+  it("canonicalizes an added impact command to the cross-cutting tier", async () => {
+    const command = {
+      id: "BH-005-VERIFY-02",
+      argv: ["node", "node_modules/vitest/vitest.mjs", "run"],
+      expected_exit_code: 0 as const,
+      tier: "focused" as const,
+      satisfies: ["BH-005-AC-01"],
+    };
+    const input = await validInput(validPatch({
+      added_change_units: [{
+        id: "BH-005-CH-99",
+        path: "src/helper.ts",
+        target: "Shared helper",
+        operation: "create",
+        requirements: ["Provide the verified shared behavior."],
+        satisfies: ["BH-005-AC-01"],
+      }],
+      added_verification_commands: [command],
+      added_cross_cutting_impacts: [{
+        change_unit_id: "BH-005-CH-99",
+        category: "shared_helper",
+        callers: ["src/BH-005.ts"],
+        representative_fixtures: ["tests/BH-005.test.ts"],
+        verification_command_ids: [command.id],
+      }],
+    }));
+
+    const result = await createReplanPatch(input);
+    expect(result.patch.added_verification_commands[0]?.tier).toBe("cross_cutting");
+  });
+
   it("rejects an added verification command linked to an unknown acceptance ID", async () => {
     const input = await validInput(validPatch({
       added_verification_commands: [{
@@ -585,11 +616,12 @@ describe("createReplanPatch", () => {
   it("accepts repository source alongside run-owned replan evidence", async () => {
     const input = await validInput();
     const repositoryEvidence = "src/replan-evidence.ts";
+    const repositoryEvidenceRef = `${repositoryEvidence}:1`;
     await mkdir(join(input.repo_root, "src"), { recursive: true });
     await writeFile(join(input.repo_root, repositoryEvidence), "export const evidence = true;\n");
     const convergenceFile = join(input.run_dir, convergencePath);
     const convergence = JSON.parse(await readFile(convergenceFile, "utf8"));
-    convergence.evidence_refs = [...cycleEvidencePaths, repositoryEvidence].sort();
+    convergence.evidence_refs = [...cycleEvidencePaths, repositoryEvidenceRef].sort();
     await writeFile(convergenceFile, `${JSON.stringify(convergence)}\n`);
     input.evidence_paths = convergence.evidence_refs;
 
@@ -599,11 +631,65 @@ describe("createReplanPatch", () => {
     expect(input.brain.calls).toHaveLength(1);
   });
 
+  it("retries a claimed create-replan effect only when no invocation prompt exists", async () => {
+    const input = await validInput();
+    await expect(createReplanPatch({ ...input, existing_only: true })).resolves.toMatchObject({
+      patch: { target_work_item_id: "BH-005" },
+    });
+    expect(input.brain.calls).toHaveLength(1);
+
+    await rm(root!, { recursive: true, force: true });
+    root = undefined;
+    const ambiguous = await validInput();
+    await mkdir(join(ambiguous.run_dir, "prompts"), { recursive: true });
+    await writeFile(
+      join(ambiguous.run_dir, "prompts/replans-work-item-QkgtMDA1-base-1-review-1.md"),
+      "persisted invocation boundary\n",
+    );
+    await expect(createReplanPatch({ ...ambiguous, existing_only: true }))
+      .rejects.toThrow(/ambiguous create_replan effect/i);
+    expect(ambiguous.brain.calls).toHaveLength(0);
+  });
+
+  it("recovers a completed replan response when the immutable patch write was interrupted", async () => {
+    const input = await validInput();
+    const artifactName = "replans-work-item-QkgtMDA1-base-1-review-1";
+    await mkdir(join(input.run_dir, "prompts"), { recursive: true });
+    await mkdir(join(input.run_dir, "responses"), { recursive: true });
+    await writeFile(join(input.run_dir, "prompts", `${artifactName}.md`), "persisted invocation boundary\n");
+    await writeFile(join(input.run_dir, "responses", `${artifactName}.json`), `${JSON.stringify(validPatch())}\n`);
+
+    const result = await createReplanPatch({ ...input, existing_only: true });
+
+    expect(result.patch.target_work_item_id).toBe("BH-005");
+    expect(input.brain.calls).toHaveLength(0);
+    expect(JSON.parse(await readFile(result.path, "utf8"))).toMatchObject({
+      patch: { target_work_item_id: "BH-005" },
+    });
+  });
+
   it("accepts the run-owned original request as replan evidence", async () => {
     const input = await validInput();
     const convergenceFile = join(input.run_dir, convergencePath);
     const convergence = JSON.parse(await readFile(convergenceFile, "utf8"));
     convergence.evidence_refs = [...cycleEvidencePaths, "original-request.md"].sort();
+    await writeFile(convergenceFile, `${JSON.stringify(convergence)}\n`);
+    input.evidence_paths = convergence.evidence_refs;
+
+    await expect(createReplanPatch(input)).resolves.toMatchObject({
+      patch: { target_work_item_id: "BH-005" },
+    });
+    expect(input.brain.calls).toHaveLength(1);
+  });
+
+  it("accepts controller-owned context fragments as replan evidence", async () => {
+    const input = await validInput();
+    const contextPath = "contexts/fragments/verification/sha256-test/browser_evidence-0.json";
+    await mkdir(join(input.run_dir, "contexts/fragments/verification/sha256-test"), { recursive: true });
+    await writeFile(join(input.run_dir, contextPath), "{}\n");
+    const convergenceFile = join(input.run_dir, convergencePath);
+    const convergence = JSON.parse(await readFile(convergenceFile, "utf8"));
+    convergence.evidence_refs = [...cycleEvidencePaths, contextPath].sort();
     await writeFile(convergenceFile, `${JSON.stringify(convergence)}\n`);
     input.evidence_paths = convergence.evidence_refs;
 
@@ -840,6 +926,26 @@ describe("createReplanPatch", () => {
 
     await expect(createReplanPatch(input)).rejects.toThrow(/too_big|4000|4,000|finding.*context/i);
     expect(input.brain.calls).toHaveLength(0);
+  });
+
+  it("allows a bounded replan prompt larger than the legacy 32 KB ceiling", async () => {
+    const target = plan.work_items[0]!;
+    const largePlan: BrainPlan = {
+      ...plan,
+      work_items: [{
+        ...target,
+        change_units: target.change_units.map((unit, index) => index === 0
+          ? { ...unit, requirements: [...unit.requirements, "x".repeat(40_000)] }
+          : unit),
+      }, plan.work_items[1]!],
+    };
+    const input = await validInput(validPatch(), [], {}, largePlan);
+
+    await expect(createReplanPatch(input)).resolves.toMatchObject({
+      patch: { target_work_item_id: "BH-005" },
+    });
+    expect(Buffer.byteLength(input.brain.calls[0]!.prompt, "utf8")).toBeGreaterThan(32_000);
+    expect(Buffer.byteLength(input.brain.calls[0]!.prompt, "utf8")).toBeLessThan(96_000);
   });
 
   it.each([
@@ -1771,10 +1877,21 @@ describe("approvePreparedReplanRevision", () => {
         },
       },
     })).rejects.toThrow("injected direct replan event crash");
-    expect((await readManifestV2(input.run_dir)).pending_plan_approval).toBeNull();
+    const crashed = await readManifestV2(input.run_dir);
+    expect(crashed.pending_plan_approval).toBeNull();
+    const legacyProgress = { ...crashed.work_item_progress["BH-005"]! };
+    delete legacyProgress.approved_replan_history;
+    delete legacyProgress.last_approved_replan_target_work_item_id;
+    delete legacyProgress.last_approved_replan_revision;
+    delete legacyProgress.last_approved_replan_patch_path;
+    await updateManifestV2(input.run_dir, {
+      work_item_progress: { ...crashed.work_item_progress, "BH-005": legacyProgress },
+    });
 
     await approvePreparedReplanRevision(input.run_dir, "BH-005", 2);
     await approvePreparedReplanRevision(input.run_dir, "BH-005", 2);
+    expect((await readManifestV2(input.run_dir)).work_item_progress["BH-005"])
+      .toMatchObject({ approved_replan_history: [expect.objectContaining({ review_revision: 1 })] });
     const events = (await readFile(join(input.run_dir, "events.jsonl"), "utf8"))
       .split("\n").filter(Boolean).map((line) => JSON.parse(line));
     expect(events.filter((event) => event.type === "plan_approved" && event.payload.revision === 2)).toHaveLength(1);
@@ -1801,6 +1918,29 @@ describe("approvePreparedReplanRevision", () => {
     const events = (await readFile(join(input.run_dir, "events.jsonl"), "utf8"))
       .split("\n").filter(Boolean).map((line) => JSON.parse(line));
     expect(events.filter((event) => event.type === "plan_approved" && event.payload.revision === 2)).toHaveLength(1);
+  });
+
+  it("replays an approved direct replan after later convergence replaces the manifest summary", async () => {
+    const input = await pendingApproval();
+    await approvePreparedReplanRevision(input.run_dir, "BH-005", 2);
+    const approved = await readManifestV2(input.run_dir);
+    await updateManifestV2(input.run_dir, {
+      stage: "implementing",
+      convergence_reports: {
+        ...approved.convergence_reports,
+        "BH-005": {
+          path: "reviews/convergence/later-advance.json",
+          plan_revision: 2,
+          review_revision: 2,
+          recommended_action: "advance",
+        },
+      },
+    });
+
+    await continueApprovedReplanRevision(input.run_dir, 2, {
+      approvalControllerCapture: async () => ({ provenance: recordedController, selfHosting: false }),
+    });
+    expect((await readManifestV2(input.run_dir)).approved_revision).toBe(2);
   });
 
   it("rejects an exact serialized no-op before writing a request", async () => {
@@ -2107,6 +2247,25 @@ describe("approvePreparedReplanRevision", () => {
 
   it("applies only the approved target patch and reuses its worktree", async () => {
     const input = await pendingApproval();
+    await updateManifestV2(input.run_dir, {
+      recovery: {
+        version: 1,
+        active_scope: "work-item:BH-005",
+        scopes: {
+          "work-item:BH-005": {
+            version: 1,
+            head_sequence: 1,
+            head_decision_path: "recovery/scopes/test/decisions/000001.json",
+            blocker_fingerprint: "a".repeat(64),
+            progress_subject_sha256: "b".repeat(64),
+            consecutive_without_progress: 1,
+            disposition: "active",
+            diagnostic_path: null,
+            authorization_path: null,
+          },
+        },
+      },
+    });
     const before = await readManifestV2(input.run_dir);
     const preparedPlanBytes = await readFile(join(input.run_dir, "plans/revision-2.md"), "utf8");
     const request = await readVerifiedPlanApprovalRequest(input.run_dir, before);
@@ -2119,6 +2278,7 @@ describe("approvePreparedReplanRevision", () => {
     expect(after.worktree_path).toBe(before.worktree_path);
     expect(after.branch_name).toBe(before.branch_name);
     expect(after.source_commit).toBe(before.source_commit);
+    expect(after.recovery.active_scope).toBeNull();
     expect(after.work_item_progress["BH-006"]).toEqual(before.work_item_progress["BH-006"]);
     expect(after.work_item_progress["BH-005"]).toMatchObject({
       fix_cycles_used: 0,
@@ -2127,6 +2287,11 @@ describe("approvePreparedReplanRevision", () => {
       completed_action_ids: ["R1-A1"],
       self_review_pass: 2,
       self_review_paths: { "1": "self-reviews/BH-005/pass-1.json" },
+      approved_replan_history: [expect.objectContaining({
+        target_work_item_id: "BH-005",
+        plan_revision: 2,
+        review_revision: before.work_item_progress["BH-005"]!.review_revision,
+      })],
     });
     expect(after.work_item_progress["BH-005"]).not.toHaveProperty("verification_path");
     expect(after.work_item_progress["BH-005"]).not.toHaveProperty("review_cycle_path");

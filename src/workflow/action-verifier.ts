@@ -691,25 +691,81 @@ export async function verifyReviewFixPacket(input: VerifyReviewFixPacketInput): 
     assertObservedFixPacketEvidence(input.packet, existing, verificationEvidence);
     return { review: existing, reviewPath, invocation: {} as never };
   }
+  const expectedPacketSha256 = hashReviewFixPacket(input.packet);
+  const bindProvenance = (candidate: FixPacketResolutionV1): FixPacketResolutionV1 => {
+    const packetCommands = new Map(input.packet.verification.commands.map((command) => [command.id, command.argv]));
+    const requiredEvidence = new Map(input.packet.verification.required_evidence.map((entry) => [entry.id, entry]));
+    const sameArgv = (left: readonly string[] | undefined, right: readonly string[]) => JSON.stringify(left ?? []) === JSON.stringify(right);
+    const conditionResults = candidate.condition_results.map((result) => {
+      const condition = input.packet.verification.success_conditions.find((entry) => entry.id === result.success_condition_id);
+      if (!condition) return result;
+      const refs: string[] = [];
+      const linked = condition.satisfied_by.map((id) => requiredEvidence.get(id)).filter((entry) => entry !== undefined);
+      const commandIds = new Set(condition.satisfied_by.filter((id) => packetCommands.has(id)));
+      for (const entry of linked) if (packetCommands.has(entry.source_id)) commandIds.add(entry.source_id);
+      for (const commandId of commandIds) {
+        const argv = packetCommands.get(commandId)!;
+        for (const observed of verificationEvidence.commands.filter((entry) => sameArgv(entry.argv, argv))) {
+          refs.push(observed.result_path ?? observed.stdout_path);
+        }
+      }
+      for (const entry of linked) {
+        if (entry.kind === "artifact" && (verificationEvidence.artifacts.includes(entry.output_path)
+          || verificationEvidence.artifact_checks.some((check) => check.path === entry.output_path && check.exists))) {
+          refs.push(entry.output_path);
+        }
+        if (entry.kind === "browser") {
+          for (const observed of verificationEvidence.browser_evidence.filter((browser) =>
+            browser.evidence_report_path === entry.output_path || browser.screenshot_artifact === entry.output_path)) {
+            refs.push(observed.evidence_report_path ?? observed.screenshot_artifact);
+          }
+        }
+      }
+      return refs.length > 0 ? { ...result, evidence_refs: [...new Set(refs)] } : result;
+    });
+    return fixPacketResolutionV1Schema.parse({
+      ...candidate,
+      packet_id: input.packet.provenance.packet_id,
+      packet_sha256: expectedPacketSha256,
+      action_attempt: input.actionAttempt,
+      condition_results: conditionResults,
+    });
+  };
+  const artifactName = `verifier-fix-packet-${packetId}-attempt-${input.actionAttempt}`;
+  const legacyResponse = await readFile(resolve(input.runDir, `responses/${artifactName}.json`), "utf8")
+    .then((content) => bindProvenance(fixPacketResolutionV1Schema.parse(JSON.parse(content))))
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+  if (legacyResponse) {
+    assertFixPacketResolutionMatchesPacket(input.packet, legacyResponse);
+    assertObservedFixPacketEvidence(input.packet, legacyResponse, verificationEvidence);
+    await writeCreateOnce(input.runDir, reviewPath, `${JSON.stringify(legacyResponse, null, 2)}\n`);
+    return { review: legacyResponse, reviewPath, invocation: {} as never };
+  }
   const template = await loadPromptTemplate("verifier-fix-packet-resolution-v1");
   const prompt = renderTemplate(template, {
     fix_packet_json: JSON.stringify(input.packet, null, 2), before_diff: input.beforeDiff, after_diff: input.afterDiff,
     verification_json: JSON.stringify(verificationEvidence, null, 2), self_review_reports_json: JSON.stringify(input.selfReviewReports, null, 2),
+    packet_id: input.packet.provenance.packet_id,
+    packet_sha256: expectedPacketSha256,
+    action_attempt: String(input.actionAttempt),
   });
-  const artifactName = `verifier-fix-packet-${packetId}-attempt-${input.actionAttempt}`;
   await writeCreateOnce(input.runDir, `prompts/${artifactName}.md`, prompt);
   await writeCreateOnce(input.runDir, `schemas/${artifactName}.json`, `${JSON.stringify(fixPacketResolutionV1OutputSchema, null, 2)}\n`);
   const profile = input.intake.roles.verifier;
+  const invocationArtifactName = `${artifactName}-invocation-${randomUUID()}`;
   const invocation = await input.codex.invoke({
     role: "verifier", model: profile.model, reasoningEffort: profile.reasoning_effort, sandbox: "read-only", cwd: input.worktreePath,
-    prompt, runDir: input.runDir, artifactName, outputSchema: fixPacketResolutionV1OutputSchema, outputParser: fixPacketResolutionV1Schema,
+    prompt, runDir: input.runDir, artifactName: invocationArtifactName, outputSchema: fixPacketResolutionV1OutputSchema, outputParser: fixPacketResolutionV1Schema,
     budget: input.budget,
     attemptKey: input.planRevision === undefined
       ? undefined
       : `focused-verifier:${input.planRevision}:${input.packet.provenance.work_item_id}:${input.reviewRevision ?? input.actionAttempt}:${input.actionId ?? input.packet.provenance.packet_id}:${input.actionAttempt}`,
   });
   if (invocation.exitCode !== 0 || invocation.parsed === undefined) throw new Error(`Verifier packet resolution failed for ${input.packet.provenance.packet_id}`);
-  const review = fixPacketResolutionV1Schema.parse(invocation.parsed);
+  const review = bindProvenance(fixPacketResolutionV1Schema.parse(invocation.parsed));
   if (review.packet_id !== input.packet.provenance.packet_id || review.packet_sha256 !== hashReviewFixPacket(input.packet) || review.action_attempt !== input.actionAttempt) {
     throw new Error("Verifier packet resolution provenance does not match the active packet");
   }

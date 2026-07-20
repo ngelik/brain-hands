@@ -82,6 +82,18 @@ describe("progress human-view reducer", () => {
     ]);
   });
 
+  it("labels model item errors as non-terminal provider progress", async () => {
+    const rows: string[] = [];
+    const view = createProgressViewReducer({ emit: (row) => { rows.push(row); } });
+
+    await view.push(event({ code: "progress_warning", source: "verifier", modelInvocationId: invocationId, warningKind: "item_error" }, 1));
+    await view.flush();
+
+    expect(rows).toEqual([
+      "2026-07-16 20:05:01 UTC  Model progress reported a non-terminal item error",
+    ]);
+  });
+
   it("emits human rows incrementally when follow receives a transition", async () => {
     const rows: string[] = [];
     const view = createProgressViewReducer({ emit: (row) => { rows.push(row); } });

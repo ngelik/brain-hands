@@ -57,6 +57,7 @@ import {
   candidateSha256,
   diagnosticFingerprint,
   isStrictDiagnosticImprovement,
+  planningRepairAttemptLimit,
   planRepairResponseOutputSchema,
   planRepairResponseSchema,
 } from "./plan-repair.js";
@@ -486,8 +487,11 @@ async function repairPlanCandidate(
 }
 
 export async function planRunV2(input: PlanRunV2Input): Promise<PlanRunV2Result> {
-  const maxRepairs = Math.max(0, input.maxSemanticRetries ?? 2);
   let manifest = await readManifestV2(input.runDir);
+  const maxRepairs = planningRepairAttemptLimit(
+    Math.max(0, input.maxSemanticRetries ?? 2),
+    manifest.controller_recovery.transition_count,
+  );
   if (manifest.stage !== "brain_planning") {
     return planRunV2Attempt(input, { attemptKey: `brain:plan:${manifest.run_id}:full:1` }, null);
   }

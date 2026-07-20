@@ -2,8 +2,18 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createRunLedgerV2, readManifestV2, recordTerminalDisposition } from "../../src/core/ledger.js";
-import { assertCurrentControllerMatches, captureControllerProvenance, hashRuntimeTree } from "../../src/core/controller-provenance.js";
+import {
+  createRunLedgerV2,
+  readManifestV2,
+  recordTerminalDisposition,
+  withRunLedgerCompoundTransaction,
+} from "../../src/core/ledger.js";
+import {
+  assertApprovalControllerMatches,
+  assertCurrentControllerMatches,
+  captureControllerProvenance,
+  hashRuntimeTree,
+} from "../../src/core/controller-provenance.js";
 import { abandonRun } from "../../src/workflow/assurance.js";
 import { execa } from "execa";
 import type { ControllerProvenance } from "../../src/core/types.js";
@@ -55,6 +65,32 @@ afterEach(async () => {
 });
 
 describe("controller recovery", () => {
+  it("accepts the recovered controller at the plan approval boundary", async () => {
+    const repoRoot = await packageFixture();
+    const original = provenance(repoRoot, "a".repeat(64));
+    const ledger = await createRunLedgerV2({
+      repoRoot,
+      originalRequest: "recover approval controller",
+      sourceCommit: original.candidate_commit,
+      controllerProvenance: original,
+    });
+    const current = { ...original, package_hash: "b".repeat(64) };
+    exposeCurrent(current);
+    const recovered = await recordControllerRecovery({
+      runDir: ledger.runDir,
+      actor: "operator@example.test",
+      reason: "Install reviewed approval controller bytes",
+      expectedPackageSha256: current.package_hash,
+    });
+
+    await expect(withRunLedgerCompoundTransaction(ledger.runDir, async (transaction) =>
+      assertApprovalControllerMatches(
+        transaction.runDir,
+        await transaction.readManifestV2(),
+        async () => ({ provenance: current, selfHosting: true }),
+      ))).resolves.toBeUndefined();
+  });
+
   it("rejects a wrong expected hash without mutating the run", async () => {
     const repoRoot = await packageFixture();
     const original = provenance(repoRoot, "a".repeat(64));
@@ -117,8 +153,8 @@ describe("controller recovery", () => {
       plan_revisions: before.plan_revisions,
       approved_revision: before.approved_revision,
     });
-    const { updated_at: _beforeUpdated, controller_recovery: _beforeRecovery, ...beforeWorkflow } = before;
-    const { updated_at: _afterUpdated, controller_recovery: _afterRecovery, ...afterWorkflow } = result.manifest;
+    const { updated_at: _beforeUpdated, controller_recovery: _beforeRecovery, execution_epoch: _beforeEpoch, ...beforeWorkflow } = before;
+    const { updated_at: _afterUpdated, controller_recovery: _afterRecovery, execution_epoch: _afterEpoch, ...afterWorkflow } = result.manifest;
     expect(afterWorkflow).toEqual(beforeWorkflow);
     await expect(recordControllerRecovery({
       runDir: ledger.runDir,

@@ -2021,6 +2021,10 @@ export async function withRunLedgerTransaction<T>(
             [input.work_item_id]: input.next_progress,
             ...(hasSourceUpdate ? { [input.source_work_item_id!]: input.next_source_progress! } : {}),
           },
+          recovery: {
+            ...current.recovery,
+            active_scope: null,
+          },
           last_blocker: null,
           execution_lease: null,
           updated_at: new Date().toISOString(),
@@ -4379,7 +4383,7 @@ export async function verifyPlanApprovalSubject(
 ): Promise<VerifiedPlanApproval | null> {
   const verified = await verifyPersistedPlanApprovalSubject(runDir, manifest, revision);
   if (verified === null) return null;
-  await assertApprovalControllerMatches(manifest, approvalControllerCapture);
+  await assertApprovalControllerMatches(runDir, manifest, approvalControllerCapture);
   return verified;
 }
 
@@ -4858,7 +4862,7 @@ function mutableArtifactTargetTypeError(target: string): NodeJS.ErrnoException {
 export async function writeTextArtifact(
   runDir: string,
   relativePath: string,
-  content: string,
+  content: string | Buffer,
 ): Promise<string> {
   const lexicalTarget = resolveAndValidateArtifactPath(runDir, relativePath);
   const protectedLog = ["events.jsonl", "progress.jsonl", "session-events.jsonl"].find((name) => lexicalTarget === resolve(runDir, name));
@@ -4888,7 +4892,7 @@ export async function writeTextArtifact(
   let renamed = false;
   try {
     if (!(await handle.stat()).isFile()) throw new Error("Mutable artifact temporary target must be a regular file");
-    await handle.writeFile(content, "utf8");
+    await handle.writeFile(content);
     await handle.sync();
     await handle.close();
     await assertDirectoryIdentity(parent, "Mutable artifact parent");

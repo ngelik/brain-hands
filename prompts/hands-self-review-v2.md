@@ -28,6 +28,9 @@ Required report provenance:
 - pass: {{self_review_pass}}
 - active_action_id: {{self_review_active_action_id}}
 
+These coordinates identify the parent mutation being reviewed. They remain unchanged even when this
+self-review pass applies a fix; the controller binds them to the values above.
+
 Inspect the diff and evidence independently. Do not expand scope. Explicitly preserve completed actions and their verified behavior.
 
 Scope for this pass:

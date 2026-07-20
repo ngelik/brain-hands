@@ -46,6 +46,25 @@ describe("fix packets", () => {
     await expect(persistReviewFixPacket(root, { ...packet, diagnosis: { ...packet.diagnosis, observed_behavior: "Different" } })).rejects.toThrow(/conflict|exist/i);
   });
 
+  it("maps a verifier-confused acceptance reference to the claim's success-condition IDs", () => {
+    const workItem = executionSpec("item-1");
+    const criterionRef = workItem.acceptance[0]!.id;
+    const claim = validClaimFor(workItem);
+    claim.remediation.change_units[0]!.satisfies = [criterionRef];
+    const packet = compileReviewFixPacket({
+      claim,
+      work_item: workItem,
+      finding_id: "finding:criterion-namespace",
+      action_id: "R1-A1",
+      review_revision: 1,
+      criterion_ref: criterionRef,
+      severity: "medium",
+      problem_class: "correctness",
+      approved_plan_sha256: "a".repeat(64),
+    });
+    expect(packet.remediation.change_units[0]!.satisfies).toEqual(["SC-1"]);
+  });
+
   it("persists immutable retry supplements and permits only one contract correction", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-packet-"));
     const supplement = {
@@ -102,11 +121,16 @@ describe("fix packets", () => {
       completion_contract: { required_change_unit_ids: ["FIX-1"], expected_changed_files: ["src/item-1.ts"], allow_additional_files: false as const },
     };
     let calls = 0;
-    const codex: CodexAdapter = { invoke: async () => { calls += 1; return { text: JSON.stringify(corrected), parsed: corrected, exitCode: 0, promptPath: "prompt", stdoutPath: "stdout", stderrPath: "stderr", ...codexMetrics }; }  };
+    let correctionPrompt = "";
+    const codex: CodexAdapter = { invoke: async (invocation) => { calls += 1; correctionPrompt = invocation.prompt; return { text: JSON.stringify(corrected), parsed: corrected, exitCode: 0, promptPath: "prompt", stdoutPath: "stdout", stderrPath: "stderr", ...codexMetrics }; }  };
     const input = { runDir: root, worktreePath: root, actionId: "R1-A1", reviewRevision: 1, approvedPlanSha256: "a".repeat(64), claim: corrected, validationErrors: ["vague requirement"], workItem, verifierProfile: { model: "verifier", reasoning_effort: "high" as const }, codex };
     expect(await correctVerifierRemediationClaim(input)).toEqual(corrected);
     expect(await correctVerifierRemediationClaim({ ...input, codex: { invoke: async () => { throw new Error("must not reinvoke"); } } })).toEqual(corrected);
     expect(calls).toBe(1);
+    expect(correctionPrompt).toContain("must exactly equal one `verification_commands[].argv` vector");
+    expect(correctionPrompt).toContain("exact writable paths, operations, and target labels");
+    expect(correctionPrompt).toContain("`remediation.change_units[].satisfies`");
+    expect(correctionPrompt).toContain("reference the required-evidence `id`");
   });
 
   it("does not reuse R1-A1 correction authority across work items", async () => {
@@ -170,6 +194,55 @@ describe("fix packets", () => {
   it("keeps approved-scope gaps on the replan path and malformed contracts operational", () => {
     expect(classifyFixPacketCompilationFailure(new FixPacketRequiresReplanError("scope"))).toBe("replan");
     expect(classifyFixPacketCompilationFailure(new Error("invalid_verifier_contract"))).toBe("invalid_contract");
+  });
+
+  it("treats an invented remediation command as correctable Verifier contract output", () => {
+    const workItem = executionSpec("item-1");
+    const claim = validClaimFor(workItem);
+    claim.verification.commands[0]!.argv = ["npm", "run", "invented-check"];
+
+    try {
+      compileReviewFixPacket({
+        claim,
+        work_item: workItem,
+        finding_id: "finding:command",
+        action_id: "R1-A1",
+        review_revision: 1,
+        criterion_ref: workItem.acceptance[0]!.id,
+        severity: "high",
+        problem_class: "verification",
+        approved_plan_sha256: "a".repeat(64),
+      });
+      throw new Error("Expected packet compilation to fail");
+    } catch (error) {
+      expect(classifyFixPacketCompilationFailure(error)).toBe("invalid_contract");
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("outside approved verification commands");
+    }
+  });
+
+  it("treats an in-scope remediation target label mismatch as correctable output", () => {
+    const workItem = executionSpec("item-1");
+    const claim = validClaimFor(workItem);
+    claim.remediation.change_units[0]!.target = "descriptive but unapproved target label";
+
+    try {
+      compileReviewFixPacket({
+        claim,
+        work_item: workItem,
+        finding_id: "finding:target",
+        action_id: "R1-A1",
+        review_revision: 1,
+        criterion_ref: workItem.acceptance[0]!.id,
+        severity: "high",
+        problem_class: "correctness",
+        approved_plan_sha256: "a".repeat(64),
+      });
+      throw new Error("Expected packet compilation to fail");
+    } catch (error) {
+      expect(classifyFixPacketCompilationFailure(error)).toBe("invalid_contract");
+      expect((error as Error).message).toContain("approved file target or operation");
+    }
   });
 
   it("does not reinvoke a contract correction after ambiguous dispatch", async () => {

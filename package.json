@@ -41,6 +41,7 @@
     "test:release:no-build": "vitest run --config vitest.release.config.ts",
     "test:all:no-build": "vitest run",
     "verify:funnel": "node scripts/verify-repository.mjs",
+    "verify:focused": "node scripts/verify-repository.mjs --focused",
     "release:e2e": "npm run build && npm run test:release:no-build",
     "test:skill": "vitest run tests/skill-layout.test.ts tests/scripts/brain-hands-wrapper.test.ts",
     "test:planner-replay": "vitest run tests/core/execution-spec.test.ts tests/workflow/plan-repair.test.ts tests/workflow/planner.test.ts tests/progress/events.test.ts tests/scripts/brain-hands-wrapper.test.ts",
@@ -50,6 +51,7 @@
   "dependencies": {
     "commander": "^15.0.0",
     "execa": "^9.6.1",
+    "foglamp": "^0.7.1",
     "three": "^0.185.1",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"

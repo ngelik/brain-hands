@@ -31,6 +31,7 @@ import { criterionAliasesForAcceptance } from "./review-normalizer.js";
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const correctionRequestFields = {
   schema_version: z.literal(1),
+  correction_protocol_revision: z.literal(3),
   correction_id: z.string().regex(/^fix-packet-correction:[a-f0-9]{64}$/),
   work_item_id: z.string().min(1),
   review_revision: z.number().int().positive(),
@@ -130,6 +131,7 @@ export function reviewFixPacketCorrectionAuthority(input: FixPacketCorrectionAut
   const claim = verifierRemediationClaimV1Schema.parse(input.claim);
   const validationErrors = z.array(z.string().min(1)).min(1).parse(input.validationErrors);
   const identity = {
+    correction_protocol_revision: 3 as const,
     work_item_id: workItem.id,
     review_revision: z.number().int().positive().parse(input.reviewRevision),
     action_id: z.string().min(1).parse(input.actionId),
@@ -208,9 +210,21 @@ export function fixAttemptSupplementPath(packetId: string, attempt: number): str
 }
 
 export function compileReviewFixPacket(input: CompileReviewFixPacketInput): ReviewFixPacketV1 {
-  const claim = verifierRemediationClaimV1Schema.parse(input.claim);
+  const parsedClaim = verifierRemediationClaimV1Schema.parse(input.claim);
   const criterion = input.work_item.acceptance.find((entry) => entry.id === input.criterion_ref);
   if (!criterion) throw new FixPacketRequiresReplanError(`Unknown approved criterion ${input.criterion_ref}`);
+  const successConditionIds = parsedClaim.verification.success_conditions.map(({ id }) => id);
+  const claim = verifierRemediationClaimV1Schema.parse({
+    ...parsedClaim,
+    remediation: {
+      ...parsedClaim.remediation,
+      change_units: parsedClaim.remediation.change_units.map((unit) => ({
+        ...unit,
+        satisfies: [...new Set(unit.satisfies.flatMap((id) =>
+          id === input.criterion_ref ? successConditionIds : [id]))],
+      })),
+    },
+  });
 
   const contracts = new Map(input.work_item.file_contract.map((entry) => [entry.path, entry]));
   for (const path of claim.remediation.allowed_files) {
@@ -225,13 +239,13 @@ export function compileReviewFixPacket(input: CompileReviewFixPacketInput): Revi
       throw new FixPacketRequiresReplanError(`Fix unit ${unit.id} requires unapproved path ${unit.path}`);
     }
     if (contract.permission !== unit.operation || !contract.targets.includes(unit.target)) {
-      throw new FixPacketRequiresReplanError(`Fix unit ${unit.id} conflicts with approved file target or operation`);
+      throw new Error(`Fix unit ${unit.id} conflicts with approved file target or operation`);
     }
   }
   for (const command of claim.verification.commands) {
     assertApprovedCommand(command.argv, input.worktree_path);
     if (!input.work_item.verification_commands.some((approved) => sameJson(approved.argv, command.argv))) {
-      throw new FixPacketRequiresReplanError(`Fix command ${command.id} is outside approved verification commands`);
+      throw new Error(`Fix command ${command.id} is outside approved verification commands`);
     }
   }
 

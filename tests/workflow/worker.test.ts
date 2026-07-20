@@ -109,6 +109,31 @@ async function persistedContext(
 }
 
 describe("runHandsWorkItem", () => {
+  it("suffixes Hands invocation evidence when an interrupted turn already owns the base response", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-worker-resume-evidence-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
+    await writeFile(
+      join(ledger.runDir, "responses/hands-work-item-item-1-attempt-1.json"),
+      `${JSON.stringify(implementation, null, 2)}\n`,
+      "utf8",
+    );
+    const codex = new RecordingHands();
+
+    await runHandsWorkItem({
+      runDir: ledger.runDir,
+      worktreePath: join(root, "worktree"),
+      workItem: item,
+      intake: { ...intake, repo_root: root },
+      codex,
+    });
+
+    expect(codex.calls[0]!.artifactName).toBe("hands-work-item-item-1-attempt-1-resume-2");
+    await expect(readFile(
+      join(ledger.runDir, "prompts/hands-work-item-item-1-attempt-1-resume-2.md"),
+      "utf8",
+    )).resolves.toContain('"id": "item-1"');
+  });
+
   it("passes only the approved item to Hands in the isolated worktree", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-worker-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });

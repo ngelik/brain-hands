@@ -6,6 +6,7 @@ import { createRunLedgerV2, readManifestV2, recordPlan, transitionRun, updateMan
 import { readTaskLineage, withTaskLineageTransaction } from "../../src/core/task-lineage.js";
 import { applyDeliveryEffectPreview, openIntegratedPullRequestThroughDeliveryGateway, prepareDeliveryEffectBoundary } from "../../src/workflow/github-delivery-effects.js";
 import { planIssueSyncPreview, planPullRequestDeliveryPreview, writeGithubEffectPreview, type PullRequestDeliveryPlanningInput } from "../../src/github/effect-plan.js";
+import { rewriteLegacyWorkflowProtocol } from "../fixtures/legacy-run.js";
 
 let root: string | null = null;
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = null; });
@@ -13,7 +14,7 @@ afterEach(async () => { if (root) await rm(root, { recursive: true, force: true 
 async function readyBoundary() {
   root = await mkdtemp(join(tmpdir(), "brain-hands-delivery-effects-"));
   const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "ship", mode: "github", branchName: "codex/ship", worktreePath: root });
-  await updateManifestV2(ledger.runDir, { workflow_protocol: "legacy-v2" });
+  await rewriteLegacyWorkflowProtocol(ledger.runDir);
   await transitionRun(ledger.runDir, "preflight");
   await transitionRun(ledger.runDir, "brain_planning");
   await recordPlan(ledger.runDir, `${JSON.stringify({ summary: "ship", assumptions: [], research: [], research_sources: ["repo"], architecture: "small", risks: [], work_items: [], integration_verification: [] })}\n`);
@@ -381,7 +382,7 @@ describe("GitHub delivery effect boundary", () => {
       const manifest = await readManifestV2(setup.ledger.runDir);
       const replacementSha = "f".repeat(64);
       await updateManifestV2(setup.ledger.runDir, {
-        current_plan_revision: 2, approved_plan_revision: 2,
+        current_revision: 2, current_plan_revision: 2, approved_revision: 2, approved_plan_revision: 2,
         plan_revisions: { ...manifest.plan_revisions, "2": { ...manifest.plan_revisions["1"]!, revision: 2, sha256: replacementSha } },
       });
       currentPlan = { ...plan, plan_revision: 2, plan_sha256: replacementSha };

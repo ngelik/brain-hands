@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createRunLedgerV2,
+  readManifestV2,
   recordTerminalDisposition,
   updateManifestV2,
 } from "../../src/core/ledger.js";
@@ -386,6 +387,30 @@ describe("recovery artifact schemas and paths", () => {
 });
 
 describe("diagnostic recovery authorization", () => {
+  it("keeps a historical diagnostic valid after another scope advances the approved plan", async () => {
+    const { ledger } = await createDiagnosticStop("work-item:historical");
+    await recordRecoveryObservation(recordInput(
+      ledger.runDir,
+      observation({ runId: ledger.runId, attemptId: "current-attempt", scopeId: "work-item:current" }),
+    ));
+    const manifest = await reconcileRecoveryJournal(ledger.runDir);
+    const planSha256 = sha("approved-plan-1");
+    await updateManifestV2(ledger.runDir, {
+      current_revision: 1,
+      approved_revision: 1,
+      current_plan_revision: 1,
+      approved_plan_revision: 1,
+      plan_revisions: {
+        ...manifest.plan_revisions,
+        "1": { revision: 1, path: "plans/revision-1.md", sha256: planSha256 },
+      },
+    });
+
+    await expect(reconcileRecoveryJournal(ledger.runDir)).resolves.toMatchObject({
+      recovery: { active_scope: "work-item:current" },
+    });
+  });
+
   it("authorizes the validated global-chain diagnostic stop without resetting progress", async () => {
     const { ledger, stopped } = await createDiagnosticStop();
     const before = stopped.manifest;
@@ -1616,6 +1641,43 @@ describe("immutable recovery journal", () => {
     const repairedBytes = await readFile(manifestPath);
     expect((await reconcileRecoveryJournal(ledger.runDir)).recovery.active_scope).toBe(secondScope);
     expect(await readFile(manifestPath)).toEqual(repairedBytes);
+  });
+
+  it("keeps recovery inactive after a newer approved replan reset event", async () => {
+    const ledger = await createRun();
+    const scopeId = "work-item:item-a";
+    await recordRecoveryObservation(recordInput(
+      ledger.runDir,
+      observation({ runId: ledger.runId, attemptId: "attempt-a", scopeId }),
+    ));
+    const eventPath = join(ledger.runDir, "events.jsonl");
+    const events = await readFile(eventPath, "utf8");
+    const reset = {
+      event_id: `approved-replan-reset:${"c".repeat(64)}`,
+      run_id: ledger.runId,
+      stage: "worktree_setup",
+      type: "approved_replan_attempt_reset",
+      timestamp: new Date(Date.now() + 1_000).toISOString(),
+      actor: "human",
+      payload: {
+        work_item_id: "item-a",
+        base_plan_revision: 1,
+        plan_revision: 2,
+        replan_patch_path: "replans/item-a.json",
+      },
+    };
+    await writeFile(eventPath, `${events}${JSON.stringify(reset)}\n`);
+    await updateManifestV2(ledger.runDir, {
+      recovery: {
+        ...(await readManifestV2(ledger.runDir)).recovery,
+        active_scope: null,
+      },
+    });
+
+    const reconciled = await reconcileRecoveryJournal(ledger.runDir);
+
+    expect(reconciled.recovery.active_scope).toBeNull();
+    expect((await reconcileRecoveryJournal(ledger.runDir)).recovery.active_scope).toBeNull();
   });
 
   it("rejects inconsistent per-scope decision event order", async () => {

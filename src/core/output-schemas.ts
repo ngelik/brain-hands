@@ -39,6 +39,16 @@ const commandArray = {
   },
 } as const;
 const nonEmptyCommandArray = { ...commandArray, minItems: 1 } as const;
+const fixPacketBlockerSchema = {
+  type: ["object", "null"],
+  additionalProperties: false,
+  properties: {
+    code: { type: "string", minLength: 1 },
+    message: { type: "string", minLength: 1 },
+    evidence_refs: stringArray,
+  },
+  required: ["code", "message", "evidence_refs"],
+} as const;
 
 const artifactPathSchema = {
   type: "string",
@@ -581,17 +591,6 @@ export const handsSelfReviewReportOutputSchema = {
     "remaining_findings",
     "ready_for_resolution_check",
   ],
-  allOf: [
-    {
-      if: {
-        properties: { ready_for_resolution_check: { const: true } },
-        required: ["ready_for_resolution_check"],
-      },
-      then: {
-        properties: { remaining_findings: { maxItems: 0 } },
-      },
-    },
-  ],
 } as const;
 
 export const actionResolutionReviewOutputSchema = {
@@ -618,46 +617,20 @@ export const actionResolutionReviewOutputSchema = {
     "remaining_problem",
     "required_next_fix",
   ],
-  allOf: [
-    {
-      if: {
-        properties: { decision: { const: "resolved" } },
-        required: ["decision"],
-      },
-      then: {
-        properties: {
-          remaining_problem: { type: "null" },
-          required_next_fix: { type: "null" },
-        },
-      },
-    },
-    {
-      if: {
-        properties: { decision: { const: "still_open" } },
-        required: ["decision"],
-      },
-      then: {
-        properties: {
-          remaining_problem: { type: "string", minLength: 1 },
-          required_next_fix: { type: "string", minLength: 1 },
-        },
-      },
-    },
-  ],
 } as const;
 
 export const fixPacketResultV1OutputSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    schema_version: { const: 1 }, packet_id: { type: "string", minLength: 1 },
+    schema_version: { type: "integer", const: 1 }, packet_id: { type: "string", minLength: 1 },
     packet_sha256: { type: "string", pattern: "^[a-f0-9]{64}$" }, action_attempt: { type: "integer", minimum: 1 },
     status: { type: "string", enum: ["implemented", "packet_contradiction", "operationally_blocked"] },
     change_units: { type: "array", items: { type: "object", additionalProperties: false, properties: { change_unit_id: { type: "string", minLength: 1 }, status: { type: "string", enum: ["completed", "not_completed"] }, changed_files: stringArray, summary: { type: "string", minLength: 1 } }, required: ["change_unit_id", "status", "changed_files", "summary"] } },
     changed_files: stringArray,
     commands_attempted: { type: "array", items: { type: "object", additionalProperties: false, properties: { command_id: { type: "string", minLength: 1 }, argv: nonEmptyStringArray, exit_code: { type: ["integer", "null"] }, evidence_ref: { type: "string", minLength: 1 } }, required: ["command_id", "argv", "exit_code", "evidence_ref"] } },
     unresolved_requirements: { type: "array", items: { type: "object", additionalProperties: false, properties: { change_unit_id: { type: "string", minLength: 1 }, requirement: { type: "string", minLength: 1 }, reason: { type: "string", minLength: 1 } }, required: ["change_unit_id", "requirement", "reason"] } },
-    blocker: { type: ["object", "null"] },
+    blocker: fixPacketBlockerSchema,
   },
   required: ["schema_version", "packet_id", "packet_sha256", "action_attempt", "status", "change_units", "changed_files", "commands_attempted", "unresolved_requirements", "blocker"],
 } as const;
@@ -668,7 +641,7 @@ export const fixPacketResolutionV1OutputSchema = {
     packet_id: { type: "string", minLength: 1 }, packet_sha256: { type: "string", pattern: "^[a-f0-9]{64}$" },
     action_attempt: { type: "integer", minimum: 1 }, decision: { type: "string", enum: ["resolved", "still_open", "packet_contradiction", "operationally_blocked"] },
     condition_results: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false, properties: { success_condition_id: { type: "string", minLength: 1 }, status: { type: "string", enum: ["satisfied", "unsatisfied"] }, evidence_refs: nonEmptyStringArray, remaining_problem: { type: ["string", "null"] } }, required: ["success_condition_id", "status", "evidence_refs", "remaining_problem"] } },
-    required_next_fix: { type: ["string", "null"] }, blocker: { type: ["object", "null"] },
+    required_next_fix: { type: ["string", "null"] }, blocker: fixPacketBlockerSchema,
   },
   required: ["packet_id", "packet_sha256", "action_attempt", "decision", "condition_results", "required_next_fix", "blocker"],
 } as const;

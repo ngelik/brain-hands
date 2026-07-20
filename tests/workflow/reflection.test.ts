@@ -312,7 +312,9 @@ describe("runReflection", () => {
     expect(interrupted.calls[0]?.prompt).toContain(contextJson);
     expect(interrupted.calls[0]?.prompt).toContain('"phase": "reflection"');
     expect(interrupted.calls[0]?.prompt).toContain('"retry_counts"');
+    expect(interrupted.calls[0]?.prompt).toContain('"work_item_attempts"');
     expect(interrupted.calls[0]?.prompt).toContain('"review_accounting"');
+    expect(interrupted.calls[0]?.prompt).toContain('"finding_history"');
     expect(interrupted.calls[0]?.prompt).toContain('"budget_usage"');
     expect(interrupted.calls[0]?.prompt).toContain('"terminal_disposition"');
     expect(interrupted.calls[0]?.prompt).toContain('"delivery_identifiers"');

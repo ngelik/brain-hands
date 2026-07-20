@@ -218,15 +218,16 @@ export interface CreateReplanPatchInput {
   model_profile: RoleProfile;
   /** Final/post-PR phases may project one integrated cycle onto one approved target. */
   source_work_item_id?: string;
-  /** Runtime recovery may validate a persisted patch without invoking Brain. */
+  /** Runtime recovery reuses a patch or retries only when no invocation prompt was persisted. */
   existing_only?: boolean;
   budget?: ResourceBudgetPort;
 }
 
-const maxPromptBytes = 32_000;
+const maxPromptBytes = 96_000;
 const runOwnedEvidenceRoots = new Set([
   "assurance",
   "authorizations",
+  "contexts",
   "failures",
   "findings",
   "implementation",
@@ -266,7 +267,8 @@ async function assertReplanEvidenceAvailable(
     await readOwnedEvidenceFile(runDir, path, `${root}/`);
     return;
   }
-  const target = await realpath(join(repoRoot, path)).catch((error: unknown) => {
+  const repositoryPath = path.replace(/:[1-9]\d*(?::[1-9]\d*)?$/, "");
+  const target = await realpath(join(repoRoot, repositoryPath)).catch((error: unknown) => {
     if (errorCode(error) === "ENOENT") throw new Error(`Repository evidence artifact is missing: ${path}`);
     throw error;
   });
@@ -645,6 +647,19 @@ function findingContext(findings: Awaited<ReturnType<typeof loadFindingRevisionR
   }));
 }
 
+function canonicalizeGeneratedPatch(patch: ReplanPatch): ReplanPatch {
+  const crossCuttingCommandIds = new Set(
+    patch.added_cross_cutting_impacts.flatMap((impact) => impact.verification_command_ids),
+  );
+  return {
+    ...patch,
+    added_verification_commands: patch.added_verification_commands.map((command) =>
+      crossCuttingCommandIds.has(command.id) && command.tier !== "cross_cutting"
+        ? { ...command, tier: "cross_cutting" as const }
+        : command),
+  };
+}
+
 export async function createReplanPatch(
   rawInput: CreateReplanPatchInput,
 ): Promise<ReplanPatchResult> {
@@ -788,8 +803,42 @@ export async function createReplanPatch(
     validatePatch(existing.patch, input, criteria);
     return { patch: existing.patch, path: join(input.run_dir, relativePath), model_profile: input.model_profile };
   }
+  const artifactName = relativePath.slice(0, -".json".length).replaceAll("/", "-");
+  const persistGeneratedPatch = async (rawPatch: unknown): Promise<ReplanPatchResult> => {
+    const patch = canonicalizeGeneratedPatch(generatedReplanPatchSchema.parse(rawPatch));
+    validatePatch(patch, input, criteria);
+    const record: ReplanPatchRecord = replanPatchRecordSchema.parse({ patch, provenance });
+    const raced = await readOptionalValidatedArtifact(input.run_dir, relativePath, replanPatchRecordSchema);
+    if (raced) {
+      if (canonical(raced) !== canonical(record)) {
+        throw new Error(`Replan patch already exists with different content: ${relativePath}`);
+      }
+    } else {
+      await writeCreateOnceValidated(input.run_dir, relativePath, record, replanPatchRecordSchema);
+    }
+    return { patch, path: join(input.run_dir, relativePath), model_profile: input.model_profile };
+  };
   if (input.existing_only) {
-    throw new Error(`Ambiguous create_replan effect has no persisted immutable patch: ${relativePath}`);
+    let promptExists = false;
+    try {
+      await readOwnedEvidenceFile(input.run_dir, `prompts/${artifactName}.md`, "prompts/");
+      promptExists = true;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+    if (promptExists) {
+      try {
+        const response = JSON.parse((await readOwnedEvidenceFile(
+          input.run_dir,
+          `responses/${artifactName}.json`,
+          "responses/",
+        )).toString("utf8"));
+        return await persistGeneratedPatch(response);
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+        throw new Error(`Ambiguous create_replan effect has no persisted immutable patch: ${relativePath}`);
+      }
+    }
   }
 
   const promptTarget = { ...target, acceptance_criteria: criteria };
@@ -836,7 +885,6 @@ export async function createReplanPatch(
   }
   assertNoSecretMaterial("Brain replan prompt", prompt);
 
-  const artifactName = relativePath.slice(0, -".json".length).replaceAll("/", "-");
   const schemaText = `${JSON.stringify(replanPatchOutputSchema, null, 2)}\n`;
   await writeTextArtifact(input.run_dir, `prompts/${artifactName}.md`, prompt);
   await writeTextArtifact(input.run_dir, `schemas/${artifactName}.json`, schemaText);
@@ -856,21 +904,7 @@ export async function createReplanPatch(
     outputParser: generatedReplanPatchSchema,
   });
   if (result.parsed === undefined) throw new Error("Brain replan did not return a parsed ReplanPatch object");
-  const patch = generatedReplanPatchSchema.parse(result.parsed);
-  validatePatch(patch, input, criteria);
-  const record: ReplanPatchRecord = replanPatchRecordSchema.parse({
-    patch,
-    provenance,
-  });
-  const raced = await readOptionalValidatedArtifact(input.run_dir, relativePath, replanPatchRecordSchema);
-  if (raced) {
-    if (canonical(raced) !== canonical(record)) {
-      throw new Error(`Replan patch already exists with different content: ${relativePath}`);
-    }
-  } else {
-    await writeCreateOnceValidated(input.run_dir, relativePath, record, replanPatchRecordSchema);
-  }
-  return { patch, path: join(input.run_dir, relativePath), model_profile: input.model_profile };
+  return persistGeneratedPatch(result.parsed);
 }
 
 /** Resolve the concrete target of the one replan currently awaiting approval. */
@@ -980,10 +1014,15 @@ const clearedReplanProgressKeys = new Set([
 function resetTargetProgress(
   progress: RunManifestV2Ledger["work_item_progress"][string],
   revision: number,
+  targetWorkItemId: string,
+  patchPath: string,
 ): RunManifestV2Ledger["work_item_progress"][string] {
   const retained = Object.fromEntries(
     Object.entries(progress).filter(([key]) => !clearedReplanProgressKeys.has(key)),
   );
+  const history = Array.isArray(progress.approved_replan_history)
+    ? progress.approved_replan_history
+    : [];
   return {
     ...retained,
     status: "pending",
@@ -992,6 +1031,20 @@ function resetTargetProgress(
     attempts: progress.attempts + 1,
     fix_cycles_used: 0,
     plan_revision: revision,
+    approved_replan_history: [...history, {
+      target_work_item_id: targetWorkItemId,
+      plan_revision: revision,
+      replan_patch_path: patchPath,
+      review_revision: progress.review_revision,
+      review_cycle_path: progress.review_cycle_path,
+      review_effect_id: progress.review_effect_id,
+      review_path: progress.review_path,
+      verification_path: progress.verification_path,
+      delivery_phase: progress.delivery_phase,
+    }],
+    last_approved_replan_target_work_item_id: targetWorkItemId,
+    last_approved_replan_revision: revision,
+    last_approved_replan_patch_path: patchPath,
   };
 }
 
@@ -1925,6 +1978,30 @@ export async function approvePreparedReplanRevision(
         progress.last_approved_replan_target_work_item_id === workItemId
         && progress.last_approved_replan_revision === planRevision);
     }
+    if (alreadyApplied && sourceCandidates.length > 1) {
+      const archivedPatchPaths = [...new Set(sourceCandidates
+        .map(([, progress]) => progress.last_approved_replan_patch_path)
+        .filter((path): path is string => typeof path === "string"))];
+      if (archivedPatchPaths.length !== 1) {
+        throw new Error(`Replan approval archived source cycles disagree for target ${workItemId}`);
+      }
+      const archivedRecord = await readOptionalValidatedArtifact(
+        runDir,
+        archivedPatchPaths[0]!,
+        replanPatchRecordSchema,
+      );
+      const archivedConvergence = archivedRecord
+        ? await readOptionalValidatedArtifact(
+            runDir,
+            archivedRecord.provenance.convergence_report_path,
+            convergenceReportSchema,
+          )
+        : null;
+      if (!archivedConvergence) {
+        throw new Error(`Replan approval archived source provenance is missing for target ${workItemId}`);
+      }
+      sourceCandidates = sourceCandidates.filter(([candidateId]) => candidateId === archivedConvergence.work_item_id);
+    }
     if (sourceCandidates.length !== 1 && !(alreadyApplied && sourceCandidates.length === 0)) {
       throw new Error(`Replan approval must resolve exactly one source cycle for target ${workItemId}`);
     }
@@ -1945,14 +2022,44 @@ export async function approvePreparedReplanRevision(
 
     const baseRecord = manifest.plan_revisions[String(baseRevision)];
     if (!baseRecord) throw new Error(`Replan approval base plan revision ${baseRevision} is not recorded`);
-    const convergenceSummary = manifest.convergence_reports?.[sourceWorkItemId];
-    if (!convergenceSummary || convergenceSummary.plan_revision !== baseRevision
-      || convergenceSummary.recommended_action !== "create_replan") {
+    let approvedHistory: Record<string, unknown> | null = null;
+    let archivedPatchPath: string | null = null;
+    if (alreadyApplied && sourceCandidates.length > 0) {
+      const history = Array.isArray(sourceProgress.approved_replan_history)
+        ? sourceProgress.approved_replan_history as Record<string, unknown>[]
+        : [];
+      const matchingHistory = history.filter((entry) => entry.target_work_item_id === workItemId
+        && entry.plan_revision === planRevision
+        && typeof entry.replan_patch_path === "string");
+      if (matchingHistory.length !== 1) {
+        throw new Error("Completed replan source archived lineage does not identify exactly one approved patch");
+      }
+      approvedHistory = matchingHistory[0]!;
+      archivedPatchPath = approvedHistory.replan_patch_path as string;
+      if (sourceProgress.last_approved_replan_target_work_item_id !== workItemId
+        || sourceProgress.last_approved_replan_revision !== planRevision
+        || sourceProgress.last_approved_replan_patch_path !== archivedPatchPath) {
+        throw new Error("Completed replan source archived lineage does not match the approved patch");
+      }
+    }
+    const currentConvergenceSummary = manifest.convergence_reports?.[sourceWorkItemId];
+    if (archivedPatchPath === null && (!currentConvergenceSummary
+      || currentConvergenceSummary.plan_revision !== baseRevision
+      || currentConvergenceSummary.recommended_action !== "create_replan")) {
       throw new Error("Replan approval convergence provenance does not match the target and base revision");
     }
-    const patchPath = replanPatchPath(workItemId, baseRevision, convergenceSummary.review_revision);
+    const patchPath = archivedPatchPath
+      ?? replanPatchPath(workItemId, baseRevision, currentConvergenceSummary!.review_revision);
     const record = await readOptionalValidatedArtifact(runDir, patchPath, replanPatchRecordSchema);
     if (!record) throw new Error("Replan approval immutable pending patch is missing");
+    const convergenceSummary = archivedPatchPath === null
+      ? currentConvergenceSummary!
+      : {
+          path: record.provenance.convergence_report_path,
+          plan_revision: baseRevision,
+          review_revision: record.provenance.convergence_review_revision,
+          recommended_action: "create_replan" as const,
+        };
     if (record.patch.target_work_item_id !== workItemId
       || record.patch.base_plan_revision !== baseRevision
       || record.provenance.base_plan_revision !== baseRevision
@@ -1961,22 +2068,6 @@ export async function approvePreparedReplanRevision(
       || (!alreadyApplied && sourceWorkItemId !== workItemId
         && sourceProgress.replan_target_work_item_id !== workItemId)) {
       throw new Error("Replan approval patch target or base provenance does not match");
-    }
-    let approvedHistory: Record<string, unknown> | null = null;
-    if (alreadyApplied && sourceWorkItemId !== workItemId) {
-      const history = Array.isArray(sourceProgress.approved_replan_history)
-        ? sourceProgress.approved_replan_history as Record<string, unknown>[]
-        : [];
-      const matchingHistory = history.filter((entry) => entry.target_work_item_id === workItemId
-        && entry.plan_revision === planRevision
-        && entry.replan_patch_path === patchPath);
-      if (matchingHistory.length !== 1
-        || sourceProgress.last_approved_replan_target_work_item_id !== workItemId
-        || sourceProgress.last_approved_replan_revision !== planRevision
-        || sourceProgress.last_approved_replan_patch_path !== patchPath) {
-        throw new Error("Completed replan source archived lineage does not match the approved patch");
-      }
-      approvedHistory = matchingHistory[0]!;
     }
     assertEqual("approval finding set", record.patch.unresolved_finding_ids, record.provenance.unresolved_finding_ids);
     assertEqual("approval release guards", record.provenance.release_guards, manifest.release_guards ?? []);
@@ -2088,14 +2179,68 @@ export async function approvePreparedReplanRevision(
     if (reconstructedSha256 !== proposedRecord.sha256) {
       throw new Error("Replan approval immutable patch does not reconstruct the approved plan");
     }
-    const nextProgress = alreadyApplied ? progress : resetTargetProgress(progress, planRevision);
+    const nextProgress = alreadyApplied
+      ? progress
+      : resetTargetProgress(progress, planRevision, workItemId, patchPath);
     const nextSourceProgress = alreadyApplied || sourceWorkItemId === workItemId
       ? undefined
       : archiveSourceProgress(sourceProgress, workItemId, planRevision, patchPath);
     if (alreadyApplied) {
+      let replayManifest = manifest;
+      if (replayManifest.recovery.active_scope !== null) {
+        replayManifest = await transaction.updateManifestV2({
+          recovery: {
+            ...replayManifest.recovery,
+            active_scope: null,
+          },
+        });
+      }
+      const replayProgress = manifest.work_item_progress[workItemId]!;
+      const replayHistory = Array.isArray(replayProgress.approved_replan_history)
+        ? replayProgress.approved_replan_history
+        : [];
+      const hasReplayHistory = replayHistory.some((entry) =>
+        entry.target_work_item_id === workItemId
+        && entry.plan_revision === planRevision
+        && entry.replan_patch_path === patchPath);
+      if (sourceWorkItemId === workItemId && !hasReplayHistory) {
+        const historicalDecision = await readOptionalValidatedArtifact(
+          runDir,
+          reviewDecisionPath(sourceWorkItemId, convergence.review_revision),
+          reviewCycleStateSchema,
+        );
+        if (!historicalDecision
+          || historicalDecision.work_item_id !== sourceWorkItemId
+          || historicalDecision.review_revision !== convergence.review_revision
+          || historicalDecision.decision.action !== "create_replan") {
+          throw new Error("Completed direct replan is missing its historical review lineage");
+        }
+        const repairedProgress = {
+          ...replayProgress,
+          approved_replan_history: [...replayHistory, {
+            target_work_item_id: workItemId,
+            plan_revision: planRevision,
+            replan_patch_path: patchPath,
+            review_revision: historicalDecision.review_revision,
+            review_cycle_path: historicalDecision.decision_path,
+            review_effect_id: historicalDecision.effect_id,
+            review_path: historicalDecision.work_item_progress_reference?.review_path,
+            verification_path: historicalDecision.work_item_progress_reference?.verification_path,
+          }],
+          last_approved_replan_target_work_item_id: workItemId,
+          last_approved_replan_revision: planRevision,
+          last_approved_replan_patch_path: patchPath,
+        };
+        replayManifest = await transaction.updateManifestV2({
+          work_item_progress: {
+            ...manifest.work_item_progress,
+            [workItemId]: repairedProgress,
+          },
+        });
+      }
       await reconcileCompletedReplanEvents({
         runDir: transaction.runDir,
-        manifest,
+        manifest: replayManifest,
         verifiedApproval,
         workItemId,
         baseRevision,
@@ -2104,7 +2249,7 @@ export async function approvePreparedReplanRevision(
         patchPath,
         eventIoHooks: options.eventIoHooks,
       });
-      return manifest;
+      return replayManifest;
     }
     const approved = await transaction.approveReplanRevision({
       base_revision: baseRevision,

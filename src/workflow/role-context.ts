@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import {
   artifactRefV1Schema,
   artifactRefFromBytes,
@@ -47,6 +48,80 @@ export const CONTEXT_LIMITS_V1 = {
   verifier_diff_bytes: 32 * 1024,
   reflection_total_bytes: 96 * 1024,
 } as const;
+
+const generatedLockfilePath = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$/;
+
+export function boundedGeneratedLockfileDiff(patch: string): string {
+  if (Buffer.byteLength(patch, "utf8") <= CONTEXT_LIMITS_V1.verifier_diff_bytes) return patch;
+  const boundaries = [...patch.matchAll(/^diff --git /gm)].map((match) => match.index);
+  if (boundaries.length === 0) return patch;
+  const prefix = patch.slice(0, boundaries[0]);
+  const sections = boundaries.map((start, index) => patch.slice(start, boundaries[index + 1] ?? patch.length));
+  let summarized = false;
+  const bounded = sections.map((section) => {
+    const header = section.split("\n", 1)[0] ?? "";
+    const match = /^diff --git a\/(.+) b\/(.+)$/.exec(header);
+    const path = match?.[2];
+    if (!path || !generatedLockfilePath.test(path)) return section;
+    summarized = true;
+    return [
+      header,
+      "# Generated lockfile diff summarized for bounded role context.",
+      `Path: ${path}`,
+      `Git patch section bytes (not file content bytes): ${Buffer.byteLength(section, "utf8")}`,
+      `Git patch section sha256 (not file content sha256): ${createHash("sha256").update(section).digest("hex")}`,
+      "Do not compare this patch-section metadata with the worktree file size or digest.",
+      "The full generated lockfile remains available in the worktree and is verified as an owned artifact.",
+      "",
+    ].join("\n");
+  }).join("");
+  const result = `${prefix}${bounded}`;
+  return summarized && Buffer.byteLength(result, "utf8") <= CONTEXT_LIMITS_V1.verifier_diff_bytes
+    ? result
+    : patch;
+}
+
+function boundedSourceDiff(patch: string, role: "Hands" | "Verifier"): string {
+  let bounded = boundedGeneratedLockfileDiff(patch);
+  if (Buffer.byteLength(bounded, "utf8") <= CONTEXT_LIMITS_V1.verifier_diff_bytes) return bounded;
+  const boundaries = [...bounded.matchAll(/^diff --git /gm)].map((match) => match.index);
+  if (boundaries.length === 0) return bounded;
+  const prefix = bounded.slice(0, boundaries[0]);
+  const sections = boundaries.map((start, index) => bounded.slice(start, boundaries[index + 1] ?? bounded.length));
+  const summaries = sections.map((section) => {
+    const header = section.split("\n", 1)[0] ?? "";
+    const match = /^diff --git a\/(.+) b\/(.+)$/.exec(header);
+    if (!match?.[2]) return section;
+    return [
+      header,
+      `# Source patch section summarized for bounded ${role} context.`,
+      `Path: ${match[2]}`,
+      `Git patch section bytes (not file content bytes): ${Buffer.byteLength(section, "utf8")}`,
+      `Git patch section sha256 (not file content sha256): ${createHash("sha256").update(section).digest("hex")}`,
+      "The full changed file remains available in the authoritative worktree for direct inspection.",
+      "",
+    ].join("\n");
+  });
+  const selected = new Set<number>();
+  const bySavings = sections
+    .map((section, index) => ({ index, savings: Buffer.byteLength(section, "utf8") - Buffer.byteLength(summaries[index]!, "utf8") }))
+    .filter(({ savings }) => savings > 0)
+    .sort((left, right) => right.savings - left.savings || left.index - right.index);
+  for (const candidate of bySavings) {
+    selected.add(candidate.index);
+    bounded = `${prefix}${sections.map((section, index) => selected.has(index) ? summaries[index] : section).join("")}`;
+    if (Buffer.byteLength(bounded, "utf8") <= CONTEXT_LIMITS_V1.verifier_diff_bytes) return bounded;
+  }
+  return patch;
+}
+
+export function boundedHandsDiff(patch: string): string {
+  return boundedSourceDiff(patch, "Hands");
+}
+
+export function boundedVerifierDiff(patch: string): string {
+  return boundedSourceDiff(patch, "Verifier");
+}
 
 export type HandsAttemptKind = "initial" | "primary_fix" | "fix_packet" | "quality_recovery";
 
@@ -475,7 +550,8 @@ export function verifierContextPath(
 export const reflectionContextPath = "contexts/reflection/final.json";
 
 async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<ArtifactRefV1> {
-  if (Buffer.byteLength(input.diff, "utf8") > CONTEXT_LIMITS_V1.hands_diff_bytes) {
+  const boundedDiff = boundedHandsDiff(input.diff);
+  if (Buffer.byteLength(boundedDiff, "utf8") > CONTEXT_LIMITS_V1.hands_diff_bytes) {
     throw new Error(`Hands diff exceeds ${CONTEXT_LIMITS_V1.hands_diff_bytes} UTF-8 bytes`);
   }
   requiredJson(input.workItem, "work_item");
@@ -489,7 +565,7 @@ async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<A
     schema_version: 1,
     role: "hands",
     work_item: workItem,
-    diff: input.diff,
+    diff: boundedDiff,
     active_findings: activeFindings,
     dependency_summaries: [],
     bounded_evidence: [],
@@ -547,7 +623,8 @@ async function validateVerifierEvidenceIndex(
 }
 
 async function buildVerifierContextLocked(input: BuildVerifierContextInput): Promise<ArtifactRefV1> {
-  if (Buffer.byteLength(input.diff, "utf8") > CONTEXT_LIMITS_V1.verifier_diff_bytes) {
+  const boundedDiff = boundedVerifierDiff(input.diff);
+  if (Buffer.byteLength(boundedDiff, "utf8") > CONTEXT_LIMITS_V1.verifier_diff_bytes) {
     throw new Error(`Verifier diff exceeds ${CONTEXT_LIMITS_V1.verifier_diff_bytes} UTF-8 bytes`);
   }
   const evidenceIndexAuthority = await validateVerifierEvidenceIndex(
@@ -577,7 +654,7 @@ async function buildVerifierContextLocked(input: BuildVerifierContextInput): Pro
     work_item_id: input.workItemId,
     acceptance_contract: requiredJsonArray(input.acceptanceContract, "acceptance_contract"),
     changed_files: input.changedFiles,
-    diff: input.diff,
+    diff: boundedDiff,
     verification_ref: sourceVerification.ref,
     command_evidence: [],
     artifact_checks: [],

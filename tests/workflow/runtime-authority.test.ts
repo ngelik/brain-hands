@@ -1328,7 +1328,7 @@ describe("approved runtime authority", () => {
     if (presence === "present") expect(await readFile(join(worktreePath, "sentinel"), "utf8")).toBe("unchanged\n");
   });
 
-  it.each(["absent", "present"] as const)("recovers a valid historical pinned-source checkout when %s", async (presence) => {
+  it.each(["absent", "present"] as const)("rejects incomplete historical pinned-source approval evidence when checkout is %s", async (presence) => {
     const fixture = await approvedLegacyRuntime("local", false);
     const sourceCommit = fixture.sourceCommit;
     const manifestPath = join(fixture.runDir, "manifest.json");
@@ -1355,23 +1355,14 @@ describe("approved runtime authority", () => {
       execFileSync("git", ["worktree", "add", "-b", branchName, worktreePath, sourceCommit], { cwd: root! });
     }
 
-    const result = await runLocalWorkflow({
+    await expect(runLocalWorkflow({
       runDir: fixture.runDir,
       worktreePath,
       intake: fixture.intake,
       plan: fixture.plan,
       codex: {} as never,
-    });
-
-    expect(result.status).toBe("human_action_required");
-    const recovered = await readManifestV2(fixture.runDir);
-    expect(recovered).toMatchObject({
-      worktree_path: worktreePath,
-      branch_name: branchName,
-      checkout_allocation_state: "ready",
-      execution_lease: null,
-    });
-    expect(execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd: worktreePath, encoding: "utf8" }).trim()).not.toBe("");
+    })).rejects.toThrow(/approval directory is missing/i);
+    expect(await readFile(manifestPath, "utf8")).toContain('"checkout_allocation_state": null');
   });
 
   it("blocks runtime and observational reads when selected role profiles drift", async () => {

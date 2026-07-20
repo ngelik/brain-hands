@@ -331,6 +331,24 @@ export class RehearsalHarness {
     }
   }
 
+  async waitForLedgerRecoverable(timeoutMs: number): Promise<void> {
+    const lockPath = join(this.requireRunDir(), ".ledger.lock");
+    const staleAt = Date.now() + timeoutMs;
+    while (true) {
+      const lock = await lstat(lockPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      if (lock === null) return;
+      const remaining = lock.mtimeMs + 30_000 - Date.now();
+      if (remaining <= 0) return;
+      if (Date.now() >= staleAt) {
+        throw new Error(`Timed out waiting for interrupted run ledger lock to become recoverable: path=${lockPath}`);
+      }
+      await delay(Math.min(25, remaining));
+    }
+  }
+
   async resume(): Promise<Status> {
     return this.runJson<Status>([
       "resume", this.requireRunId(), "--repo", this.repo, "--dry-run", "--json",
@@ -485,13 +503,18 @@ export class RehearsalHarness {
   async expectReflectionComplete(): Promise<void> {
     const manifest = await this.readManifest();
     const reflectionPaths = manifest.final_artifact_paths.filter((path) => path.includes("reflection"));
-    expect(reflectionPaths).toEqual(expect.arrayContaining([
+    const expectedPaths = [
       "reflection.json",
       "reflection.md",
-      "responses/reflection-brain-account.json",
-      "responses/reflection-hands-account.json",
       "responses/reflection-synthesis.json",
-    ]));
+    ];
+    if (manifest.reflection_protocol !== "single-pass-v1") {
+      expectedPaths.push(
+        "responses/reflection-brain-account.json",
+        "responses/reflection-hands-account.json",
+      );
+    }
+    expect(reflectionPaths).toEqual(expect.arrayContaining(expectedPaths));
     for (const path of reflectionPaths) {
       const raw = await readFile(join(this.requireRunDir(), path), "utf8");
       if (path.endsWith(".json")) parseJson<unknown>(raw);

@@ -214,15 +214,25 @@ const actionInvocationProfileSchema = z.object({
   reasoning_effort: z.string().trim().min(1),
 }).strict();
 
-const actionInvocationCompletionSchema = z.object({
+const actionInvocationShape = {
   effect_id: z.string().regex(/^review-effect:[a-f0-9]{64}$/),
   review_revision: z.number().int().positive(),
   action_id: z.string().trim().min(1),
   action_attempt: z.number().int().positive(),
   report_path: z.string().trim().min(1),
-  substage: z.literal("primary_fix"),
-  state: z.literal("complete"),
+  substage: z.enum(["primary_fix", "quality_recovery"]),
   started_profile: actionInvocationProfileSchema,
+} as const;
+
+const actionInvocationClaimSchema = z.object({
+  ...actionInvocationShape,
+  state: z.literal("started"),
+  completed_profile: z.null(),
+}).strict();
+
+const actionInvocationCompletionSchema = z.object({
+  ...actionInvocationShape,
+  state: z.literal("complete"),
   completed_profile: actionInvocationProfileSchema,
   report_sha256: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
@@ -802,6 +812,18 @@ export async function requireClaimedReviewEffect(
   return assertEffectOwner(assertEffectProvenance(decisionState, claim), owner);
 }
 
+export async function recoverClaimedReviewEffectBeforeQueue(
+  input: ReviewEffectInput & { queue_persisted: boolean },
+): Promise<ReviewEffectClaimResult> {
+  if (input.queue_persisted) {
+    throw new Error(`Review effect ${input.cycle.effect_id} cannot be replayed after its action queue was persisted`);
+  }
+  return {
+    status: "acquired",
+    cycle: await requireClaimedReviewEffect(input),
+  };
+}
+
 export async function requireCompletedAdvanceEffect(
   input: ReviewEffectInput,
 ): Promise<{ cycle: ReviewCycleState; commit_sha: string }> {
@@ -1068,13 +1090,14 @@ async function readCompletedReservations(
       fixReservationCompletionReadSchema,
     );
     const cycle = reservation ? cyclesByEffect.get(reservation.effect_id) : undefined;
-    if (!reservation || !completion || !cycle
-      || JSON.stringify({ ...reservationProvenance(completion, cycle), status: "charged" })
-        !== JSON.stringify({ ...reservationProvenance(reservation, cycle), status: "charged" })) {
-      throw new Error("Successful-fix reservation is missing or incomplete");
-    }
+    if (!reservation || !cycle) throw new Error("Successful-fix reservation is missing its provenance");
     if (root !== encoded(`${reservation.effect_id}:${reservation.mutation_id}`)) {
       throw new Error("Successful-fix reservation path does not match its provenance");
+    }
+    if (!completion) continue;
+    if (JSON.stringify({ ...reservationProvenance(completion, cycle), status: "charged" })
+      !== JSON.stringify({ ...reservationProvenance(reservation, cycle), status: "charged" })) {
+      throw new Error("Successful-fix reservation completion provenance mismatch");
     }
     reservations.push({ reservation, completion });
   }
@@ -1087,12 +1110,25 @@ async function readActionInvocationCompletions(
   const roots = await readDirectoryEntries(runDir, "reviews/action-invocations");
   const completions: Array<z.infer<typeof actionInvocationCompletionSchema>> = [];
   for (const root of roots) {
+    const claim = await readOptionalValidatedArtifact(
+      runDir,
+      `reviews/action-invocations/${root}/claim.json`,
+      actionInvocationClaimSchema,
+    );
+    if (!claim) throw new Error("Action invocation is missing its immutable claim");
+    const claimId = [claim.effect_id, claim.review_revision, claim.action_id, claim.action_attempt].join(":");
+    if (root !== encoded(claimId)) throw new Error("Action invocation path does not match its claim provenance");
     const completion = await readOptionalValidatedArtifact(
       runDir,
       `reviews/action-invocations/${root}/completion.json`,
       actionInvocationCompletionSchema,
     );
-    if (!completion) throw new Error("Successful action fix is missing its immutable invocation completion");
+    if (!completion) continue;
+    const { state: _claimState, completed_profile: _claimCompletedProfile, ...claimProvenance } = claim;
+    const { state: _completionState, completed_profile: _completionProfile, report_sha256: _reportSha256, ...completionProvenance } = completion;
+    if (JSON.stringify(completionProvenance) !== JSON.stringify(claimProvenance)) {
+      throw new Error("Action invocation completion does not match its claim provenance");
+    }
     completions.push(completion);
   }
   return completions;
@@ -1187,24 +1223,32 @@ export async function loadSuccessfulFixProvenanceLocked(
       effectCompletionPath(cycle.effect_id),
       reviewCycleStateSchema,
     );
+    const claim = completion ? null : await readOptionalValidatedArtifact(
+      transaction.runDir,
+      effectClaimPath(cycle.effect_id),
+      reviewCycleStateSchema,
+    );
+    const persistedEffect = completion ?? claim;
     if (
-      !completion
-      || completion.effect_state !== "complete"
-      || completion.effect_owner !== marker.effect_owner
-      || JSON.stringify(invariantCycle(completion)) !== JSON.stringify(invariantCycle(cycle))
-    ) throw new Error("Successful-fix marker requires its matching completed effect");
+      !persistedEffect
+      || (persistedEffect.effect_state !== "complete" && persistedEffect.effect_state !== "in_progress")
+      || persistedEffect.effect_owner !== marker.effect_owner
+      || JSON.stringify(invariantCycle(persistedEffect)) !== JSON.stringify(invariantCycle(cycle))
+    ) throw new Error("Successful-fix marker requires its matching claimed or completed effect");
 
     if (marker.kind === "successful_fix") {
       if (mutationIds.has(marker.mutation_id)) throw new Error("Successful-fix mutation IDs must be unique");
       mutationIds.add(marker.mutation_id);
-      const result = normalFixEffectResultSchema.safeParse(completion.effect_result);
-      if (!result.success || result.data.implementation_path !== marker.mutation_id) {
-        throw new Error("Successful fix effect evidence does not own its accounting marker");
+      if (completion) {
+        const result = normalFixEffectResultSchema.safeParse(completion.effect_result);
+        if (!result.success || result.data.implementation_path !== marker.mutation_id) {
+          throw new Error("Successful fix effect evidence does not own its accounting marker");
+        }
       }
       const prefix = `implementation/${cycle.work_item_id.replace(/[^a-zA-Z0-9._-]/g, "_")}/`;
-      await requireOwnedFile(transaction.runDir, result.data.implementation_path, prefix);
+      await requireOwnedFile(transaction.runDir, marker.mutation_id, prefix);
       if (marker.accounting_before.plan_revision === accounting.plan_revision) {
-        evidence.add(result.data.implementation_path);
+        evidence.add(marker.mutation_id);
       }
       continue;
     }

@@ -257,3 +257,29 @@ export async function advancePreparedRunToDiscovery(
   enforceRequiredPreflight(report, options.dryRun);
   return transitionRun(prepared.ledger.runDir, "brain_discovery", { actor: "cli" });
 }
+
+export async function retryRunPreflightToDiscovery(
+  runDir: string,
+  options: { dryRun: boolean },
+): Promise<RunManifestV2> {
+  const manifest = await readManifestV2(runDir);
+  if (manifest.stage !== "preflight") {
+    throw new Error(`Preflight retry requires stage preflight; got ${manifest.stage}`);
+  }
+  const repoRoot = manifest.repo_root;
+  const config = await loadFreshRunConfig(repoRoot, options.dryRun);
+  const intakeRaw = JSON.parse(
+    await readFile(join(runDir, manifest.intake_path), "utf8"),
+  ) as Parameters<typeof resolveRunIntake>[0];
+  const intake = resolveRunIntake({ ...intakeRaw, repo_root: repoRoot }, config);
+  const report = await runPreflight({
+    repoRoot,
+    config: { ...config, profiles: intake.roles } as never,
+    strict: false,
+    githubMode: intake.mode === "github",
+    research: intake.research,
+  });
+  await persistPreflight(runDir, report);
+  enforceRequiredPreflight(report, options.dryRun);
+  return transitionRun(runDir, "brain_discovery", { actor: "cli" });
+}

@@ -295,6 +295,10 @@ describe("runHandsFixPacket", () => {
     expect(prompt).toContain(fixture.contextRef.sha256);
     expect(prompt).toContain("COMPLETE_FIX_DIFF_SENTINEL");
     expect(prompt).toContain(`"packet_id": "${fixture.boundedPacket.provenance.packet_id}"`);
+    expect(prompt).toContain("must quote one requirement string exactly");
+    expect(prompt).toContain("when every change unit is complete, return");
+    expect(prompt).toContain("`unresolved_requirements: []` and `blocker: null`");
+    expect(prompt).toContain("The controller independently verifies the change");
     for (const leaked of ["BROAD_SOURCE_SENTINEL", "BROAD_EVIDENCE_SENTINEL", "BROAD_DEPENDENCY_SENTINEL", "BROAD_DIFF_SENTINEL"] ) {
       expect(prompt).not.toContain(leaked);
     }
@@ -743,6 +747,33 @@ describe("runHandsFixPacket", () => {
     let reinvocations = 0;
     await expect(runHandsFixPacket({ ...base, codex: { invoke: async () => { reinvocations += 1; return { text: JSON.stringify(result), parsed: result, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics }; } }  })).rejects.toThrow(/ambiguous/i);
     expect(reinvocations).toBe(0);
+  });
+
+  it("reinvokes an exact started packet claim only with explicit diagnostic recovery authority", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-fix-worker-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const base = { runDir: ledger.runDir, worktreePath: root, workItem: item, packet, actionAttempt: 1, intake: { ...intake, repo_root: root }, relevantSourceContext: [], evidenceContext: [], completedDependencies: [], currentDiff: "", supplement: null };
+    await expect(runHandsFixPacket({ ...base, codex: { invoke: async () => { throw new Error("transport ended after dispatch"); } } })).rejects.toThrow(/transport ended/);
+    let reinvocations = 0;
+    let recoveryArtifactName: string | undefined;
+    let recoveryPrompt: string | undefined;
+
+    const recovered = await runHandsFixPacket({
+      ...base,
+      recoverStartedInvocation: true,
+      codex: { invoke: async (input) => {
+        reinvocations += 1;
+        recoveryArtifactName = input.artifactName;
+        recoveryPrompt = input.prompt;
+        return { text: JSON.stringify(result), parsed: result, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics };
+      } },
+    });
+
+    expect(recovered.result).toEqual(result);
+    expect(reinvocations).toBe(1);
+    expect(recoveryArtifactName).toMatch(/-resume-2$/);
+    expect(recoveryPrompt).toContain(hashReviewFixPacket(packet));
+    expect(recoveryPrompt).toContain("Do not invent packet command IDs");
   });
 
   it("resumes a legacy persisted primary claim and result without reinvoking Hands", async () => {

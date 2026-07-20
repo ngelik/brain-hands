@@ -590,12 +590,13 @@ describe("v2 operator status projection", () => {
           replan_patch_path: "replans/item-base-1-review-4.json",
         },
       },
-    }), {}, null, null, "/runs/status", null, null, null, request);
+    }), { operational_blocker: true }, null, null, "/runs/status", null, null, null, request);
 
     expect(status.current_revision).toBe(1);
     expect(status.approved_revision).toBe(1);
     expect(status.pending_action).toBeNull();
     expect(status.plan_approval_request?.subject.plan_revision).toBe(2);
+    expect(status.operator_state).toBe("awaiting_plan_approval");
     expect(status.approval_boundary).toBe("Explicit approval is required for plan revision 2.");
     expect(planApprovalBlock(renderRunStatus(status))).toEqual([
       "Approval required: material replan",
@@ -1363,6 +1364,60 @@ describe("v2 operator status projection", () => {
     expect(status.operator_state).toBe("operationally_blocked");
     expect(status.blocker).toMatch(/identity|provenance/i);
     expect(manifest.review_accounting?.review_revision).toBe(1);
+  });
+
+  it("allows claimed review effects to advance mutable work-item progress", async () => {
+    repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-status-active-effect-"));
+    const ledger = await createLegacyRunLedgerV2({ repoRoot, originalRequest: "Status active effect", slug: "status-active-effect" });
+    const plan: BrainPlan = {
+      summary: "Status", assumptions: [], research: [], research_sources: [], architecture: "local", risks: [],
+      work_items: [executionSpec("item")],
+      integration_verification: [["true"]],
+    };
+    await recordPlan(ledger.runDir, `${JSON.stringify(plan)}\n`);
+    await approvePlanRevision(ledger.runDir, 1);
+    let manifest = await updateManifestV2(ledger.runDir, {
+      stage: "fixing",
+      current_work_item_id: "item",
+      work_item_progress: {
+        item: {
+          status: "in_progress",
+          attempts: 1,
+          review_path: "reviews/item/attempt-1.json",
+          verification_path: "verification/local/item/attempt-1/evidence.json",
+        },
+      },
+    });
+    const policy = manifest.review_policy_snapshot!;
+    const cycle = await beginReviewCycle({
+      run_dir: ledger.runDir,
+      work_item_id: "item",
+      phase: "work_item",
+      review_revision: 1,
+      policy_hash: createHash("sha256").update(JSON.stringify(policy)).digest("hex"),
+      finding_ids: [],
+      accounting_before: manifest.review_accounting!,
+      work_item_progress_reference: {
+        attempts: 1,
+        review_path: "reviews/item/attempt-1.json",
+        verification_path: "verification/local/item/attempt-1/evidence.json",
+      },
+      evaluate: () => ({ action: "fix", reason_code: "fix_required", finding_ids: [], policy_revision: policy.policy_revision, authorization_required: false }),
+    });
+    await claimReviewEffect({ run_dir: ledger.runDir, cycle, owner: "runtime:work-item:item" });
+    manifest = await readManifestV2(ledger.runDir);
+    await updateManifestV2(ledger.runDir, {
+      work_item_progress: {
+        item: {
+          ...manifest.work_item_progress.item!,
+          verification_path: "verification/local/item/quality-gate/evidence.json",
+        },
+      },
+    });
+
+    const status = await readOperatorStatus(ledger.runDir);
+    expect(status.operator_state).toBe("progressing_automatically");
+    expect(status.blocker).toBeNull();
   });
 
   it("requires every manifest convergence pointer to resolve", async () => {

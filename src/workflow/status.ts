@@ -270,6 +270,11 @@ export function projectOperatorStatus(
     operatorState = "delivered";
   } else if (evidence.projection_blocker !== undefined && evidence.projection_blocker !== null) {
     operatorState = "operationally_blocked";
+  } else if (
+    planApprovalRequest !== null
+    && manifest.stage === "awaiting_plan_approval"
+  ) {
+    operatorState = "awaiting_plan_approval";
   } else if (recoveryState?.disposition === "diagnostic_stop") {
     operatorState = "diagnostic_stop";
   } else if (evidence.operational_blocker === true || effectiveAssurance?.outcome === "blocked") {
@@ -678,7 +683,7 @@ async function inspectStatusEvidence(runDir: string, manifest: RunManifestV2): P
     const persistedEffect = await validatePersistedReviewEffectState(runDir, cycle, owner);
     const effectState = persistedEffect.effect_state;
     const reference = cycle.work_item_progress_reference;
-    if (reference && (effectState === "pending" || effectState === "in_progress") && (
+    if (reference && effectState === "pending" && (
       reference.attempts !== progress.attempts
       || reference.review_path !== progress.review_path
       || reference.verification_path !== progress.verification_path

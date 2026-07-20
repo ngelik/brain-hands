@@ -604,6 +604,41 @@ describe("runVerification", () => {
 
       expect(evidence.issue_number).toBe(issueNumber);
       expect(evidence.commands).toHaveLength(1);
+      if (browserChecks.length > 0) {
+        expect(evidence.browser_evidence[0]?.screenshot_artifact).toBe(
+          `verification/issue-${issueNumber}/attempt-1/reports/browser.png`,
+        );
+      }
+    } finally {
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps missing browser artifacts inside the verification identity", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-verification-"));
+    const repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-repo-"));
+    try {
+      const evidence = await runVerification({
+        repoRoot,
+        runDir,
+        identity: githubIdentity(33),
+        commands: [[process.execPath, "-e", "process.exit(1)"]],
+        browserChecks: [{
+          name: "failed browser check",
+          url: "http://127.0.0.1:5177/",
+          local_server_command: "npm run dev",
+          required_selectors: ["#app"],
+          console_error_policy: "no_errors",
+          expected_network: [],
+          screenshot_artifact: "artifacts/playwright/missing.png",
+        }],
+      });
+
+      expect(evidence.browser_evidence[0]).toMatchObject({
+        status: "failed",
+        screenshot_exists: false,
+        screenshot_artifact: "verification/issue-33/attempt-1/artifacts/playwright/missing.png",
+      });
     } finally {
       await rm(repoRoot, { recursive: true, force: true });
     }
@@ -751,7 +786,8 @@ describe("runVerification", () => {
         screenshot_exists: true,
         observed_network: ["/app.js", "/styles.css"],
         missing_network: [],
-        evidence_report_path: "reports/browser-evidence.json",
+        screenshot_artifact: "verification/issue-21/attempt-1/reports/desktop.png",
+        evidence_report_path: "verification/issue-21/attempt-1/reports/browser-evidence.json",
       });
     } finally {
       await rm(repoRoot, { recursive: true, force: true });
@@ -814,7 +850,61 @@ describe("runVerification", () => {
         observed_network: ["/app.js", "/styles.css"],
         missing_network: [],
         missing_selectors: [],
-        evidence_report_path: "reports/browser-evidence.json",
+        screenshot_artifact: "verification/issue-24/attempt-1/reports/desktop.png",
+        evidence_report_path: "verification/issue-24/attempt-1/reports/browser-evidence.json",
+      });
+    } finally {
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("stages and normalizes scenario-named browser evidence reports", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-verification-"));
+    const repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-repo-"));
+    await mkdir(join(repoRoot, "artifacts/playwright"), { recursive: true });
+    await writeFile(join(repoRoot, "artifacts/playwright/desktop-overview.png"), "png\n", "utf8");
+    await writeFile(
+      join(repoRoot, "artifacts/playwright/desktop-overview.json"),
+      `${JSON.stringify({
+        checkName: "desktop-overview",
+        status: "passed",
+        screenshotArtifact: "artifacts/playwright/desktop-overview.png",
+        observedRequests: [{ method: "GET", url: "http://127.0.0.1:4173/" }],
+        observedRequestOrigins: ["http://127.0.0.1:4173"],
+        pageErrors: [],
+        consoleErrors: [],
+        failedRequests: [],
+        nonLocalRequests: [],
+        assertions: { requiredSelectors: true },
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    try {
+      const evidence = await runVerification({
+        repoRoot,
+        runDir,
+        identity: githubIdentity(25),
+        commands: [[process.execPath, "-e", "process.stdout.write('verified')"]],
+        expectedArtifacts: ["artifacts/playwright/desktop-overview.json"],
+        browserChecks: [{
+          name: "production-desktop-overview",
+          url: "http://127.0.0.1:4173",
+          local_server_command: "npm run preview:app",
+          required_selectors: ["#app"],
+          console_error_policy: "no_errors",
+          expected_network: ["http://127.0.0.1:4173"],
+          screenshot_artifact: "artifacts/playwright/desktop-overview.png",
+        }],
+      });
+
+      expect(evidence.browser_evidence[0]).toMatchObject({
+        status: "passed",
+        observed_network: ["http://127.0.0.1:4173", "GET http://127.0.0.1:4173/"],
+        missing_network: [],
+        missing_selectors: [],
+        screenshot_artifact: "verification/issue-25/attempt-1/artifacts/playwright/desktop-overview.png",
+        evidence_report_path: "verification/issue-25/attempt-1/artifacts/playwright/desktop-overview.json",
       });
     } finally {
       await rm(repoRoot, { recursive: true, force: true });
@@ -863,7 +953,11 @@ describe("runVerification", () => {
           screenshot_artifact: "reports/browser-evidence.json",
         }],
       });
-      expect(evidence.browser_evidence[0]).toMatchObject({ status: "passed", evidence_report_path: "reports/browser-evidence.json" });
+      expect(evidence.browser_evidence[0]).toMatchObject({
+        status: "passed",
+        screenshot_artifact: "verification/issue-28/attempt-1/reports/browser-evidence.json",
+        evidence_report_path: "verification/issue-28/attempt-1/reports/browser-evidence.json",
+      });
     } finally {
       await rm(repoRoot, { recursive: true, force: true });
     }

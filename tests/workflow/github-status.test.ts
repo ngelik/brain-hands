@@ -12,6 +12,7 @@ import { appendGitHubStatusIntent, readGitHubStatusCheckpoint, readGitHubStatusI
 import { eventMarker, statusMarker } from "../../src/github/status-projection.js";
 import { replayGitHubStatusIntents } from "../../src/workflow/github-status.js";
 import { executionSpec } from "../fixtures/execution-spec.js";
+import { rewriteLegacyWorkflowProtocol } from "../fixtures/legacy-run.js";
 
 let root: string | undefined;
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = undefined; });
@@ -162,6 +163,7 @@ describe("GitHub status workflow projection", () => {
   it("reconstructs missing issue and delivery intents from durable ledger progress", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-workflow-status-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "Deliver feature", mode: "github" });
+    await rewriteLegacyWorkflowProtocol(ledger.runDir);
     const github = new IntentAwareGitHub(ledger.runDir);
     const issueNumber = await github.createIssue(item);
     const issueEvidencePath = "verification/issue-1/attempt-1/evidence.json";
@@ -175,7 +177,6 @@ describe("GitHub status workflow projection", () => {
     const transitionAt = "2026-07-11T16:25:00.000Z";
     let manifest = await readManifestV2(ledger.runDir);
     manifest = await updateManifestV2(ledger.runDir, {
-      workflow_protocol: "legacy-v2",
       discovery: null,
       github_ids: {
         ...manifest.github_ids,
@@ -349,6 +350,7 @@ describe("GitHub status workflow projection", () => {
   it("uses the persisted Verifier attempt for a reconstructed requested-changes event", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-workflow-status-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "Deliver feature", mode: "github" });
+    await rewriteLegacyWorkflowProtocol(ledger.runDir);
     const github = new DryRunGitHubAdapter();
     const issueNumber = await github.createIssue(item);
     const reviewPath = "reviews/feature/attempt-1.json";
@@ -378,6 +380,7 @@ describe("GitHub status workflow projection", () => {
   it("replays immutable events with their originating evidence and review", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-workflow-status-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "Deliver feature", mode: "github" });
+    await rewriteLegacyWorkflowProtocol(ledger.runDir);
     const github = new DryRunGitHubAdapter();
     const issueNumber = await github.createIssue(item);
     const failedEvidencePath = "verification/issue-7/attempt-1/evidence.json";
@@ -397,7 +400,6 @@ describe("GitHub status workflow projection", () => {
     const transitionAt = "2026-07-11T16:25:00.000Z";
     let manifest = await readManifestV2(ledger.runDir);
     manifest = await updateManifestV2(ledger.runDir, {
-      workflow_protocol: "legacy-v2",
       discovery: null,
       stage: "delivery",
       github_ids: { ...manifest.github_ids, issue_numbers: [issueNumber], work_item_issue_map: { feature: issueNumber } },

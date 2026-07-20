@@ -845,11 +845,24 @@ describe("adaptive Brain discovery", () => {
       revision: 2,
       goal: "Persist planning-gap discovery",
       decisions: [{ id: "d-001", statement: "Use both planning-gap answers.", source_question_ids: ["cycle-002-q-001", "cycle-002-q-002"] }],
+      selected_approach_id: "approach-always",
+      selected_approach_rationale: "It preserves the selected planning-gap architecture.",
     };
+    const approachPending = await runDiscoveryTurn({
+      runDir: run.ledger.runDir,
+      intake: run.intake,
+      codex: new QueuedBrain([ready({ brief: revisedBrief })]),
+    });
+    expect(approachPending).toMatchObject({
+      state: "awaiting_discovery_approach",
+      approaches,
+    });
+    if (approachPending.state !== "awaiting_discovery_approach") throw new Error("Expected planning-gap approaches");
+    await selectDiscoveryApproach(run.ledger.runDir, approachPending.revision, "approach-always");
     const briefBrain = new QueuedBrain([
       ready({
-        approaches: [],
-        alternatives_omitted_reason: "The planning gap is resolved.",
+        approaches,
+        alternatives_omitted_reason: null,
         brief: { ...revisedBrief, revision: 3 },
       }),
     ]);

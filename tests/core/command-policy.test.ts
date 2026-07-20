@@ -19,6 +19,15 @@ describe("assertApprovedCommand", () => {
     expect(() => assertApprovedCommand(["npm", "test", "--", "tests/unit.test.ts"], worktree!)).not.toThrow();
   });
 
+  it("accepts JavaScript syntax in a direct Node eval argument without a shell", async () => {
+    worktree = await mkdtemp(join(tmpdir(), "brain-hands-policy-"));
+    expect(() => assertApprovedCommand([
+      "node",
+      "-e",
+      "const value = `safe`; if (value !== 'safe') process.exit(1);",
+    ], worktree!)).not.toThrow();
+  });
+
   it.each([
     ["shell composition", ["npm", "test;", "echo", "bad"]],
     ["redirection", ["npm", "test", ">", "/tmp/out"]],

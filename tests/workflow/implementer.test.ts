@@ -425,10 +425,10 @@ describe("implementIssue", () => {
       identity: { scope: "github", work_item_id: "legacy-issue-1", issue_number: 1 },
       reportPath: "reports/browser-evidence-issue-1.json",
     });
-    expect(evidence.artifacts).toContain("reports/browser-evidence-issue-1.json");
+    expect(evidence.artifacts).not.toContain("reports/browser-evidence-issue-1.json");
     expect(evidence.browser_evidence[0]).toMatchObject({
       status: "passed",
-      evidence_report_path: "reports/browser-evidence-issue-1.json",
+      evidence_report_path: "verification/issue-1/attempt-1/reports/browser-evidence-issue-1.json",
     });
     expect(prVerification.browser_evidence[0].status).toBe("passed");
     expect(github.openPullRequests).toHaveLength(1);

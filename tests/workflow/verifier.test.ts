@@ -18,6 +18,7 @@ import { execFileSync } from "node:child_process";
 import { collectScopedWorktreeDiff } from "../../src/adapters/git.js";
 import { readdir } from "node:fs/promises";
 import { normalizeReviewerActions, validateReviewerActionQueue } from "../../src/workflow/reviewer-actions.js";
+import { createLegacyRunLedgerV2 } from "../fixtures/legacy-run.js";
 const codexMetrics = { usage: null, durationMs: 0, processStarted: false, turnStarted: false, structuredTerminalError: false } as const;
 
 const item: WorkItem = executionSpec("item-1");
@@ -125,15 +126,15 @@ async function gitWorktree(rootPath: string): Promise<{ worktreePath: string; ba
   return { worktreePath, baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreePath, encoding: "utf8" }).trim() };
 }
 
-async function boundedVerifierFixture() {
+async function boundedVerifierFixture(legacy = false) {
   root = await mkdtemp(join(tmpdir(), "brain-hands-bounded-verifier-"));
   const git = await gitWorktree(root);
   await mkdir(join(git.worktreePath, "src"), { recursive: true });
   await writeFile(join(git.worktreePath, "src/item-1.ts"), "export const item = 1;\n");
-  const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task, sourceCommit: git.baseCommit, worktreePath: git.worktreePath });
+  const createLedger = legacy ? createLegacyRunLedgerV2 : createRunLedgerV2;
+  const ledger = await createLedger({ repoRoot: root, originalRequest: intake.task, sourceCommit: git.baseCommit, worktreePath: git.worktreePath, branchName: "test-verifier" });
   const plan = await recordPlan(ledger.runDir, JSON.stringify({ work_items: [item] }));
   await approvePlanRevision(ledger.runDir, plan.revision);
-  await updateManifestV2(ledger.runDir, { workflow_protocol: "bounded-context-v1" });
   const boundedImplementation = { ...implementation, changed_files: ["src/item-1.ts"] };
   const implementationRef = await writeImmutableValidatedJson(
     ledger.runDir,
@@ -173,7 +174,7 @@ describe("verifyWorkItem", () => {
     await mkdir(join(root!, "worktree/unrelated"), { recursive: true });
     await writeFile(join(root!, "worktree/unrelated/history.json"), "UNRELATED_WORKTREE_ARTIFACT_SENTINEL");
     const codex = new ExactCoverageVerifier();
-    await verifyWorkItem({ runDir: ledger.runDir, worktreePath: join(root!, "worktree"), workItem: item, contextRef, context, phase: "work_item", final: false, intake: { ...intake, repo_root: root! }, codex, attempt: 1 });
+    const result = await verifyWorkItem({ runDir: ledger.runDir, worktreePath: join(root!, "worktree"), workItem: item, contextRef, context, phase: "work_item", final: false, intake: { ...intake, repo_root: root! }, codex, attempt: 1 });
 
     const prompt = codex.calls[0]!.prompt;
     const normalizedPrompt = prompt.replace(/\s+/g, " ");
@@ -195,6 +196,9 @@ describe("verifyWorkItem", () => {
     expect(prompt).toContain("Orders must be contiguous and one-based");
     expect(prompt).toContain("depends_on");
     expect(prompt).toContain("problem_class");
+    expect(normalizedPrompt).toContain("exactly one approved acceptance ID");
+    expect(normalizedPrompt).toContain("Never join, delimit, or otherwise combine multiple IDs");
+    expect(normalizedPrompt).toContain("emit a separate finding for each affected ID");
     expect(prompt).toContain("exact allowed files");
     expect(prompt).toContain("single-file change units");
     expect(normalizedPrompt).toContain("argument-vector verification commands");
@@ -203,7 +207,35 @@ describe("verifyWorkItem", () => {
     expect(normalizedPrompt).toContain("completion contract");
     expect(prompt).toContain("blocker_code");
     expect(prompt).toContain("test_infrastructure_blocker");
+    expect(normalizedPrompt).toContain("A missing evidence report is not test infrastructure");
+    expect(normalizedPrompt).toContain("That is an inadequate approved plan: return `replan_required`");
     expect(prompt).toContain("does not authorize a workflow transition");
+    expect(prompt).toContain("work_item_id=item-1");
+    expect(prompt).toContain("attempt=1");
+    expect(prompt).toContain("final=false");
+    expect(result.review.evidence_reviewed).toContain(context.verification_ref.path);
+  });
+
+  it("suffixes Verifier invocation evidence after an interrupted turn owns the base response", async () => {
+    const { ledger, contextRef, context, worktreePath } = await boundedVerifierFixture();
+    const base = "verifier-review-item-1-attempt-1";
+    await writeFile(join(ledger.runDir, `responses/${base}.json`), "{}\n", "utf8");
+    const codex = new ExactCoverageVerifier();
+
+    await verifyWorkItem({
+      runDir: ledger.runDir,
+      worktreePath,
+      workItem: item,
+      contextRef,
+      context,
+      phase: "work_item",
+      final: false,
+      intake: { ...intake, repo_root: root! },
+      codex,
+      attempt: 1,
+    });
+
+    expect(codex.calls[0]!.artifactName).toBe(`${base}-resume-2`);
   });
 
   it("fails closed on bounded protocol downgrade and partial-package attempts before artifacts or model work", async () => {
@@ -229,8 +261,7 @@ describe("verifyWorkItem", () => {
   });
 
   it("rejects bounded fields under the legacy manifest instead of upgrading the renderer", async () => {
-    const { ledger, contextRef, context, worktreePath } = await boundedVerifierFixture();
-    await updateManifestV2(ledger.runDir, { workflow_protocol: "durable-discovery-v1" });
+    const { ledger, contextRef, context, worktreePath } = await boundedVerifierFixture(true);
     const codex = new ExactCoverageVerifier();
     await expect(verifyWorkItem({ runDir: ledger.runDir, worktreePath, workItem: item, contextRef, context, phase: "work_item", final: false, intake: { ...intake, repo_root: root! }, codex, attempt: 1 }))
       .rejects.toThrow(/legacy.*bounded context/i);
@@ -299,7 +330,7 @@ describe("verifyWorkItem", () => {
     await mkdir(join(git.worktreePath, "tests"), { recursive: true });
     await writeFile(join(git.worktreePath, "src/item-1.ts"), "export const item = 1;\n");
     await writeFile(join(git.worktreePath, "tests/item-1.test.ts"), "export const tested = true;\n");
-    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task, sourceCommit: git.baseCommit, worktreePath: git.worktreePath });
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task, sourceCommit: git.baseCommit, worktreePath: git.worktreePath, branchName: "test-terminal-verifier" });
     const plan: BrainPlan = { summary: "Terminal package", assumptions: [], research: [], research_sources: ["repo"], architecture: "local", risks: [], work_items: [item], integration_verification: [["npm", "test"]] };
     const recorded = await recordPlan(ledger.runDir, JSON.stringify(plan));
     await approvePlanRevision(ledger.runDir, recorded.revision);
@@ -389,8 +420,7 @@ describe("verifyWorkItem", () => {
   });
   it("reviews implementation and saved evidence read-only", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-verifier-"));
-    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
-    await updateManifestV2(ledger.runDir, { workflow_protocol: "legacy-v2", discovery: null });
+    const ledger = await createLegacyRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
     await writeFile(join(ledger.runDir, "verification/stdout.txt"), "verification passed\n", "utf8");
     await writeFile(join(ledger.runDir, "verification/stderr.txt"), "", "utf8");
     await writeFile(join(ledger.runDir, "verification/result.json"), "{\"exit_code\":0}\n", "utf8");
@@ -429,8 +459,7 @@ describe("verifyWorkItem", () => {
 
   it("preserves strict ordered actions in generated change requests", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-verifier-actions-"));
-    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
-    await updateManifestV2(ledger.runDir, { workflow_protocol: "legacy-v2", discovery: null });
+    const ledger = await createLegacyRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
     const codex = new ParserHonoringVerifier();
 
     const result = await verifyWorkItem({

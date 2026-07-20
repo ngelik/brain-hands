@@ -10,6 +10,7 @@ import {
   AmbiguousEffectError,
   beginReviewCycle,
   claimReviewEffect,
+  recoverClaimedReviewEffectBeforeQueue,
   completeReviewEffect,
   incrementSelfReviewMutation,
   incrementSuccessfulFix,
@@ -249,18 +250,36 @@ async function interruptedStrictQualityMarker(mode: "direct" | "reserved") {
   const reportBytes = "{}\n";
   await mkdir(join(setupResult.runDir, "implementation/item_one"), { recursive: true });
   await writeFile(join(setupResult.runDir, reportPath), reportBytes);
-  await mkdir(join(setupResult.runDir, "reviews/action-invocations/quality-reserved"), { recursive: true });
+  const actionInvocation = {
+    effect_id: setupResult.cycle.effect_id,
+    review_revision: setupResult.cycle.review_revision,
+    action_id: "R1-A1",
+    action_attempt: 1,
+    report_path: reportPath,
+    substage: "quality_recovery",
+    started_profile: { kind: "backup", model: "backup", reasoning_effort: "medium" },
+  } as const;
+  const actionInvocationId = [
+    actionInvocation.effect_id,
+    actionInvocation.review_revision,
+    actionInvocation.action_id,
+    actionInvocation.action_attempt,
+  ].join(":");
+  const actionInvocationRoot = join(
+    setupResult.runDir,
+    "reviews/action-invocations",
+    Buffer.from(actionInvocationId).toString("base64url"),
+  );
+  await mkdir(actionInvocationRoot, { recursive: true });
   await writeFile(
-    join(setupResult.runDir, "reviews/action-invocations/quality-reserved/completion.json"),
+    join(actionInvocationRoot, "claim.json"),
+    `${JSON.stringify({ ...actionInvocation, state: "started", completed_profile: null })}\n`,
+  );
+  await writeFile(
+    join(actionInvocationRoot, "completion.json"),
     `${JSON.stringify({
-      effect_id: setupResult.cycle.effect_id,
-      review_revision: setupResult.cycle.review_revision,
-      action_id: "R1-A1",
-      action_attempt: 1,
-      report_path: reportPath,
-      substage: "primary_fix",
+      ...actionInvocation,
       state: "complete",
-      started_profile: { kind: "backup", model: "backup", reasoning_effort: "medium" },
       completed_profile: { kind: "backup", model: "backup", reasoning_effort: "medium" },
       report_sha256: createHash("sha256").update(reportBytes).digest("hex"),
     })}\n`,
@@ -476,6 +495,32 @@ describe("review cycle persistence", () => {
       .rejects.toBeInstanceOf(AmbiguousEffectError);
     await expect(claimReviewEffect({ run_dir: runDir, cycle, owner: "worker-2" }))
       .rejects.toBeInstanceOf(AmbiguousEffectError);
+  });
+
+  it("recovers an exact claimed fix effect only before its action queue is persisted", async () => {
+    const { runDir, policyHash } = await setup();
+    const cycle = await beginReviewCycle(cycleInput(runDir, policyHash, () => decision));
+    await claimReviewEffect({ run_dir: runDir, cycle, owner: "worker-1" });
+
+    const recovered = await recoverClaimedReviewEffectBeforeQueue({
+      run_dir: runDir,
+      cycle,
+      owner: "worker-1",
+      queue_persisted: false,
+    });
+    expect(recovered).toMatchObject({ status: "acquired", cycle: { effect_state: "in_progress", effect_owner: "worker-1" } });
+    await expect(recoverClaimedReviewEffectBeforeQueue({
+      run_dir: runDir,
+      cycle,
+      owner: "worker-1",
+      queue_persisted: true,
+    })).rejects.toThrow(/cannot be replayed after its action queue was persisted/i);
+    await expect(recoverClaimedReviewEffectBeforeQueue({
+      run_dir: runDir,
+      cycle,
+      owner: "worker-2",
+      queue_persisted: false,
+    })).rejects.toThrow(/owned by worker-1/i);
   });
 
   it("never generically retries after an effect ran but completion was not persisted", async () => {
@@ -792,6 +837,45 @@ describe("review accounting", () => {
     await expect(reserveFixSlot({ ...input, effect_action: "quality_recovery" }))
       .rejects.toThrow(/action|quality recovery|provenance/i);
     expect(await readFile(reservationPath, "utf8")).toBe(parentBytes);
+  });
+
+  it("keeps an admitted but uncharged action reservation valid during status provenance reads", async () => {
+    const { runDir, policyHash } = await setup();
+    const cycle = await beginReviewCycle(cycleInput(runDir, policyHash, () => decision));
+    const input = {
+      run_dir: runDir,
+      cycle,
+      owner: "worker-1",
+      mutation_id: "R1-A1:attempt-1",
+      effect_action: "fix" as const,
+    };
+    await claimReviewEffect(input);
+    await reserveFixSlot(input);
+    const reportPath = "implementation/item_one/attempt-1000101.json";
+    const invocationId = [cycle.effect_id, cycle.review_revision, "R1-A1", 1].join(":");
+    const invocationRoot = join(
+      runDir,
+      "reviews/action-invocations",
+      Buffer.from(invocationId).toString("base64url"),
+    );
+    await mkdir(invocationRoot, { recursive: true });
+    await writeFile(join(invocationRoot, "claim.json"), `${JSON.stringify({
+      effect_id: cycle.effect_id,
+      review_revision: cycle.review_revision,
+      action_id: "R1-A1",
+      action_attempt: 1,
+      report_path: reportPath,
+      substage: "primary_fix",
+      state: "started",
+      started_profile: { kind: "primary", model: "hands", reasoning_effort: "medium" },
+      completed_profile: null,
+    }, null, 2)}\n`);
+    const current = (await readManifestV2(runDir)).review_accounting!;
+
+    const provenance = await withRunLedgerCompoundTransaction(runDir, (transaction) =>
+      loadSuccessfulFixProvenanceLocked(transaction, current));
+
+    expect(provenance).toEqual({ successful_hands_fixes: 0, evidence_refs: [] });
   });
 
   it("replays parent-format charged reservation artifacts without rewriting them", async () => {
@@ -1175,6 +1259,54 @@ describe("review accounting", () => {
       kind: "successful_fix",
       effect_action: "fix",
     });
+    const current = (await readManifestV2(runDir)).review_accounting!;
+
+    const provenance = await withRunLedgerCompoundTransaction(runDir, (transaction) =>
+      loadSuccessfulFixProvenanceLocked(transaction, current));
+
+    expect(provenance).toEqual({
+      successful_hands_fixes: 1,
+      evidence_refs: [implementationPath],
+    });
+  });
+
+  it("proves a charged mutation while its matching review effect remains claimed", async () => {
+    const { runDir, policyHash } = await setup();
+    const cycle = await beginReviewCycle(cycleInput(runDir, policyHash, () => decision));
+    const implementationPath = "implementation/item_one/attempt-claimed.json";
+    const reportBytes = "{}\n";
+    await mkdir(join(runDir, "implementation/item_one"), { recursive: true });
+    await writeFile(join(runDir, implementationPath), reportBytes);
+    await claimReviewEffect({ run_dir: runDir, cycle, owner: "worker-1" });
+    const mutationId = "R1-A1:attempt-1";
+    const reservation = {
+      run_dir: runDir,
+      cycle,
+      owner: "worker-1",
+      mutation_id: mutationId,
+      effect_action: "fix",
+    } as const;
+    await reserveFixSlot(reservation);
+    const invocation = {
+      effect_id: cycle.effect_id,
+      review_revision: cycle.review_revision,
+      action_id: "R1-A1",
+      action_attempt: 1,
+      report_path: implementationPath,
+      substage: "primary_fix",
+      started_profile: { kind: "primary", model: "hands", reasoning_effort: "medium" },
+    } as const;
+    const invocationId = [cycle.effect_id, cycle.review_revision, invocation.action_id, invocation.action_attempt].join(":");
+    const invocationRoot = join(runDir, "reviews/action-invocations", Buffer.from(invocationId).toString("base64url"));
+    await mkdir(invocationRoot, { recursive: true });
+    await writeFile(join(invocationRoot, "claim.json"), `${JSON.stringify({ ...invocation, state: "started", completed_profile: null })}\n`);
+    await writeFile(join(invocationRoot, "completion.json"), `${JSON.stringify({
+      ...invocation,
+      state: "complete",
+      completed_profile: invocation.started_profile,
+      report_sha256: createHash("sha256").update(reportBytes).digest("hex"),
+    })}\n`);
+    await commitReservedFixSlot(reservation);
     const current = (await readManifestV2(runDir)).review_accounting!;
 
     const provenance = await withRunLedgerCompoundTransaction(runDir, (transaction) =>

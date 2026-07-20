@@ -45,9 +45,12 @@ import {
   brainPlanOutputSchema,
   discoveryOutcomeOutputSchema,
   actionResolutionReviewOutputSchema,
+  handsSelfReviewReportOutputSchema,
   implementationResultOutputSchema,
   planningDiscoveryGapOutputSchema,
   verifierReviewOutputSchema,
+  fixPacketResultV1OutputSchema,
+  fixPacketResolutionV1OutputSchema,
 } from "../../src/core/output-schemas.js";
 import type { BrowserEvidenceReport, IssueSpec, RemoteSynchronizationEvidence } from "../../src/core/types.js";
 
@@ -1129,7 +1132,8 @@ describe("v2 contracts", () => {
       decision: "still_open",
       required_next_fix: "Add the guard",
     }).success).toBe(false);
-    expect(actionResolutionReviewOutputSchema.allOf).toHaveLength(2);
+    expect("allOf" in actionResolutionReviewOutputSchema).toBe(false);
+    expect("allOf" in handsSelfReviewReportOutputSchema).toBe(false);
   });
 
   it("requires executable argument vectors for every work item verification", () => {
@@ -1657,6 +1661,28 @@ describe("v2 contracts", () => {
     expect(browserCheck.properties.viewport.required).toEqual(["width", "height", "mobile"]);
     expect(browserCheck.required).toEqual(Object.keys(browserCheck.properties));
     expect(workItem.required).toEqual(Object.keys(workItem.properties));
+  });
+
+  it("declares the fix-packet schema version type for strict provider validation", () => {
+    expect(fixPacketResultV1OutputSchema.properties.schema_version).toEqual({
+      type: "integer",
+      const: 1,
+    });
+  });
+
+  it.each([fixPacketResultV1OutputSchema, fixPacketResolutionV1OutputSchema])("publishes a fully strict fix-packet provider schema", (schema) => {
+    const visit = (value: unknown): void => {
+      if (!value || typeof value !== "object") return;
+      const node = value as Record<string, unknown>;
+      if (Object.hasOwn(node, "const")) expect(node).toHaveProperty("type");
+      const types = Array.isArray(node.type) ? node.type : [node.type];
+      if (types.includes("object")) {
+        expect(node.additionalProperties).toBe(false);
+        expect(node.required).toEqual(Object.keys(node.properties as Record<string, unknown>));
+      }
+      for (const child of Object.values(node)) visit(child);
+    };
+    visit(schema);
   });
 
   it("preserves runtime browser check URL validation", () => {

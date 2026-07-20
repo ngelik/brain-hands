@@ -112,6 +112,9 @@ const heartbeatPhase = (intent: ProgressIntent): Phase => ({
   verification: "verification", runtime: "starting", github: "delivery",
 })[intent.source] as Phase;
 const roleName = (source: ProgressIntent["source"]): string => source[0]!.toUpperCase() + source.slice(1);
+const progressWarningLabel = (intent: ProgressIntent): string => intent.warningKind === "item_error"
+  ? "Model progress reported a non-terminal item error"
+  : "Skipped an unreadable progress event";
 
 const CATALOG: Record<ProgressCode, Descriptor> = {
   worker_started: { phase: "starting", status: "started", label: fixed("Worker session started") },
@@ -174,7 +177,7 @@ const CATALOG: Record<ProgressCode, Descriptor> = {
   reflection_recorded: { phase: "reflection", status: "completed", label: fixed("Reflection recorded") },
   local_delivery_ready: { phase: "delivery", status: "completed", label: fixed("Run ready for local delivery") },
   github_delivery_ready: { phase: "delivery", status: "completed", label: fixed("Run ready for GitHub delivery") },
-  progress_warning: { phase: "warning", status: "warning", label: fixed("Skipped an unreadable progress event") },
+  progress_warning: { phase: "warning", status: "warning", label: progressWarningLabel },
   role_failed: { phase: "failed", status: "failed", label: fixed("Workflow step failed; inspect the run artifacts") },
 };
 

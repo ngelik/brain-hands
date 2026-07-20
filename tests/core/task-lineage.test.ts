@@ -32,7 +32,7 @@ async function makeRepo(): Promise<string> {
 
 function lease(pid: number, host = hostname()): string {
   return `${JSON.stringify({
-    token: "fixture-lease-token",
+    token: "946c7414-d500-4e65-a596-dcf99f0015c3",
     host,
     pid,
     created_at: "2000-01-01T00:00:00.000Z",

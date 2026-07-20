@@ -385,9 +385,21 @@ export function normalizeReviewInputs(input: NormalizeReviewInput): NormalizedRe
     });
   }
 
+  const verificationFindings = verificationFindingInputs(input);
+  if (input.phase === "work_item" && input.review.decision === "approve" && verificationFindings.length > 0) {
+    return invalidContract(
+      input,
+      "Verifier approval contradicts failed required verification evidence",
+      verificationFindings.flatMap((finding) => finding.evidence_refs),
+    );
+  }
+
   try {
     return {
-      findings: mergeAndFingerprint([...normalized, ...verificationFindingInputs(input)]),
+      findings: mergeAndFingerprint([
+        ...normalized,
+        ...(input.phase === "work_item" ? [] : verificationFindings),
+      ]),
       operational_blocker: null,
     };
   } catch (error) {

@@ -121,10 +121,36 @@ describe("Reviewer action queues", () => {
     const queue = normalizePolicyReviewerActions(review, 1, workItem, [mediumId]);
     expect(queue.actions).toHaveLength(1);
     expect(queue.actions[0]!.file).toBe(medium.file);
-    expect(() => normalizePolicyReviewerActions(review, 1, workItem, [`finding:${"f".repeat(64)}`])).toThrow(/exactly one action/i);
+    expect(() => normalizePolicyReviewerActions(review, 1, workItem, [`finding:${"f".repeat(64)}`])).toThrow(/no actionable finding/i);
     expect(() => normalizePolicyReviewerActions({ ...review, findings: [medium, { ...medium, problem: "duplicate" }] }, 1, workItem, [mediumId])).toThrow(/more than one action/i);
     const extraQueue = normalizePolicyReviewerActions(review, 1, workItem, [mediumId, lowId]);
-    expect(() => assertPolicyReviewerQueueAuthority(extraQueue, workItem, [mediumId])).toThrow(/exactly one action/i);
+    expect(() => assertPolicyReviewerQueueAuthority(extraQueue, workItem, [mediumId])).toThrow(/outside the authorized decision/i);
+  });
+
+  it("allows a remediation queue to cover the actionable subset of an engine decision", () => {
+    const workItem = executionSpec("item-1");
+    const remediation = {
+      schema_version: 1 as const,
+      diagnosis: { observed_behavior: "Wrong", expected_behavior: "Right", failure_mechanism: "Missing", reproduction: ["Run"], evidence_refs: ["verification/evidence.json"] },
+      targets: [{ kind: "code" as const, path: "src/item-1.ts", symbol: "item-1 implementation", line_hint: null }],
+      remediation: { strategy: "Fix", change_units: [{ id: "FIX-1", path: "src/item-1.ts", target: "item-1 implementation", operation: "modify" as const, requirements: ["Make right."], satisfies: ["SC-1"] }], allowed_files: ["src/item-1.ts"], forbidden_changes: [] },
+      verification: { commands: [{ id: "CMD-1", argv: ["npm", "test", "--", "tests/item-1.test.ts"] }], success_conditions: [{ id: "SC-1", statement: "Right", satisfied_by: ["CMD-1", "EV-1"] }], required_evidence: [{ id: "EV-1", kind: "test_result" as const, source_id: "CMD-1", output_path: "verification/result.json" }] },
+      completion_contract: { required_change_unit_ids: ["FIX-1"], expected_changed_files: ["src/item-1.ts"], allow_additional_files: false as const },
+    };
+    const finding = {
+      severity: "medium" as const, file: "src/item-1.ts", line: null,
+      acceptance_criterion: workItem.acceptance[0]!.id, problem_class: "correctness" as const,
+      problem: "Wrong", required_fix: "Fix", evidence_refs: ["verification/evidence.json"], remediation,
+    };
+    const findingId = fingerprintFinding({ work_item_id: workItem.id, criterion_ref: workItem.acceptance[0]!.id, source: "verifier", normalized_location: finding.file, problem_class: finding.problem_class });
+    const verificationFindingId = `finding:${"e".repeat(64)}`;
+
+    expect(() => normalizePolicyReviewerActions(
+      { ...legacyReview, work_item_id: workItem.id, findings: [finding] },
+      1,
+      workItem,
+      [findingId, verificationFindingId],
+    )).not.toThrow();
   });
 
   it("rejects duplicate action IDs", () => {

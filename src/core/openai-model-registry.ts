@@ -1,12 +1,13 @@
-export type KnownModelSurface = "codex_and_api" | "api_only";
+export type KnownModelSurface = "codex_and_api" | "codex_only" | "api_only";
 
 export interface KnownOpenAIModel {
   readonly id: string;
-  readonly family: "gpt-5.6" | "gpt-5.5";
-  readonly tier: "alias" | "sol" | "terra" | "luna" | "flagship" | "pro" | "snapshot";
+  readonly family: "gpt-5.6" | "gpt-5.5" | "gpt-5.3-codex";
+  readonly tier: "alias" | "sol" | "terra" | "luna" | "flagship" | "pro" | "spark" | "snapshot";
   readonly description: string;
   readonly reasoning_efforts: readonly string[];
   readonly surface: KnownModelSurface;
+  readonly recommended_reasoning_effort?: string;
   readonly resolves_to?: string;
   readonly aliases: readonly string[];
 }
@@ -84,6 +85,16 @@ export const KNOWN_OPENAI_MODELS: readonly KnownOpenAIModel[] = [
     reasoning_efforts: ["medium", "high", "xhigh"],
     surface: "api_only",
     aliases: [],
+  },
+  {
+    id: "gpt-5.3-codex-spark",
+    family: "gpt-5.3-codex",
+    tier: "spark",
+    description: "Near-instant text-only Codex research-preview model",
+    reasoning_efforts: ["low", "medium", "high", "xhigh"],
+    recommended_reasoning_effort: "high",
+    surface: "codex_only",
+    aliases: ["spark", "codex spark", "5.3 spark", "5.3 codex spark", "gpt 5.3 codex spark"],
   },
 ] as const;
 

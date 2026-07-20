@@ -834,6 +834,39 @@ describe("plan readiness", () => {
     );
   });
 
+  it("rejects a change unit whose requirements explicitly forbid its byte change", () => {
+    const plan = validPlan();
+    plan.work_items[0].change_units[0].requirements = [
+      "Perform no content change; use this modify operation only as an execution marker.",
+    ];
+
+    expect(() => assertPlanReady(plan)).toThrowError(
+      /change requirement contradicts operation modify.*perform no content change/i,
+    );
+  });
+
+  it("rejects browser screenshot collisions across work items", () => {
+    const browserCheck = {
+      name: "desktop",
+      url: "http://127.0.0.1:5177/",
+      local_server_command: "npm run dev",
+      required_selectors: [],
+      console_error_policy: "no_errors" as const,
+      expected_network: [],
+      screenshot_artifact: "artifacts/desktop.png",
+    };
+    const first = executionSpecV2Schema.parse({ ...validExecutionSpec(), browser_checks: [browserCheck] });
+    const second = executionSpecV2Schema.parse({
+      ...validExecutionSpec(),
+      id: "BH-002",
+      browser_checks: [{ ...browserCheck, name: "final-desktop" }],
+    });
+
+    expect(() => assertPlanReady({ ...validPlan(), work_items: [first, second] })).toThrowError(
+      /duplicate browser screenshot artifact artifacts\/desktop\.png across work items BH-001 and BH-002/,
+    );
+  });
+
   it("checks frozen browser server commands before local approval", () => {
     const plan = validPlan();
     plan.work_items[0].verification_commands[0].argv = ["npm", "test"];

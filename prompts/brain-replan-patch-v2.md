@@ -44,6 +44,9 @@ Requirements:
   expected_exit_code 0 and tier `focused` or `cross_cutting`. Existing verification commands are immutable.
   Use `satisfies` to link every added command to one or more existing local acceptance IDs.
   Keep all focused commands before cross_cutting commands. Otherwise return an empty array.
+- Every added command referenced by `added_cross_cutting_impacts` must use tier `cross_cutting`.
+  Because added commands are appended, if the target already contains a cross_cutting command,
+  every added verification command must also use tier `cross_cutting`.
 - Return one `added_cross_cutting_impacts` row for every added shared helper or critical surface,
   linking it to its change unit and cross_cutting verification command IDs. Otherwise return an empty array.
 - When creating a reusable helper, either add its path to the reviewed critical-surface registry in the same change or classify its change unit as shared_helper and enumerate its callers.

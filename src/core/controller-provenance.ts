@@ -310,14 +310,31 @@ export async function assertCurrentControllerMatches(
 type CaptureController = typeof captureControllerProvenance;
 
 export async function assertApprovalControllerMatches(
+  runDir: string,
   manifest: RunManifestV2,
   capture: CaptureController = captureControllerProvenance,
 ): Promise<void> {
   if (!manifest.controller_provenance) {
     throw new Error("Plan approval requires immutable controller provenance");
   }
+  let recorded: ControllerRuntimeSnapshotV1 = controllerRuntimeSnapshot(manifest.controller_provenance);
+  if ((manifest.controller_recovery?.transition_count ?? 0) > 0) {
+    if (manifest.controller_recovery.head_path === null) {
+      throw new Error("Plan approval controller recovery is missing its accepted head");
+    }
+    const artifact = controllerRecoveryArtifactV1Schema.parse(JSON.parse((await readOwnedEvidenceFile(
+      runDir,
+      manifest.controller_recovery.head_path,
+      "controller-recovery",
+    )).toString("utf8")));
+    if (artifact.run_id !== manifest.run_id
+      || artifact.sequence !== manifest.controller_recovery.transition_count) {
+      throw new Error("Plan approval controller recovery does not match the supplied run manifest");
+    }
+    recorded = artifact.next_runtime;
+  }
   const current = (await capture(manifest.repo_root)).provenance;
-  if (!controllerRuntimeMatches(current, manifest.controller_provenance)) {
-    throw new Error("Current approval controller does not match the immutable run controller");
+  if (!controllerRuntimeMatches(current, recorded)) {
+    throw new Error("Current approval controller does not match the accepted run controller");
   }
 }

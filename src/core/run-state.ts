@@ -19,7 +19,7 @@ export const ALLOWED_TRANSITIONS: Readonly<Record<RunStageV2, readonly RunStageV
   github_issue_sync: ["worktree_setup", "implementing"],
   implementing: ["verifying"],
   verifying: ["verifier_review"],
-  verifier_review: ["fixing", "replanning", "implementing", "final_verification", "delivery"],
+  verifier_review: ["verifying", "fixing", "replanning", "implementing", "final_verification", "delivery"],
   fixing: ["verifying", "final_verification"],
   replanning: ["brain_planning", "awaiting_plan_approval"],
   final_verification: ["verifying", "verifier_review"],

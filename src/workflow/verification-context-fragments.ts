@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import {
   artifactRefFromBytes,
   artifactSegment,
@@ -74,6 +75,25 @@ function workItemIdentity(manifest: RunManifestV2, workItemId: string): Verifica
   return { scope: "github", work_item_id: workItemId, issue_number: issueNumber };
 }
 
+function currentProgressVerificationIdentity(manifest: RunManifestV2, workItemId: string): VerificationIdentity {
+  const base = workItemIdentity(manifest, workItemId);
+  const progress = manifest.work_item_progress[workItemId];
+  const scope = progress?.verification_scope;
+  const progressWorkItemId = progress?.verification_work_item_id;
+  if (scope === undefined && progressWorkItemId === undefined) return base;
+  if (scope !== "local" || typeof progressWorkItemId !== "string") {
+    if (scope === base.scope && progressWorkItemId === base.work_item_id) return base;
+    throw new Error(`Current verification progress identity is invalid for ${workItemId}`);
+  }
+  if (base.scope === "local" && progressWorkItemId === workItemId) return base;
+  const escaped = workItemId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const qualityGate = new RegExp(`^${escaped}:quality-gate:[1-9][0-9]*:(?:baseline|[1-9][0-9]*)(?::authority-[a-f0-9]{16})?$`);
+  if (!qualityGate.test(progressWorkItemId)) {
+    throw new Error(`Current verification progress identity is not an owned quality gate for ${workItemId}`);
+  }
+  return { scope: "local", work_item_id: progressWorkItemId };
+}
+
 export async function currentWorkItemVerificationAuthority(
   runDir: string,
   manifest: RunManifestV2,
@@ -82,13 +102,14 @@ export async function currentWorkItemVerificationAuthority(
 ): Promise<VerificationSourceAuthority | null> {
   const progress = manifest.work_item_progress[workItemId];
   if (typeof progress?.verification_path !== "string") return null;
-  const identity = workItemIdentity(manifest, workItemId);
+  const identity = currentProgressVerificationIdentity(manifest, workItemId);
   const bytes = await readOwnedRunFile(runDir, progress.verification_path);
   const ref = artifactRefFromBytes(progress.verification_path, bytes);
   const evidence = await validateVerificationContextSource(runDir, ref, identity);
+  const qualityGateIdentity = identity.scope === "local" && identity.work_item_id.startsWith(`${workItemId}:quality-gate:`);
   if (
-    evidence.attempt !== progress.attempts
-    || (expectedAttempt !== undefined && progress.attempts !== expectedAttempt)
+    (!qualityGateIdentity && evidence.attempt !== progress.attempts)
+    || (expectedAttempt !== undefined && evidence.attempt !== expectedAttempt)
   ) {
     throw new Error(`Current verification authority does not match ${workItemId} attempt ${expectedAttempt ?? progress.attempts}`);
   }
@@ -100,7 +121,12 @@ function fragmentPath(
   kind: VerificationContextFragmentV1["kind"],
   ordinal: number,
 ): string {
-  return `contexts/fragments/verification/${artifactSegment(`${sourceRef.path}\0${sourceRef.sha256}`)}/${kind}-${ordinal}.json`;
+  const sourceIdentity = `${sourceRef.path}\0${sourceRef.sha256}`;
+  const legacySegment = artifactSegment(sourceIdentity);
+  const segment = legacySegment.length <= 200
+    ? legacySegment
+    : `sha256-${createHash("sha256").update(sourceIdentity).digest("hex")}`;
+  return `contexts/fragments/verification/${segment}/${kind}-${ordinal}.json`;
 }
 
 /** Reconstruct the typed record universe from one authoritative verification bundle. */

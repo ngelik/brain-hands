@@ -249,7 +249,6 @@ describe("runHandsSelfReview", () => {
         },
       };
     }],
-    ["provenance mismatch", () => new RecordingHands({ ...validReport, work_item_id: "item-2" })],
   ])("retains a blocked claim after %s and rejects ordinary replay", async (_label, createCodex) => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-post-invoke-failure-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
@@ -348,6 +347,7 @@ describe("runHandsSelfReview", () => {
 
     expect(result.report).toEqual(validReport);
     expect(backup.calls).toHaveLength(1);
+    expect(backup.calls[0]!.artifactName).toBe("hands-self-review-item-1-attempt-2-pass-1-resume-2");
     expect(JSON.parse(await readFile(
       join(ledger.runDir, "self-review/item-1/attempt-2/pass-1.claim.json.primary-blocked"),
       "utf8",
@@ -425,8 +425,15 @@ describe("runHandsSelfReview", () => {
     ["mutation kind", { mutation_kind: "quality_recovery" as const }],
     ["pass", { pass: 2 }],
     ["active action", { active_action_id: "R2-A2" }],
-  ])("rejects a mismatched %s before persisting the report", async (_label, patch) => {
-    await expect(invoke({ ...validReport, ...patch })).rejects.toThrow("provenance does not match");
+  ])("binds a model-mismatched %s to controller-owned provenance", async (_label, patch) => {
+    const { result } = await invoke({ ...validReport, ...patch });
+    expect(result.report).toMatchObject({
+      work_item_id: "item-1",
+      parent_attempt: 2,
+      mutation_kind: "normal_fix",
+      pass: 1,
+      active_action_id: "R2-A1",
+    });
   });
 
   it("rejects readiness while findings remain", async () => {

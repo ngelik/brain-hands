@@ -178,11 +178,11 @@ describe("controller provenance", () => {
       controller_provenance: recorded,
     } as unknown as RunManifestV2;
 
-    await expect(assertApprovalControllerMatches(manifest, async () => ({
+    await expect(assertApprovalControllerMatches("/candidate/.brain-hands/runs/run", manifest, async () => ({
       provenance: { ...recorded, candidate_commit: "c".repeat(40) },
       selfHosting: false,
     }))).resolves.toBeUndefined();
-    await expect(assertApprovalControllerMatches(manifest, async () => ({
+    await expect(assertApprovalControllerMatches("/candidate/.brain-hands/runs/run", manifest, async () => ({
       provenance: { ...recorded, package_hash: "d".repeat(64) },
       selfHosting: false,
     }))).rejects.toThrow(/approval.*controller/i);

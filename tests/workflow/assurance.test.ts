@@ -75,6 +75,8 @@ async function githubAssuranceRun(): Promise<{ runDir: string; worktree: string;
     intake,
     roles: intake.roles,
     sourceCommit: head,
+    worktreePath: repo.worktree,
+    branchName: "candidate",
     controllerProvenance,
   });
   await writeFile(join(ledger.runDir, "run-configuration.json"), serializeRunConfiguration(runConfiguration));
@@ -156,7 +158,6 @@ async function githubAssuranceRun(): Promise<{ runDir: string; worktree: string;
     current_revision: revision.revision, current_plan_revision: revision.revision,
     approved_revision: revision.revision, approved_plan_revision: revision.revision,
     mode: "github", run_mode: "github", delivery_state: "ready",
-    worktree_path: repo.worktree, branch_name: "candidate",
     pull_request_numbers: [42],
     github_ids: { issue_numbers: [], pull_request_numbers: [42], pull_request_urls: { "42": "https://github.test/org/repo/pull/42/" } },
     final_artifact_paths: [evidencePath, reviewPath],
@@ -191,9 +192,11 @@ async function githubAssuranceRun(): Promise<{ runDir: string; worktree: string;
 }
 
 async function writeSynchronizationEvidence(input: Awaited<ReturnType<typeof githubAssuranceRun>>, patch: Record<string, unknown> = {}): Promise<void> {
+  const manifest = await readManifestV2(input.runDir);
+  if (manifest.branch_name === null) throw new Error("Assurance fixture requires a pinned branch");
   const value = {
-    version: 1, run_id: (await readManifestV2(input.runDir)).run_id,
-    branch_name: "candidate", remote_name: "origin", pull_request_number: 42,
+    version: 1, run_id: manifest.run_id, branch_name: manifest.branch_name,
+    remote_name: "origin", pull_request_number: 42,
     pull_request_url: "https://github.test/org/repo/pull/42", local_candidate_sha: input.head,
     mapped_pr_sha: input.head, remote_head_sha: input.head, problems: [], synchronized: true,
     observed_at: "2026-07-16T12:00:01.000Z", ...patch,
@@ -375,15 +378,18 @@ describe("terminal assurance", () => {
 
   it("uses live three-source recovery only when the manifest truly omits the new field", async () => {
     const run = await githubAssuranceRun();
+    const branchName = (await readManifestV2(run.runDir)).branch_name!;
     const manifestPath = join(run.runDir, "manifest.json");
     const raw = JSON.parse(await readFile(manifestPath, "utf8"));
     delete raw.remote_synchronization_path;
     await writeFile(manifestPath, `${JSON.stringify(raw, null, 2)}\n`);
     let calls = 0;
     const assessment = await assessFinalDelivery(run.runDir, {
+      candidateCommit: run.head,
+      worktreeClean: true,
       legacyRemoteCandidate: {
         resolveRemoteSha: async () => { calls += 1; return run.head; },
-        getPullRequest: async () => { calls += 1; return { number: 42, url: "https://github.test/org/repo/pull/42", head_ref: "candidate", head_sha: run.head, base_ref: "main", state: "OPEN" }; },
+        getPullRequest: async () => { calls += 1; return { number: 42, url: "https://github.test/org/repo/pull/42", head_ref: branchName, head_sha: run.head, base_ref: "main", state: "OPEN" }; },
       },
     });
     expect(assessment.outcome).toBe("verified_ready");
@@ -393,6 +399,7 @@ describe("terminal assurance", () => {
 
   it.each(["malformed", "symlink"])("ignores a %s frozen configuration during true legacy recovery", async (kind) => {
     const run = await githubAssuranceRun();
+    const branchName = (await readManifestV2(run.runDir)).branch_name!;
     const manifestPath = join(run.runDir, "manifest.json");
     const raw = JSON.parse(await readFile(manifestPath, "utf8"));
     delete raw.remote_synchronization_path;
@@ -407,9 +414,11 @@ describe("terminal assurance", () => {
       await symlink(outside, configurationPath);
     }
     expect(await assessFinalDelivery(run.runDir, {
+      candidateCommit: run.head,
+      worktreeClean: true,
       legacyRemoteCandidate: {
         resolveRemoteSha: async () => run.head,
-        getPullRequest: async () => ({ number: 42, url: "https://github.test/org/repo/pull/42", head_ref: "candidate", head_sha: run.head, base_ref: "main", state: "OPEN" }),
+        getPullRequest: async () => ({ number: 42, url: "https://github.test/org/repo/pull/42", head_ref: branchName, head_sha: run.head, base_ref: "main", state: "OPEN" }),
       },
     })).toMatchObject({ outcome: "verified_ready", blocker_code: null });
   });
@@ -446,11 +455,11 @@ describe("terminal assurance", () => {
     const input = {
       runDir: run.runDir,
       repoRoot: manifest.repo_root,
-      branchName: "candidate",
+      branchName: manifest.branch_name!,
       remoteName: "origin",
       pullRequestNumber: 42,
       expectedPullRequestUrl: "https://github.test/org/repo/pull/42",
-      github: { getPullRequest: async () => ({ number: 42, url: "https://github.test/org/repo/pull/42", head_ref: "candidate", head_sha: run.head, base_ref: "main", state: "OPEN" as const }) },
+      github: { getPullRequest: async () => ({ number: 42, url: "https://github.test/org/repo/pull/42", head_ref: manifest.branch_name!, head_sha: run.head, base_ref: "main", state: "OPEN" as const }) },
       resolveLocalSha: async () => run.head,
       resolveRemoteSha: async () => run.head,
       observedAt: () => "2026-07-16T12:00:01.000Z",
@@ -545,6 +554,8 @@ describe("terminal assurance", () => {
       intake,
       roles: intake.roles,
       sourceCommit: head,
+      worktreePath: repo.worktree,
+      branchName: "candidate",
       controllerProvenance,
     });
     await writeFile(join(ledger.runDir, "run-configuration.json"), serializeRunConfiguration(runConfiguration));
@@ -616,7 +627,6 @@ describe("terminal assurance", () => {
     });
     manifest = await readManifestV2(ledger.runDir);
     await updateManifestV2(ledger.runDir, {
-      worktree_path: repo.worktree,
       work_item_progress: {
         ...manifest.work_item_progress,
         feature: { ...manifest.work_item_progress.feature!, status: "complete", summary_path: summaryRef.path, summary_sha256: summaryRef.sha256 },

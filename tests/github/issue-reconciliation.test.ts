@@ -166,7 +166,13 @@ class CleanupGitHub extends DryRunGitHubAdapter {
 
 async function cleanupFixture(recordTerminal = true) {
   root = await mkdtemp(join(tmpdir(), "brain-hands-lineage-cleanup-"));
-  const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "cleanup", mode: "github" });
+  const ledger = await createRunLedgerV2({
+    repoRoot: root,
+    originalRequest: "cleanup",
+    mode: "github",
+    worktreePath: root,
+    branchName: "codex/cleanup",
+  });
   const manifest = await updateManifestV2(ledger.runDir, { stage: "verifier_review", delivery_state: "blocked" });
   const desired = (title: string, reason_code: string) => ({ title, body: `${title}\n`, labels: ["brain-hands"], state: "OPEN" as const, state_reason: null, reason_code });
   const preview = planIssueSyncPreview({
@@ -886,6 +892,7 @@ describe("reconcileGitHubIssues", () => {
     const deliveredManifest = await updateManifestV2(ledger.runDir, {
       stage: "delivery",
       delivery_state: "ready",
+      worktree_path: root!,
       branch_name: "codex/cleanup",
       work_item_progress: { ...before.work_item_progress, integrated: { status: "complete", attempts: 1, commit_sha: head } },
       pull_request_numbers: [33],
@@ -914,7 +921,7 @@ describe("reconcileGitHubIssues", () => {
     const manifestPath = join(ledger.runDir, "manifest.json");
     const stale = await readManifestV2(ledger.runDir);
     await writeFile(manifestPath, `${JSON.stringify({ ...stale,
-      issue_numbers: [999], work_item_issue_map: { forged: 999 }, pull_request_numbers: [999], branch_name: "foreign/branch",
+      issue_numbers: [999], work_item_issue_map: { forged: 999 }, pull_request_numbers: [999],
       github_ids: { ...stale.github_ids, issue_numbers: [999], work_item_issue_map: { forged: 999 }, parent_issue_number: 998,
         pull_request_numbers: [999], pull_request_urls: { "999": "https://github.com/other/repo/pull/999" } },
     }, null, 2)}\n`, "utf8");
@@ -1124,6 +1131,7 @@ describe("reconcileGitHubIssues", () => {
     const ready = await updateManifestV2(ledger.runDir, {
       stage: "delivery",
       delivery_state: "ready",
+      worktree_path: root!,
       branch_name: "codex/cleanup",
       work_item_progress: { ...manifest.work_item_progress, integrated: { status: "complete", attempts: 1, commit_sha: head } },
       pull_request_numbers: [33],
@@ -1149,6 +1157,7 @@ describe("reconcileGitHubIssues", () => {
     const ready = await updateManifestV2(ledger.runDir, {
       stage: "delivery",
       delivery_state: "ready",
+      worktree_path: root!,
       branch_name: "codex/cleanup",
       work_item_progress: { ...manifest.work_item_progress, integrated: { status: "complete", attempts: 1, commit_sha: head } },
       pull_request_numbers: [33],

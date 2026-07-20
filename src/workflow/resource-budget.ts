@@ -14,15 +14,18 @@ import {
   resourceBudgetClaimV1Schema,
   resourceBudgetCompletionV1Schema,
   resourceBudgetPolicyV1Schema,
+  resourceBudgetReconciliationV1Schema,
   type ResourceBudgetClaimInput,
   type ResourceBudgetClaimV1,
   type ResourceBudgetCompletionInput,
   type ResourceBudgetCompletionV1,
   type ResourceBudgetPolicyV1,
+  type ResourceBudgetReconciliationV1,
   type ResourceBudgetPort,
   type ResourceBudgetUsage,
 } from "../core/resource-budget.js";
 import { artifactSegment, canonicalJsonBytes, type ArtifactRefV1 } from "../core/context-contracts.js";
+import { readOwnedRunFile } from "../core/owned-evidence.js";
 
 const POLICY_PATH = "budgets/policy.json";
 const claimIdentitySchema = z.object({
@@ -43,6 +46,10 @@ function completionPath(claimId: string): string {
   return `budgets/completions/${artifactSegment(claimId)}.json`;
 }
 
+function reconciliationPath(claimId: string): string {
+  return `budgets/reconciliations/${artifactSegment(claimId)}.json`;
+}
+
 function claimIdFor(runId: string, kind: ResourceBudgetClaimInput["kind"], key: string): string {
   const bytes = canonicalJsonBytes(claimIdentitySchema, { run_id: runId, kind, key });
   return `budget-claim:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -52,6 +59,7 @@ async function readBudgetArtifacts(runDir: string): Promise<{
   policy: ResourceBudgetPolicyV1;
   claims: ResourceBudgetClaimV1[];
   completions: ResourceBudgetCompletionV1[];
+  reconciliations: ResourceBudgetReconciliationV1[];
 }> {
   const manifest = await readManifestV2(runDir);
   if (manifest.workflow_protocol !== "bounded-context-v1") {
@@ -69,7 +77,12 @@ async function readBudgetArtifacts(runDir: string): Promise<{
 
   const claims = await readArtifactDirectory(runDir, "budgets/claims", resourceBudgetClaimV1Schema);
   const completions = await readArtifactDirectory(runDir, "budgets/completions", resourceBudgetCompletionV1Schema);
-  return { policy: filePolicy, claims, completions };
+  const reconciliations = await readArtifactDirectory(
+    runDir,
+    "budgets/reconciliations",
+    resourceBudgetReconciliationV1Schema,
+  );
+  return { policy: filePolicy, claims, completions, reconciliations };
 }
 
 async function readArtifactDirectory<T>(
@@ -77,7 +90,10 @@ async function readArtifactDirectory<T>(
   directory: string,
   schema: z.ZodType<T>,
 ): Promise<T[]> {
-  const entries = await readdir(`${runDir}/${directory}`, { withFileTypes: true });
+  const entries = await readdir(`${runDir}/${directory}`, { withFileTypes: true }).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+    throw error;
+  });
   const values: T[] = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
@@ -149,17 +165,17 @@ export class ResourceBudgetController implements ResourceBudgetPort {
 
   async usage(): Promise<ResourceBudgetUsage> {
     return withRunLedgerTransaction(this.runDir, async () => {
-      const { policy, claims, completions } = await readBudgetArtifacts(this.runDir);
-      return reduceResourceBudgetArtifacts(policy, claims, completions);
+      const { policy, claims, completions, reconciliations } = await readBudgetArtifacts(this.runDir);
+      return reduceResourceBudgetArtifacts(policy, claims, completions, reconciliations);
     });
   }
 
   async claim(input: ResourceBudgetClaimInput): Promise<ResourceBudgetClaimV1> {
     return withRunLedgerTransaction(this.runDir, async () => {
-      const { policy, claims, completions } = await readBudgetArtifacts(this.runDir);
+      const { policy, claims, completions, reconciliations } = await readBudgetArtifacts(this.runDir);
       const manifest = await readManifestV2(this.runDir);
       const claimId = claimIdFor(manifest.run_id, input.kind, input.key);
-      const usage = reduceResourceBudgetArtifacts(policy, claims, completions);
+      const usage = reduceResourceBudgetArtifacts(policy, claims, completions, reconciliations);
       const existing = claims.find((claim) => claim.claim_id === claimId);
       if (existing !== undefined) {
         if (
@@ -189,8 +205,8 @@ export class ResourceBudgetController implements ResourceBudgetPort {
 
   async complete(input: ResourceBudgetCompletionInput): Promise<ResourceBudgetCompletionV1> {
     return withRunLedgerTransaction(this.runDir, async () => {
-      const { policy, claims, completions } = await readBudgetArtifacts(this.runDir);
-      reduceResourceBudgetArtifacts(policy, claims, completions);
+      const { policy, claims, completions, reconciliations } = await readBudgetArtifacts(this.runDir);
+      reduceResourceBudgetArtifacts(policy, claims, completions, reconciliations);
       const claim = claims.find((candidate) => candidate.claim_id === input.claim_id);
       if (claim === undefined) {
         throw new Error(`Resource budget completion ${input.claim_id} exists without a claim`);
@@ -215,6 +231,7 @@ export class ResourceBudgetController implements ResourceBudgetPort {
         policy,
         claims,
         [...completions, completion],
+        reconciliations,
       );
       await writeImmutableValidatedJson(
         this.runDir,
@@ -233,11 +250,110 @@ export class ResourceBudgetController implements ResourceBudgetPort {
 
   async remainingActiveElapsedMs(): Promise<number> {
     return withRunLedgerTransaction(this.runDir, async () => {
-      const { policy, claims, completions } = await readBudgetArtifacts(this.runDir);
-      const usage = reduceResourceBudgetArtifacts(policy, claims, completions);
+      const { policy, claims, completions, reconciliations } = await readBudgetArtifacts(this.runDir);
+      const usage = reduceResourceBudgetArtifacts(policy, claims, completions, reconciliations);
       return Math.max(0, policy.max_active_elapsed_ms - usage.active_elapsed_ms);
     });
   }
+}
+
+export async function reconcileResourceBudgetModelInvocation(input: {
+  runDir: string;
+  claimId: string;
+  actor: string;
+  reason: string;
+  evidenceRefs: string[];
+  tokenUsage: ResourceBudgetReconciliationV1["token_usage"];
+}): Promise<ResourceBudgetReconciliationV1> {
+  return withRunLedgerTransaction(input.runDir, async () => {
+    const { policy, claims, completions, reconciliations } = await readBudgetArtifacts(input.runDir);
+    for (const evidenceRef of input.evidenceRefs) {
+      await readOwnedRunFile(input.runDir, evidenceRef);
+    }
+    const reconciliation = resourceBudgetReconciliationV1Schema.parse({
+      schema_version: 1,
+      claim_id: input.claimId,
+      reconciled_at: new Date().toISOString(),
+      actor: input.actor,
+      reason: input.reason,
+      evidence_refs: input.evidenceRefs,
+      token_usage: input.tokenUsage,
+    });
+    reduceResourceBudgetArtifacts(policy, claims, completions, [...reconciliations, reconciliation]);
+    await writeImmutableValidatedJson(
+      input.runDir,
+      reconciliationPath(input.claimId),
+      resourceBudgetReconciliationV1Schema,
+      reconciliation,
+    );
+    return reconciliation;
+  });
+}
+
+export async function reconcileInterruptedResourceBudgetModelInvocation(input: {
+  runDir: string;
+  claimId: string;
+  actor: string;
+  reason: string;
+  evidenceRefs: string[];
+  durationMs: number;
+  tokenUsage: ResourceBudgetReconciliationV1["token_usage"];
+}): Promise<{ completion: ResourceBudgetCompletionV1; reconciliation: ResourceBudgetReconciliationV1 }> {
+  return withRunLedgerTransaction(input.runDir, async () => {
+    const { policy, claims, completions, reconciliations } = await readBudgetArtifacts(input.runDir);
+    for (const evidenceRef of input.evidenceRefs) await readOwnedRunFile(input.runDir, evidenceRef);
+    const claim = claims.find((candidate) => candidate.claim_id === input.claimId);
+    if (claim?.kind !== "model_invocation") {
+      throw new Error(`Interrupted model reconciliation requires a model-invocation claim: ${input.claimId}`);
+    }
+    const existingCompletion = completions.find((candidate) => candidate.claim_id === input.claimId);
+    const existingReconciliation = reconciliations.find((candidate) => candidate.claim_id === input.claimId);
+    if (existingCompletion && (
+      !existingCompletion.process_started
+      || !existingCompletion.turn_started
+      || !existingCompletion.structured_terminal_error
+      || existingCompletion.token_usage !== null
+    )) throw new Error(`Interrupted model reconciliation requires an uncertain started completion: ${input.claimId}`);
+    if (existingCompletion && existingCompletion.duration_ms !== input.durationMs) {
+      throw new Error(`Interrupted model reconciliation duration must match the immutable completion: ${existingCompletion.duration_ms}`);
+    }
+    const completion = existingCompletion ?? resourceBudgetCompletionV1Schema.parse({
+      schema_version: 1,
+      claim_id: input.claimId,
+      completed_at: new Date().toISOString(),
+      outcome: "reconciled",
+      duration_ms: input.durationMs,
+      process_started: true,
+      turn_started: true,
+      structured_terminal_error: true,
+      token_usage: null,
+    });
+    const reconciliation = resourceBudgetReconciliationV1Schema.parse({
+      schema_version: 1,
+      claim_id: input.claimId,
+      reconciled_at: existingReconciliation?.reconciled_at ?? new Date().toISOString(),
+      actor: input.actor,
+      reason: input.reason,
+      evidence_refs: input.evidenceRefs,
+      token_usage: input.tokenUsage,
+    });
+    if (existingReconciliation && !sameJson(existingReconciliation, reconciliation)) {
+      throw new Error(`Resource budget reconciliation ${input.claimId} already exists with different bytes`);
+    }
+    reduceResourceBudgetArtifacts(
+      policy,
+      claims,
+      existingCompletion ? completions : [...completions, completion],
+      existingReconciliation ? reconciliations : [...reconciliations, reconciliation],
+    );
+    if (!existingCompletion) {
+      await writeImmutableValidatedJson(input.runDir, completionPath(input.claimId), resourceBudgetCompletionV1Schema, completion);
+    }
+    if (!existingReconciliation) {
+      await writeImmutableValidatedJson(input.runDir, reconciliationPath(input.claimId), resourceBudgetReconciliationV1Schema, reconciliation);
+    }
+    return { completion, reconciliation };
+  });
 }
 
 export async function claimExternalEffect(

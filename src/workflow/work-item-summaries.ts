@@ -33,6 +33,7 @@ import type {
   WorkItem,
   WorkItemProgress,
 } from "../core/types.js";
+import { verifierEvidenceBindsVerification } from "./verifier-evidence-binding.js";
 import { validatePersistedWarningAuthorization, warningAuthorizationPath } from "./authorization.js";
 import { loadCurrentFindingResolution } from "./findings.js";
 import { readOwnedEvidenceFile } from "./owned-evidence.js";
@@ -270,7 +271,7 @@ async function loadSources(
   if (verification.evidence_path !== verificationRef.path) {
     throw new Error("Verification evidence path does not match its artifact reference");
   }
-  if (!review.evidence_reviewed.includes(verificationRef.path)) {
+  if (!verifierEvidenceBindsVerification(review.evidence_reviewed, verificationRef.path)) {
     throw new Error("Verifier review does not bind the referenced verification evidence");
   }
   return { implementation, verification, review };

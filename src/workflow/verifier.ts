@@ -16,7 +16,8 @@ import { renderTemplate } from "../prompts/renderer.js";
 import type { ProgressReporter } from "../progress/log.js";
 import type { ArtifactRefV1, VerifierContextV1 } from "../core/context-contracts.js";
 import type { ResourceBudgetPort } from "../core/resource-budget.js";
-import { validateVerifierInvocationContext } from "./role-context.js";
+import { boundedVerifierDiff, validateVerifierInvocationContext } from "./role-context.js";
+import { invocationArtifactName } from "./invocation-artifacts.js";
 import { collectScopedWorktreeDiff, type ScopedDiff } from "../adapters/git.js";
 import { readManifestV2 } from "../core/ledger.js";
 import { loadEvidenceIndex, verifierEvidenceIndexPath } from "./evidence-index.js";
@@ -261,11 +262,15 @@ export async function verifyWorkItem(input: VerifyWorkItemInput): Promise<Verify
     }
     const baseCommit = manifest.work_item_progress[input.workItem.id]?.context_base_commit;
     if (typeof baseCommit !== "string") throw new Error("Bounded Verifier context base commit is unavailable");
-    const snapshot = await collectScopedWorktreeDiff({
+    const collectedSnapshot = await collectScopedWorktreeDiff({
       repoRoot: input.worktreePath,
       baseCommit,
       workItem: input.workItem,
     });
+    const snapshot = {
+      ...collectedSnapshot,
+      patch: boundedVerifierDiff(collectedSnapshot.patch),
+    };
     const scopeAuthority = await loadVerifierScopeAuthority({
       runDir: input.runDir,
       workItemId: input.workItem.id,
@@ -313,6 +318,9 @@ export async function verifyWorkItem(input: VerifyWorkItemInput): Promise<Verify
     });
   } else {
     prompt = renderTemplate(await loadPromptTemplate("verifier-review-v2"), {
+      review_work_item_id: input.workItem.id,
+      review_attempt: String(attempt),
+      review_final: String(final),
       context_package_json: JSON.stringify({
         context_ref: boundedContext.context_ref,
         context: boundedContext.context,
@@ -321,7 +329,7 @@ export async function verifyWorkItem(input: VerifyWorkItemInput): Promise<Verify
   }
   const id = artifactId(input.workItem.id);
   const suffix = final ? `final-attempt-${attempt}` : `attempt-${attempt}`;
-  const artifactName = `verifier-review-${id}-${suffix}`;
+  const artifactName = await invocationArtifactName(input.runDir, `verifier-review-${id}-${suffix}`);
   await writeTextArtifact(input.runDir, `prompts/${artifactName}.md`, prompt);
   await writeTextArtifact(
     input.runDir,
@@ -353,9 +361,18 @@ export async function verifyWorkItem(input: VerifyWorkItemInput): Promise<Verify
       invocation,
     );
   }
-  const review = parseReview(invocation);
+  let review = parseReview(invocation);
   assertReviewProvenance(review, input, attempt);
-  if (boundedContext !== null) assertBoundedAcceptanceCoverage(review, input.workItem);
+  if (boundedContext !== null) {
+    assertBoundedAcceptanceCoverage(review, input.workItem);
+    const canonicalEvidencePath = boundedContext.context.verification_ref.path;
+    if (!review.evidence_reviewed.includes(canonicalEvidencePath)) {
+      review = strictVerifierReviewSchema.parse({
+        ...review,
+        evidence_reviewed: [...review.evidence_reviewed, canonicalEvidencePath],
+      });
+    }
+  }
   await writeTextArtifact(
     input.runDir,
     `responses/${artifactName}.json`,

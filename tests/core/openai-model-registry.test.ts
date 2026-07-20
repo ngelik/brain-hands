@@ -16,6 +16,7 @@ describe("OpenAI model registry", () => {
       "gpt-5.5-pro",
       "gpt-5.5-2026-04-23",
       "gpt-5.5-pro-2026-04-23",
+      "gpt-5.3-codex-spark",
     ]);
   });
 
@@ -27,8 +28,18 @@ describe("OpenAI model registry", () => {
     ["fastest", "gpt-5.6-luna"],
     ["5.5", "gpt-5.5"],
     ["5.5 Pro", "gpt-5.5-pro"],
+    ["Codex Spark", "gpt-5.3-codex-spark"],
   ])("resolves human model request %j to %s", (request, expected) => {
     expect(resolveModelOverride(request)).toBe(expected);
+  });
+
+  it("recommends high reasoning for GPT-5.3-Codex-Spark", () => {
+    expect(KNOWN_OPENAI_MODELS.find((model) => model.id === "gpt-5.3-codex-spark"))
+      .toMatchObject({
+        surface: "codex_only",
+        reasoning_efforts: ["low", "medium", "high", "xhigh"],
+        recommended_reasoning_effort: "high",
+      });
   });
 
   it("preserves future or provider-specific exact slugs for live catalog validation", () => {

@@ -8,6 +8,7 @@ import * as preflight from "../../src/workflow/preflight.js";
 import {
   advancePreparedRunToDiscovery,
   prepareFreshRun,
+  retryRunPreflightToDiscovery,
 } from "../../src/workflow/run-start.js";
 
 const roots: string[] = [];
@@ -159,6 +160,38 @@ describe("fresh run bootstrap", () => {
     expect((await readManifestV2(prepared.ledger.runDir)).stage).toBe("preflight");
     expect(JSON.parse(await readFile(join(prepared.ledger.runDir, "preflight.json"), "utf8")))
       .toMatchObject({ required_checks_failed: true });
+  });
+
+  it("rechecks a failed preflight during same-run recovery", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-run-start-retry-"));
+    roots.push(repoRoot);
+    const runPreflight = vi.spyOn(preflight, "runPreflight")
+      .mockResolvedValueOnce({
+        ...preflightReport,
+        checks: [requiredFailureCheck],
+        required_checks_failed: true,
+      })
+      .mockResolvedValueOnce(preflightReport);
+    const prepared = await prepareFreshRun({
+      task: "Retry repaired preflight",
+      repoRoot,
+      choices: { mode: "local", research: false, reflection: false, model_overrides: {} },
+      dryRun: true,
+    });
+    await expect(advancePreparedRunToDiscovery(prepared, { dryRun: false }))
+      .rejects.toThrow("Preflight failed");
+
+    const manifest = await retryRunPreflightToDiscovery(prepared.ledger.runDir, {
+      dryRun: true,
+    });
+
+    expect(manifest.stage).toBe("brain_discovery");
+    expect(runPreflight).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(await readFile(join(prepared.ledger.runDir, "preflight.json"), "utf8")))
+      .toEqual(preflightReport);
+    const events = (await readFile(join(prepared.ledger.runDir, "events.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line) as { type: string });
+    expect(events.filter((event) => event.type === "preflight_completed")).toHaveLength(2);
   });
 
   it("rejects an incomplete persisted preflight report", async () => {

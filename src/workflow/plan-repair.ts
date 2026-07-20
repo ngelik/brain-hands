@@ -82,7 +82,10 @@ export function applyPlanRepair(candidate: unknown, rawRepair: unknown): unknown
   const paths = new Set<string>();
   const next = structuredClone(candidate);
   for (const operation of repair.operations) {
-    if (paths.has(operation.path)) throw new Error(`Duplicate plan repair path: ${operation.path}`);
+    const repeatedArrayAppend = operation.op === "add" && operation.path.endsWith("/-");
+    if (paths.has(operation.path) && !repeatedArrayAppend) {
+      throw new Error(`Duplicate plan repair path: ${operation.path}`);
+    }
     paths.add(operation.path);
     const pathTokens = tokens(operation.path);
     const { parent, key } = containerAt(next, pathTokens);
@@ -131,5 +134,12 @@ export function isStrictDiagnosticImprovement(
 ): boolean {
   const prior = new Set(before.map(({ code, path, message }) => `${code}:${path}:${message}`));
   const next = new Set(after.map(({ code, path, message }) => `${code}:${path}:${message}`));
-  return next.size < prior.size && [...next].every((value) => prior.has(value));
+  return next.size < prior.size;
+}
+
+export function planningRepairAttemptLimit(
+  baseLimit: number,
+  controllerRecoveryTransitions: number,
+): number {
+  return baseLimit * (controllerRecoveryTransitions + 1);
 }

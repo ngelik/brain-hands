@@ -153,6 +153,17 @@ function artifactSha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function artifactBelongsToWorkItem(label: string, actual: unknown, expected: string): boolean {
+  if (actual === expected) return true;
+  if (label !== "Verification" || typeof actual !== "string") return false;
+  const prefix = `${expected}:quality-gate:`;
+  if (!actual.startsWith(prefix)) return false;
+  const [parentAttempt, pass, ...extra] = actual.slice(prefix.length).split(":");
+  return (extra.length === 0 || (extra.length === 1 && /^authority-[a-f0-9]{16}$/.test(extra[0] ?? "")))
+    && /^[1-9][0-9]*$/.test(parentAttempt ?? "")
+    && (pass === "baseline" || /^[1-9][0-9]*$/.test(pass ?? ""));
+}
+
 async function readValidatedOwnedArtifact<T>(input: {
   runDir: string;
   path: string | undefined;
@@ -174,7 +185,7 @@ async function readValidatedOwnedArtifact<T>(input: {
     !value
     || typeof value !== "object"
     || !("work_item_id" in value)
-    || value.work_item_id !== input.workItemId
+    || !artifactBelongsToWorkItem(input.label, value.work_item_id, input.workItemId)
   ) {
     throw new Error(`${input.label} artifact belongs to a foreign work item; expected ${input.workItemId}`);
   }
@@ -356,6 +367,7 @@ export async function gateReviewPolicyEffect(input: {
   operation: string;
   effectAttemptId: string;
   decision: ReviewPolicyDecision;
+  observationStage?: RunManifestV2["stage"];
   reviewCyclePath?: string;
   progress: BuiltRecoveryProgress;
   ownedEvidenceRefs?: Partial<RecoveryOwnedEvidenceRefs>;
@@ -366,6 +378,7 @@ export async function gateReviewPolicyEffect(input: {
   let manifest = await readManifestV2(input.runDir);
   await ensureRecoveryRoot(input.runDir, manifest);
   manifest = await reconcileRecoveryJournal(input.runDir);
+  const observationStage = input.observationStage ?? manifest.stage;
   const authorization = await activeAuthorization(input.runDir, manifest, input.scopeId, progress.sha256);
   if (authorization !== null) {
     const claimed = await claimAuthorizedRecoveryAttempt({
@@ -374,7 +387,7 @@ export async function gateReviewPolicyEffect(input: {
       expectedSubject: {
         run_id: manifest.run_id,
         scope_id: input.scopeId,
-        stage: manifest.stage,
+        stage: observationStage,
         operation: input.operation,
         failure_class: "implementation_failure",
         blocker_code: decision.reason_code,
@@ -400,7 +413,7 @@ export async function gateReviewPolicyEffect(input: {
   const recovery = await recordRecoveryObservation({
     runDir: input.runDir,
     observation: observation({
-      manifest,
+      manifest: observationStage === manifest.stage ? manifest : { ...manifest, stage: observationStage },
       scopeId: input.scopeId,
       operation: input.operation,
       failureClass: "implementation_failure",

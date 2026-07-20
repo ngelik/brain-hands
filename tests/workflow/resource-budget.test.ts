@@ -10,9 +10,12 @@ import {
   type ResourceBudgetPolicyV1,
 } from "../../src/core/resource-budget.js";
 import { createRunLedgerV2, readManifestV2, updateManifestV2 } from "../../src/core/ledger.js";
+import { createLegacyRunLedgerV2 } from "../fixtures/legacy-run.js";
 import {
   initializeResourceBudgetPolicy,
   openResourceBudget,
+  reconcileInterruptedResourceBudgetModelInvocation,
+  reconcileResourceBudgetModelInvocation,
 } from "../../src/workflow/resource-budget.js";
 
 let repoRoot: string | null = null;
@@ -74,8 +77,7 @@ describe("resource budget controller", () => {
     await expect(openResourceBudget(runDir)).rejects.toThrow(/mismatch|corrupt/i);
 
     repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-budget-legacy-"));
-    const legacy = await createRunLedgerV2({ repoRoot, originalRequest: "Legacy run" });
-    await updateManifestV2(legacy.runDir, { workflow_protocol: "legacy-v2" });
+    const legacy = await createLegacyRunLedgerV2({ repoRoot, originalRequest: "Legacy run" });
     await expect(openResourceBudget(legacy.runDir)).rejects.toThrow(/bounded-context-v1/i);
   });
 
@@ -179,13 +181,90 @@ describe("resource budget controller", () => {
     expect(await budget.usage()).toMatchObject({ token_accounting: "known", total_tokens: 0 });
 
     const uncertain = await budget.claim({ kind: "model_invocation", key: "hands:uncertain", elapsed_reservation_ms: 100 });
-    await budget.complete(completion(uncertain.claim_id, { token_usage: null }));
+    await budget.complete(completion(uncertain.claim_id, {
+      structured_terminal_error: true,
+      token_usage: null,
+    }));
     expect(await budget.usage()).toMatchObject({
       token_accounting: "uncertain",
       uncertain_model_claim_ids: [uncertain.claim_id],
     });
     await expect(budget.claim({ kind: "model_invocation", key: "blocked", elapsed_reservation_ms: 100 }))
       .rejects.toThrow(/uncertain/i);
+
+    await writeFile(join(runDir, "responses", "uncertain.stdout.txt"), "structured terminal error\n", "utf8");
+    await reconcileResourceBudgetModelInvocation({
+      runDir,
+      claimId: uncertain.claim_id,
+      actor: "operator@example.test",
+      reason: "The provider rejected the request schema before model sampling.",
+      evidenceRefs: ["responses/uncertain.stdout.txt"],
+      tokenUsage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 },
+    });
+    expect(await budget.usage()).toMatchObject({ token_accounting: "known", uncertain_model_claim_ids: [] });
+    await expect(budget.claim({ kind: "model_invocation", key: "unblocked", elapsed_reservation_ms: 100 }))
+      .resolves.toMatchObject({ key: "unblocked" });
+  });
+
+  it("settles an interrupted started model claim with explicit conservative usage", async () => {
+    const { runDir, policy } = await boundedRun({ ...DEFAULT_RESOURCE_BUDGET_V1, max_active_elapsed_ms: 2_000 });
+    await initializeResourceBudgetPolicy(runDir, policy);
+    const budget = await openResourceBudget(runDir);
+    const interrupted = await budget.claim({ kind: "model_invocation", key: "verifier:interrupted", elapsed_reservation_ms: 1_200 });
+    await writeFile(join(runDir, "responses", "interrupted.stderr.txt"), "worker interrupted after the model turn started\n", "utf8");
+
+    await reconcileInterruptedResourceBudgetModelInvocation({
+      runDir,
+      claimId: interrupted.claim_id,
+      actor: "operator@example.test",
+      reason: "Charge a conservative upper bound derived from the neighboring completed invocation.",
+      evidenceRefs: ["responses/interrupted.stderr.txt"],
+      durationMs: 600,
+      tokenUsage: { input_tokens: 1_000, cached_input_tokens: 500, output_tokens: 200, reasoning_output_tokens: 100 },
+    });
+
+    expect(await budget.usage()).toMatchObject({
+      active_elapsed_ms: 600,
+      total_tokens: 1_200,
+      cached_input_tokens: 500,
+      reasoning_output_tokens: 100,
+      token_accounting: "known",
+      uncertain_model_claim_ids: [],
+    });
+  });
+
+  it("reconciles an already-recorded uncertain completion without replacing its immutable bytes", async () => {
+    const { runDir, policy } = await boundedRun({ ...DEFAULT_RESOURCE_BUDGET_V1, max_active_elapsed_ms: 2_000 });
+    await initializeResourceBudgetPolicy(runDir, policy);
+    const budget = await openResourceBudget(runDir);
+    const interrupted = await budget.claim({ kind: "model_invocation", key: "hands:failed", elapsed_reservation_ms: 1_200 });
+    const recorded = await budget.complete(completion(interrupted.claim_id, {
+      outcome: "failed",
+      duration_ms: 300,
+      process_started: true,
+      turn_started: true,
+      structured_terminal_error: true,
+      token_usage: null,
+    }));
+    await writeFile(join(runDir, "responses", "failed.stderr.txt"), "model process exited after turn start\n", "utf8");
+
+    const settled = await reconcileInterruptedResourceBudgetModelInvocation({
+      runDir,
+      claimId: interrupted.claim_id,
+      actor: "operator@example.test",
+      reason: "Charge a conservative token bound while preserving measured duration.",
+      evidenceRefs: ["responses/failed.stderr.txt"],
+      durationMs: 300,
+      tokenUsage: { input_tokens: 1_000, cached_input_tokens: 500, output_tokens: 200, reasoning_output_tokens: 100 },
+    });
+
+    expect(settled.completion).toEqual(recorded);
+    expect(await budget.usage()).toMatchObject({
+      active_elapsed_ms: 300,
+      total_tokens: 1_200,
+      token_accounting: "known",
+      uncertain_model_claim_ids: [],
+    });
   });
 
   it("enforces zero external-effect capacity before writing a new claim", async () => {

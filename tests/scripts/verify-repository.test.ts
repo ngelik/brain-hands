@@ -33,12 +33,20 @@ type CoordinatorModule = {
     runCommand(call: CommandCall): Promise<number | undefined>;
     hashDist(call: DigestCall): Promise<string>;
   }): Promise<void>;
+  verifyFocusedRepository(options: {
+    cwd: string;
+    env: Record<string, string | undefined>;
+    testFiles: string[];
+    runCommand(call: CommandCall): Promise<number | undefined>;
+    hashDist(call: DigestCall): Promise<string>;
+  }): Promise<void>;
 };
 
 const coordinatorModulePath = "../../scripts/verify-repository.mjs";
 const {
   RepositoryVerificationError,
   VERIFICATION_STAGES,
+  verifyFocusedRepository,
   verifyRepository,
 } = await import(coordinatorModulePath) as CoordinatorModule;
 
@@ -137,6 +145,44 @@ function runScript(argv: string[], options: {
 }
 
 describe("repository verification coordinator", () => {
+  it("runs a bounded focused sequence with one immutable build", async () => {
+    const harness = createHarness({ digests: ["frozen", "frozen"] });
+    await verifyFocusedRepository({
+      cwd,
+      env: { BASELINE: "present" },
+      testFiles: ["tests/core/example.test.ts", "tests/cli-smoke.test.ts"],
+      runCommand: harness.runCommand,
+      hashDist: harness.hashDist,
+    });
+
+    expect(harness.commandCalls.map((call) => call.argv)).toEqual([
+      [npmCommand, "run", "typecheck"],
+      [npmCommand, "run", "build"],
+      [process.platform === "win32" ? "npx.cmd" : "npx", "vitest", "run", "tests/core/example.test.ts", "tests/cli-smoke.test.ts"],
+    ]);
+    expect(harness.commandCalls[2]?.env.BRAIN_HANDS_DIST_IMMUTABLE).toBe("1");
+    expect(harness.digestCalls).toHaveLength(2);
+  });
+
+  it.each([
+    { testFiles: [] },
+    { testFiles: ["src/core/example.ts"] },
+    { testFiles: ["../tests/example.test.ts"] },
+  ])(
+    "rejects invalid focused test paths $testFiles before running commands",
+    async ({ testFiles }) => {
+      const harness = createHarness();
+      await expect(verifyFocusedRepository({
+        cwd,
+        env: {},
+        testFiles,
+        runCommand: harness.runCommand,
+        hashDist: harness.hashDist,
+      })).rejects.toThrow(/Focused verification/);
+      expect(harness.commandCalls).toEqual([]);
+    },
+  );
+
   it("exposes the exact immutable stage order", () => {
     expect(VERIFICATION_STAGES.map(({ kind, label }) => ({ kind, label }))).toEqual(
       expectedOperations,
@@ -401,5 +447,20 @@ describe("repository verification coordinator", () => {
     } finally {
       await rm(temporaryDirectory, { recursive: true, force: true });
     }
+  });
+
+  it("prints focused usage without running verification", async () => {
+    const scriptPath = fileURLToPath(
+      new URL("../../scripts/verify-repository.mjs", import.meta.url),
+    );
+    const result = await runScript([scriptPath, "--focused", "--help"], {
+      cwd: process.cwd(),
+      env: process.env,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("npm run verify:focused -- tests/path/to/surface.test.ts");
+    expect(result.stdout).toContain("not release evidence");
   });
 });

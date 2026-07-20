@@ -381,6 +381,29 @@ describe("buildRecoveryProgressSubject", () => {
   });
 
   it.each([
+    "item-1:quality-gate:1:baseline",
+    "item-1:quality-gate:1:baseline:authority-0123456789abcdef",
+  ])("accepts an owned quality-gate verification identity for its base work item: %s", async (identity) => {
+    const { runDir, manifest } = await setup();
+    const verificationValue = verification(identity);
+    await writeTextArtifact(
+      runDir,
+      verificationValue.evidence_path,
+      `${JSON.stringify(verificationValue)}\n`,
+    );
+
+    await expect(buildRecoveryProgressSubject({
+      runDir,
+      manifest,
+      workItemId: "item-1",
+      findingIds: [],
+      verificationPath: verificationValue.evidence_path,
+    })).resolves.toMatchObject({
+      subject: { verification_artifact_sha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    });
+  });
+
+  it.each([
     ["absolute", (runDir: string, root: string) => join(runDir, "implementation/item-1/a.json")],
     ["traversal", (_runDir: string, _root: string) => "../outside.json"],
     ["outside owned root", (_runDir: string, _root: string) => "reviews/item-1/a.json"],
@@ -707,6 +730,30 @@ describe("recovery runtime adapter", () => {
     const stable = await gateReviewPolicyEffect(interrupted);
     expect(stable.recovery_decision).toEqual(replay.recovery_decision);
     expect(await readFile(join(runDir, stable.diagnostic_path!))).toEqual(bytes);
+  });
+
+  it("replays the same review effect against its original observation stage after a stage transition", async () => {
+    const { runDir, manifest } = await setup();
+    const { paths, progress } = await progressInput(runDir, manifest);
+    const effectAttemptId = `review-effect:${"8".repeat(64)}`;
+    const base = {
+      runDir,
+      scopeId: "work-item:item-1",
+      operation: "work-item-fix",
+      decision: policyDecision,
+      effectAttemptId,
+      progress,
+      ownedEvidenceRefs: ownedEvidenceRefs(paths),
+    };
+    await updateManifestV2(runDir, { stage: "verifier_review" });
+    const first = await gateReviewPolicyEffect(base);
+    await updateManifestV2(runDir, { stage: "fixing" });
+
+    await expect(gateReviewPolicyEffect(base)).rejects.toThrow("Same effect attempt replay conflicts");
+    const replay = await gateReviewPolicyEffect({ ...base, observationStage: "verifier_review" });
+
+    expect(replay.recovery_decision).toEqual(first.recovery_decision);
+    expect(replay.effect_attempt_id).toBe(effectAttemptId);
   });
 
   it("repairs the exact diagnostic before reconciling a terminal decision interrupted after decision persistence", async () => {

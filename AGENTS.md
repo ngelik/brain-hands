@@ -63,6 +63,9 @@ Strong success criteria let you loop independently. Weak criteria like "make it 
 
 - Work on `main` unless the user explicitly asks for a feature branch.
 - Ignore git changes that were not made in the current working session. Do not revert, reformat, stage, or clean up unrelated changes unless the user explicitly asks.
+- Create commits as `ngelik <1657070+ngelik@users.noreply.github.com>` so public history never exposes a personal email.
+- Before committing, set or verify the repository-local identity with `git config --local user.name ngelik` and `git config --local user.email 1657070+ngelik@users.noreply.github.com`. Do not change the global Git identity for this repository.
+- After committing, verify the recorded identity with `git log -1 --format='%an <%ae>'` before pushing.
 
 ## Subagents
 
@@ -72,6 +75,7 @@ Only spawn subagents when I ask you to.
 
 - Treat `brain-hands` installed from npm as the stable command for real workflows.
 - Use the local checkout for development iteration with `npm run dev -- ...` or `npm run build && node dist/cli.js ...`.
+- For bounded iteration proof, use `npm run verify:focused -- <tests/**/*.test.ts...>`; it typechecks, builds once, runs only the named tests with immutable `dist/`, and is not release evidence.
 - Do not use `npm link` for the primary `brain-hands` command; it makes the stable command point at the mutable working tree.
 - Prove a release candidate with `npm run verify:funnel`, then inspect those tested bytes with `npm pack --dry-run --json --ignore-scripts`.
 - The release-candidate funnel builds once, sets `BRAIN_HANDS_DIST_IMMUTABLE=1` for post-build tests, and keeps `dist/` digest-checked for byte changes. Test workers must not invoke clean, build, or `npm test`.

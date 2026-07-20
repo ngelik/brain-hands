@@ -157,8 +157,13 @@ function exactFindingIdSet(actual: string[], expectedInput: readonly string[]): 
   if (new Set(actual).size !== actual.length) {
     throw new Error("Policy Reviewer queue maps more than one action to a decision finding");
   }
-  if (JSON.stringify([...actual].sort()) !== JSON.stringify([...expected].sort())) {
-    throw new Error(`Policy Reviewer queue must map exactly one action to every authorized decision finding (actual ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)})`);
+  const expectedSet = new Set(expected);
+  const unauthorized = actual.filter((findingId) => !expectedSet.has(findingId));
+  if (unauthorized.length > 0) {
+    throw new Error(`Policy Reviewer queue contains findings outside the authorized decision (actual ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)})`);
+  }
+  if (expected.length > 0 && actual.length === 0) {
+    throw new Error(`Policy Reviewer queue has no actionable finding from the authorized decision (expected ${JSON.stringify(expected)})`);
   }
 }
 

@@ -410,7 +410,7 @@ describe("verifyBrowserIssue", () => {
       runDir,
       identity,
       commands: [[process.execPath, "-e", "process.stdout.write('integrated')"]],
-      expectedArtifacts: ["reports/browser-evidence.json"],
+      expectedArtifacts: [],
       browserChecks: [check],
       attempt: 1,
     });

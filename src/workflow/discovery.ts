@@ -251,9 +251,9 @@ async function persistValidatedOutcome(
 
   await recordDiscoveryReadiness(runDir, normalizedOutcome);
 
-  if (normalizedOutcome.approaches.length > 0 && (
-    state.selected_approach_id === null || state.cycle_kind === "planning_gap"
-  )) {
+  const selectedApproachStillAvailable = state.selected_approach_id !== null
+    && normalizedOutcome.approaches.some((approach) => approach.id === state.selected_approach_id);
+  if (normalizedOutcome.approaches.length > 0 && !selectedApproachStillAvailable) {
     const revision = (state.current_approaches_revision ?? 0) + 1;
     await recordDiscoveryApproaches(runDir, revision, normalizedOutcome.approaches);
     return requirePendingAction(runDir);

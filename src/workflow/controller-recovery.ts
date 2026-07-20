@@ -2,11 +2,18 @@ import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  acquireExecutionLease,
   appendRunEventOnceLocked,
+  assertExecutionLease,
+  beginExecutionEffect,
+  endExecutionEffect,
   readManifestV2,
+  recordExecutionEffectChild,
+  releaseExecutionLease,
   withRunLedgerCompoundTransaction,
   type RunLedgerTransaction,
 } from "../core/ledger.js";
+import { currentExecutionAuthority, runWithExecutionAuthority } from "../core/execution-context.js";
 import {
   controllerRecoveryArtifactV1Schema,
   runEventSchema,
@@ -263,7 +270,7 @@ export async function recordControllerRecovery(input: {
     throw new Error("Expected package SHA-256 does not match the captured current controller package hash");
   }
 
-  return withRunLedgerCompoundTransaction(input.runDir, async (transaction) => {
+  const record = () => withRunLedgerCompoundTransaction(input.runDir, async (transaction) => {
     let manifest = await transaction.readManifestV2();
     if (manifest.terminal !== null) throw new Error(`Cannot recover controller for terminal outcome ${manifest.terminal.outcome}`);
     if (manifest.abandonment_path !== null || manifest.assurance_outcome === "abandoned") {
@@ -317,4 +324,19 @@ export async function recordControllerRecovery(input: {
     await input.hooks?.afterManifestHead?.();
     return { artifact_path: path, artifact, manifest };
   });
+  if (currentExecutionAuthority()) return record();
+  const orphanedLease = initialManifest.execution_lease ?? null;
+  if (orphanedLease === null) return record();
+  const claim = await acquireExecutionLease(input.runDir, { mode: orphanedLease.mode });
+  try {
+    return await runWithExecutionAuthority({
+      claim,
+      assert: () => assertExecutionLease(input.runDir, claim),
+      beginEffect: (kind) => beginExecutionEffect(input.runDir, claim, kind),
+      recordEffectChild: (invocationId, pid) => recordExecutionEffectChild(input.runDir, claim, invocationId, pid),
+      endEffect: (invocationId) => endExecutionEffect(input.runDir, claim, invocationId),
+    }, record);
+  } finally {
+    await releaseExecutionLease(input.runDir, claim);
+  }
 }

@@ -54,11 +54,38 @@ describe("verifyReviewFixPacket", () => {
     expect(replay.review).toEqual(resolution);
   });
 
-  it("rejects condition evidence that is not declared by the packet", async () => {
+  it("binds controller-owned packet provenance instead of trusting model echoes", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-packet-resolution-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const echoed = { ...resolution, packet_id: "wrong", packet_sha256: "b".repeat(64), action_attempt: 7000101 };
+    const calls: CodexInvokeInput[] = [];
+    const output = await verifyReviewFixPacket({
+      runDir: ledger.runDir,
+      worktreePath: root,
+      packet,
+      actionAttempt: 1,
+      intake,
+      codex: { invoke: async (input) => {
+        calls.push(input);
+        return { text: JSON.stringify(echoed), parsed: echoed, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics };
+      } },
+      beforeDiff: "before",
+      afterDiff: "after",
+      verificationEvidence,
+      selfReviewReports: [],
+    });
+
+    expect(output.review).toEqual(resolution);
+    expect(calls[0]!.artifactName).toMatch(/-invocation-/);
+    expect(calls[0]!.prompt).toContain(`packet_sha256\`: \`${hashReviewFixPacket(packet)}`);
+  });
+
+  it("binds condition evidence references to observed packet evidence", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-packet-resolution-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
     const invalid = { ...resolution, condition_results: [{ ...resolution.condition_results[0], evidence_refs: ["verification/unknown.json"] }] };
-    await expect(verifyReviewFixPacket({ runDir: ledger.runDir, worktreePath: root, packet, actionAttempt: 1, intake, codex: { invoke: async () => ({ text: JSON.stringify(invalid), parsed: invalid, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics }) }, beforeDiff: "before", afterDiff: "after", verificationEvidence, selfReviewReports: [] })).rejects.toThrow(/observed evidence/i);
+    const output = await verifyReviewFixPacket({ runDir: ledger.runDir, worktreePath: root, packet, actionAttempt: 1, intake, codex: { invoke: async () => ({ text: JSON.stringify(invalid), parsed: invalid, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics }) }, beforeDiff: "before", afterDiff: "after", verificationEvidence, selfReviewReports: [] });
+    expect(output.review.condition_results[0]!.evidence_refs).toEqual(["verification/result.json"]);
   });
 
   it("rejects a satisfied condition when its linked command failed", async () => {

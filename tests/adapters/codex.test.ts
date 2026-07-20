@@ -12,6 +12,7 @@ import {
   DryRunCodexAdapter,
   SubprocessCodexAdapter,
   classifyCodexFailure,
+  modelInvocationBudgetKey,
   renderCodexArgs,
 } from "../../src/adapters/codex.js";
 import { runCommand } from "../../src/core/executor.js";
@@ -297,6 +298,14 @@ describe("classifyCodexFailure", () => {
 });
 
 describe("DryRunCodexAdapter", () => {
+  it("uses a fresh model budget identity when retrying the same immutable artifact", () => {
+    const first = modelInvocationBudgetKey("hands-work-item-foundation-attempt-1");
+    const second = modelInvocationBudgetKey("hands-work-item-foundation-attempt-1");
+
+    expect(first).toMatch(/^hands-work-item-foundation-attempt-1:invocation:[0-9a-f-]{36}$/);
+    expect(second).not.toBe(first);
+  });
+
   it("rejects a final evidence symlink without changing its outside target", async () => {
     const root = await mkdtemp(join(tmpdir(), "brain-hands-codex-final-link-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "Keep final evidence owned" });
@@ -1234,10 +1243,16 @@ describe("SubprocessCodexAdapter", () => {
       },
     });
 
-    expect(budget.claims.map(({ kind, key, elapsed_reservation_ms }) => ({ kind, key, elapsed_reservation_ms }))).toEqual([
-      { kind: "workflow_attempt", key: "verifier:1:item:work_item:1", elapsed_reservation_ms: 0 },
-      { kind: "model_invocation", key: "verifier-budgeted", elapsed_reservation_ms: 1_234 },
-    ]);
+    expect(budget.claims[0]).toMatchObject({
+      kind: "workflow_attempt",
+      key: "verifier:1:item:work_item:1",
+      elapsed_reservation_ms: 0,
+    });
+    expect(budget.claims[1]).toMatchObject({
+      kind: "model_invocation",
+      elapsed_reservation_ms: 1_234,
+    });
+    expect(budget.claims[1]!.key).toMatch(/^verifier-budgeted:invocation:[0-9a-f-]{36}$/);
     expect(budget.completions).toHaveLength(1);
     expect(budget.completions[0]).toMatchObject({
       claim_id: budget.claims[1]!.claim_id,
@@ -1287,9 +1302,9 @@ describe("SubprocessCodexAdapter", () => {
       outputParser: z.object({ ok: z.boolean() }),
     })).rejects.toThrow(CodexInvocationError);
 
-    expect(budget.claims.map(({ kind, key }) => ({ kind, key }))).toEqual([
-      { kind: "model_invocation", key: "verifier-budgeted-error" },
-    ]);
+    expect(budget.claims).toHaveLength(1);
+    expect(budget.claims[0]).toMatchObject({ kind: "model_invocation" });
+    expect(budget.claims[0]!.key).toMatch(/^verifier-budgeted-error:invocation:[0-9a-f-]{36}$/);
     expect(budget.completions).toHaveLength(1);
     expect(budget.completions[0]).toMatchObject({
       claim_id: budget.claims[0]!.claim_id,

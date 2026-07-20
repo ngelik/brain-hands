@@ -1252,6 +1252,9 @@ describe("planRunV2", () => {
     expect(calls[1]!.artifactName).toBe("brain-plan-repair-v1-resume-2");
     expect(calls[1]!.prompt).toContain("Structured readiness diagnostics");
     expect(calls[1]!.prompt).toContain("missing-evidence");
+    expect(calls[1]!.prompt).toContain("must remain `cross_cutting`");
+    expect(calls[1]!.prompt).toContain("add or repurpose an unowned command");
+    expect(calls[1]!.prompt).toContain("reorder commands without changing their tiers");
     expect(await readManifestV2(ledger.runDir)).toMatchObject({
       current_plan_revision: 1,
       planning_recovery: { state: "ready", full_attempts_used: 1, repair_attempts_used: 1 },

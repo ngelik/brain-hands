@@ -32,6 +32,7 @@ import { loadSuccessfulFixProvenanceLocked, type SuccessfulFixProvenance } from 
 import { readOwnedEvidenceFile } from "./owned-evidence.js";
 import { validatePersistedWarningAuthorization } from "./authorization.js";
 import { isReviewEffectAction } from "./review-policy.js";
+import { verifierEvidenceBindsVerification } from "./verifier-evidence-binding.js";
 
 export interface WriteConvergenceReportInput {
   run_dir: string;
@@ -160,10 +161,15 @@ export async function loadCurrentCycleEvidence(
   const reference = cycle.work_item_progress_reference;
   if (!reference) throw new Error("Convergence requires cycle-owned work-item progress evidence");
   const safeWorkItem = cycle.work_item_id.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const expectedReviewPath = cycle.phase === "work_item"
-    ? `reviews/${safeWorkItem}/attempt-${reference.attempts}.json`
-    : `reviews/integrated/final-attempt-${reference.attempts}.json`;
-  if (reference.review_path !== expectedReviewPath) {
+  const expectedReviewStem = cycle.phase === "work_item"
+    ? `reviews/${safeWorkItem}/attempt-${reference.attempts}`
+    : `reviews/integrated/final-attempt-${reference.attempts}`;
+  const resumeMatch = reference.review_path.match(/-resume-(\d+)\.json$/);
+  const validReviewPath = reference.review_path === `${expectedReviewStem}.json`
+    || (reference.review_path.startsWith(`${expectedReviewStem}-resume-`)
+      && resumeMatch !== null
+      && Number(resumeMatch[1]) >= 2);
+  if (!validReviewPath) {
     throw new Error("Cycle-owned review path does not match its work item and revision");
   }
   const review = persistedVerifierReviewSchema.parse(JSON.parse((await readOwnedEvidenceFile(
@@ -185,14 +191,15 @@ export async function loadCurrentCycleEvidence(
     }
     return path.slice(currentRunPrefix.length);
   });
+  const bindsVerification = verifierEvidenceBindsVerification(reviewedPaths, reference.verification_path);
   if (
     foreignRunEvidence
-    || !reviewedPaths.includes(reference.verification_path)
+    || !bindsVerification
     || review.evidence_reviewed.some((path) => path.includes("\\"))
     || reviewedPaths.some((path) =>
       path.startsWith("verification/")
       && (posix.isAbsolute(path) || posix.normalize(path) !== path))
-  ) throw new Error("Cycle-owned review evidence_reviewed does not bind the canonical cycle verification path or separators");
+  ) throw new Error("Cycle-owned review evidence_reviewed does not bind the canonical cycle verification path, its owned attempt evidence, or separators");
   const verification = verificationEvidenceSchema.parse(JSON.parse((await readOwnedEvidenceFile(
     runDir, reference.verification_path, "verification/",
   )).toString("utf8")));

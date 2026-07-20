@@ -28,6 +28,13 @@ const compareAfterIntegratedSuite = digestStage(
   "compare dist digest after integrated full suite",
 );
 
+const usage = `Usage:
+  npm run verify:funnel
+  npm run verify:focused -- tests/path/to/surface.test.ts [...]
+
+Focused verification typechecks, builds once, and runs only the named tests.
+It is not release evidence.`;
+
 export const VERIFICATION_STAGES = Object.freeze([
   staticContractTests,
   crossCuttingTests,
@@ -80,6 +87,25 @@ async function runCommandStage(stage, { cwd, env, npmCommand, runCommand }) {
     throw new RepositoryVerificationError(
       `${stage.label} failed with exit code ${exitCode}`,
       { stage: stage.label, argv, exitCode },
+    );
+  }
+}
+
+async function runArgvStage(stage, { cwd, env, runCommand }) {
+  let exitCode;
+  try {
+    exitCode = await runCommand({ label: stage.label, argv: stage.argv, cwd, env });
+  } catch (cause) {
+    const causeMessage = cause instanceof Error ? cause.message : String(cause);
+    throw new RepositoryVerificationError(
+      `${stage.label} command failed: ${causeMessage}`,
+      { stage: stage.label, argv: stage.argv, cause },
+    );
+  }
+  if (exitCode !== undefined && exitCode !== 0) {
+    throw new RepositoryVerificationError(
+      `${stage.label} failed with exit code ${exitCode}`,
+      { stage: stage.label, argv: stage.argv, exitCode },
     );
   }
 }
@@ -167,6 +193,60 @@ export async function verifyRepository(options = {}) {
   );
 }
 
+function validateFocusedTestFiles(testFiles) {
+  if (testFiles.length === 0) {
+    throw new RepositoryVerificationError(
+      "Focused verification requires at least one tests/**/*.test.ts path",
+      { stage: "focused verification preflight" },
+    );
+  }
+  for (const testFile of testFiles) {
+    if (!/^tests\/(?:[a-zA-Z0-9._-]+\/)*[a-zA-Z0-9._-]+\.test\.ts$/.test(testFile)) {
+      throw new RepositoryVerificationError(
+        `Focused verification accepts only repository-relative tests/**/*.test.ts paths: ${testFile}`,
+        { stage: "focused verification preflight", testFile },
+      );
+    }
+  }
+}
+
+export async function verifyFocusedRepository(options = {}) {
+  const testFiles = options.testFiles ?? [];
+  validateFocusedTestFiles(testFiles);
+  const cwd = options.cwd ?? process.cwd();
+  const sourceEnvironment = options.env ?? process.env;
+  if (sourceEnvironment[IMMUTABLE_DIST_ENV] === "1") {
+    throw new RepositoryVerificationError(
+      `${IMMUTABLE_DIST_ENV}=1 is reserved for post-build verification stages`,
+      { stage: "immutable dist preflight" },
+    );
+  }
+  const runCommand = options.runCommand ?? spawnCommand;
+  const hashDist = options.hashDist ?? (async () => hashDirectory(join(cwd, "dist")));
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
+  const mutableEnvironment = { ...sourceEnvironment };
+  delete mutableEnvironment[IMMUTABLE_DIST_ENV];
+  const commandOptions = { cwd, env: mutableEnvironment, npmCommand, runCommand };
+
+  await runCommandStage(typecheck, commandOptions);
+  await runCommandStage(build, commandOptions);
+  const originalDigest = await hashDistStage(freezeDistDigest, { cwd, hashDist });
+  const immutableEnvironment = Object.freeze({
+    ...mutableEnvironment,
+    [IMMUTABLE_DIST_ENV]: "1",
+  });
+  await runArgvStage({
+    label: "focused immutable tests",
+    argv: [npxCommand, "vitest", "run", ...testFiles],
+  }, { cwd, env: immutableEnvironment, runCommand });
+  assertMatchingDigest(
+    "compare dist digest after focused tests",
+    originalDigest,
+    await hashDistStage({ label: "compare dist digest after focused tests" }, { cwd, hashDist }),
+  );
+}
+
 function isDirectExecution() {
   if (process.argv[1] === undefined) {
     return false;
@@ -180,7 +260,22 @@ function isDirectExecution() {
 
 if (isDirectExecution()) {
   try {
-    await verifyRepository();
+    const args = process.argv.slice(2);
+    if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
+      console.log(usage);
+    } else if (args[0] === "--focused" &&
+      args.length === 2 && (args[1] === "--help" || args[1] === "-h")) {
+      console.log(usage);
+    } else if (args[0] === "--focused") {
+      console.log("Focused verification only; this is not release evidence.");
+      await verifyFocusedRepository({ testFiles: args.slice(1) });
+    } else if (args.length === 0) {
+      await verifyRepository();
+    } else {
+      throw new RepositoryVerificationError(`Unknown verification arguments: ${args.join(" ")}`, {
+        stage: "verification argument preflight",
+      });
+    }
   } catch (error) {
     console.error(error);
     process.exitCode = 1;

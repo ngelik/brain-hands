@@ -43,6 +43,7 @@ import {
   loadRoleContext,
   reflectionContextPath,
 } from "./role-context.js";
+import { loadCompleteFindingRevisionRecords } from "./findings.js";
 
 const processAccountSchema = z.object({
   summary: z.string().min(1),
@@ -439,10 +440,30 @@ async function publishBoundedReflectionIndex(runDir: string): Promise<void> {
   });
 }
 
-function boundedReflectionProcessMetrics(manifest: Awaited<ReturnType<typeof readManifestV2>>): unknown {
+async function boundedReflectionProcessMetrics(
+  runDir: string,
+  manifest: Awaited<ReturnType<typeof readManifestV2>>,
+): Promise<unknown> {
+  const findingRevisions = [...new Set(Object.values(manifest.finding_index ?? {}).map((finding) =>
+    `${finding.work_item_id}\u0000${finding.last_seen_revision}`))]
+    .sort()
+    .map((coordinate) => {
+      const [workItemId, revision] = coordinate.split("\u0000");
+      return { workItemId: workItemId!, revision: Number(revision) };
+    });
+  const findingHistory = (await Promise.all(findingRevisions.map(({ workItemId, revision }) =>
+    loadCompleteFindingRevisionRecords(runDir, workItemId, revision))))
+    .flat()
+    .sort((left, right) => left.work_item_id.localeCompare(right.work_item_id)
+      || left.last_seen_revision - right.last_seen_revision
+      || left.finding_id.localeCompare(right.finding_id));
   return {
     retry_counts: manifest.retry_counts,
+    work_item_attempts: Object.fromEntries(Object.entries(manifest.work_item_progress)
+      .filter(([, progress]) => typeof progress.attempts === "number")
+      .map(([workItemId, progress]) => [workItemId, progress.attempts])),
     review_accounting: manifest.review_accounting ?? null,
+    finding_history: findingHistory,
     budget_usage: null,
     terminal_disposition: manifest.terminal,
     delivery_identifiers: {
@@ -502,7 +523,7 @@ async function loadPublishedReflectionContext(runDir: string): Promise<BoundedRe
     embeddedIndexRef.path !== before.ref.path
     || embeddedIndexRef.sha256 !== before.ref.sha256
   ) throw new Error("Published Reflection context embeds stale index authority");
-  if (JSON.stringify(context.process_metrics) !== JSON.stringify(boundedReflectionProcessMetrics(before.manifest))) {
+  if (JSON.stringify(context.process_metrics) !== JSON.stringify(await boundedReflectionProcessMetrics(runDir, before.manifest))) {
     throw new Error("Published Reflection context has stale process metrics");
   }
   const after = await loadPublishedReflectionIndex(runDir);
@@ -546,7 +567,7 @@ async function buildPublishedReflectionContext(
   await buildReflectionContext({
     runDir,
     evidenceIndexRef,
-    processMetrics: boundedReflectionProcessMetrics(manifest),
+    processMetrics: await boundedReflectionProcessMetrics(runDir, manifest),
   });
   const current = await readManifestV2(runDir);
   if (
