@@ -2607,13 +2607,15 @@ export function buildCli(): Command {
     .requiredOption("--run <runDir>", "Abandoned predecessor run directory")
     .requiredOption("--actor <actor>", "Replacing actor")
     .requiredOption("--reason <reason>", "Replacement reason")
+    .option("--dry-run", "Use deterministic local fixtures", false)
     .option("--json", "Print machine-readable output", false)
-    .action(async (options: { run: string; actor: string; reason: string; json: boolean }) => {
+    .action(async (options: { run: string; actor: string; reason: string; dryRun: boolean; json: boolean }) => {
       const runDir = await resolveRunDirectory(options.run);
       const replacement = await replacementWorkflow.replaceAbandonedRun({
         runDir,
         actor: options.actor,
         reason: options.reason,
+        dryRun: options.dryRun,
       });
       const nextCommand = `brain-hands resume --run ${shellQuote(replacement.successorRunDir)}`;
       console.log(options.json

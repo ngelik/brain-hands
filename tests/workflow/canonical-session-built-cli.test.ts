@@ -858,6 +858,7 @@ describe("canonical session lifecycle through the built CLI", () => {
       "--run", predecessorRunDir,
       "--actor", "operator@example.test",
       "--reason", "The original worktree cannot be recovered",
+      "--dry-run",
       "--json",
     ])).stdout);
     expect(replacement.predecessor_run_dir).toBe(predecessorRunDir);
@@ -871,6 +872,7 @@ describe("canonical session lifecycle through the built CLI", () => {
         "--run", predecessorRunDir,
         "--actor", "operator@example.test",
         "--reason", "The original worktree cannot be recovered",
+        "--dry-run",
         "--json",
       ])).stdout,
     );
