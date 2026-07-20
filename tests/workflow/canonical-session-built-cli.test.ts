@@ -143,7 +143,7 @@ function parseJson<T>(raw: string): T {
 
 async function createIsolatedGitRepository(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "brain-hands-built-session-"));
-  await execa("git", ["init", "-q"], { cwd: root });
+  await execa("git", ["init", "-q", "--initial-branch=main"], { cwd: root });
   await execa("git", ["config", "user.email", "brain-hands@example.test"], { cwd: root });
   await execa("git", ["config", "user.name", "Brain Hands"], { cwd: root });
   await writeFile(join(root, "README.md"), "built canonical session proof\n", "utf8");
@@ -812,6 +812,7 @@ describe("canonical session lifecycle through the built CLI", () => {
   it("replaces only an abandoned built-CLI run and replays to the same fresh successor", async () => {
     const projectRoot = process.cwd();
     repoRoot = await createIsolatedGitRepository();
+    expect((await execa("git", ["branch", "--show-current"], { cwd: repoRoot })).stdout).toBe("main");
     await runBuiltCli(projectRoot, ["init", "--repo", repoRoot]);
     await writeSupportedLocalConfig(repoRoot);
 
