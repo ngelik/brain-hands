@@ -112,6 +112,7 @@ describe("npm publish workflow", () => {
   it("runs one canonical funnel, inspects its frozen package, and validates immutable tag context", async () => {
     const { workflow } = await loadWorkflow();
     const validate = workflow.jobs?.validate;
+    expect(validate?.["timeout-minutes"]).toBeGreaterThanOrEqual(180);
     expect(validate?.permissions).toEqual({ contents: "read" });
     expect(validate?.steps?.filter((step) => step.run).map(({ name, run }) => ({ name, run }))).toEqual([
       { name: "Verify the trusted-publishing toolchain", run: "node scripts/check-release-toolchain.mjs" },
