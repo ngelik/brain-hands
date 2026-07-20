@@ -1,0 +1,48 @@
+name: Diagnose npm trusted publishing
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out the release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Verify the trusted-publishing toolchain
+        run: node scripts/check-release-toolchain.mjs
+
+      - name: Verify GitHub exposed the OIDC request contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build release files
+        run: npm run build
+
+      - name: Diagnose npm OIDC exchange without publishing
+        run: npm publish --dry-run --loglevel=verbose
