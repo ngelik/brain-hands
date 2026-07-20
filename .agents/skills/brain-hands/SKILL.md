@@ -2,7 +2,7 @@
 name: brain-hands
 description: Run an approval-gated Brain, Hands, and Verifier workflow through brain-hands.
 requires:
-  codex_flow: "^0.4.0"
+  codex_flow: "^0.5.0"
 ---
 
 # Brain Hands
