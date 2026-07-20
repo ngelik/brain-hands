@@ -3343,6 +3343,7 @@ describe("replace command", () => {
       runDir: predecessor.runDir,
       actor: "operator@example.test",
       reason: "The original worktree cannot be recovered",
+      dryRun: false,
     });
     expect(log).toHaveBeenCalledWith([
       `Replacement run directory: ${successorRunDir}`,
