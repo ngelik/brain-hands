@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { CodexAdapter } from "../../src/adapters/codex.js";
 import type { VerifierRemediationClaimV1 } from "../../src/core/review-fix-packet.js";
 import { executionSpec } from "../fixtures/execution-spec.js";
-import { assertFixPacketChangedFiles, assertFixPacketCorrectionAvailable, classifyFixPacketCompilationFailure, compileReviewFixPacket, correctVerifierRemediationClaim, FixPacketRequiresReplanError, loadReviewFixPacket, persistFixAttemptSupplement, persistReviewFixPacket, reviewFixPacketCorrectionAuthority, reviewFixPacketRoot } from "../../src/workflow/fix-packets.js";
+import { assertFixPacketChangedFiles, assertFixPacketCorrectionAvailable, assertRecoveredFixPacketCommitEvidence, classifyFixPacketCompilationFailure, compileReviewFixPacket, correctVerifierRemediationClaim, FixPacketRequiresReplanError, loadReviewFixPacket, persistFixAttemptSupplement, persistReviewFixPacket, reviewFixPacketCorrectionAuthority, reviewFixPacketRoot } from "../../src/workflow/fix-packets.js";
 const codexMetrics = { usage: null, durationMs: 0, processStarted: false, turnStarted: false, structuredTerminalError: false } as const;
 
 let root: string | undefined;
@@ -44,6 +44,37 @@ describe("fix packets", () => {
     await expect(loadReviewFixPacket(root, saved.path, saved.sha256)).rejects.toThrow(/sidecar/i);
     await expect(persistReviewFixPacket(root, packet)).rejects.toThrow(/sidecar/i);
     await expect(persistReviewFixPacket(root, { ...packet, diagnosis: { ...packet.diagnosis, observed_behavior: "Different" } })).rejects.toThrow(/conflict|exist/i);
+  });
+
+  it("admits only command-linked outputs inside approved artifact and browser scope", () => {
+    const base = executionSpec("item-1");
+    const workItem = {
+      ...base,
+      expected_artifacts: ["artifacts/report.json"],
+      browser_checks: [{
+        name: "desktop", url: "http://127.0.0.1:4173/", local_server_command: "npm run preview",
+        required_selectors: [], console_error_policy: "no_errors" as const, expected_network: [],
+        screenshot_artifact: "artifacts/desktop.png",
+      }],
+    };
+    const compile = (claim: VerifierRemediationClaimV1) => compileReviewFixPacket({
+      claim, work_item: workItem, finding_id: "finding:scope", action_id: "R1-A1", review_revision: 1,
+      criterion_ref: workItem.acceptance[0]!.id, severity: "medium", problem_class: "verification",
+      approved_plan_sha256: "a".repeat(64),
+    });
+    const linked = validClaimFor(workItem);
+    linked.verification.required_evidence.push(
+      { id: "EVID-ART", kind: "artifact", source_id: "CMD-1", output_path: "artifacts/report.json" },
+      { id: "EVID-BROWSER", kind: "browser", source_id: "CMD-1", output_path: "artifacts/desktop.png" },
+    );
+    expect(compile(linked).completion_contract.allowed_generated_evidence_files)
+      .toEqual(["artifacts/report.json", "artifacts/desktop.png"]);
+    const unknown = structuredClone(linked);
+    unknown.verification.required_evidence[1]!.source_id = "UNKNOWN";
+    expect(() => compile(unknown)).toThrow(/unknown command/);
+    const outOfScope = structuredClone(linked);
+    outOfScope.verification.required_evidence[1]!.output_path = "artifacts/other.json";
+    expect(() => compile(outOfScope)).toThrow(FixPacketRequiresReplanError);
   });
 
   it("maps a verifier-confused acceptance reference to the claim's success-condition IDs", () => {
@@ -147,9 +178,58 @@ describe("fix packets", () => {
   });
 
   it("uses the real diff file list as the completion boundary", () => {
-    const expected = { completion_contract: { expected_changed_files: ["src/a.ts"], allow_additional_files: false } } as never;
+    const expected = {
+      completion_contract: {
+        expected_changed_files: ["src/a.ts"],
+        allowed_generated_evidence_files: ["artifacts/report.json", "artifacts/browser.png"],
+        allow_additional_files: false,
+      },
+      verification: {
+        commands: [{ id: "CMD-1", argv: ["npm", "test"] }],
+        required_evidence: [
+          { id: "EVID-1", kind: "artifact", source_id: "CMD-1", output_path: "artifacts/report.json" },
+          { id: "EVID-2", kind: "browser", source_id: "CMD-1", output_path: "artifacts/browser.png" },
+          { id: "EVID-3", kind: "artifact", source_id: "UNKNOWN", output_path: "artifacts/unlinked.json" },
+        ],
+      },
+    } as never;
     expect(() => assertFixPacketChangedFiles(expected, ["src/a.ts"])).not.toThrow();
+    expect(() => assertFixPacketChangedFiles(expected, ["src/a.ts", "artifacts/report.json"])).not.toThrow();
+    expect(() => assertFixPacketChangedFiles(expected, ["src/a.ts", "artifacts/browser.png"])).not.toThrow();
+    expect(() => assertFixPacketChangedFiles(expected, ["src/a.ts", "artifacts/unlinked.json"])).toThrow(/unexpected changed file/);
+    expect(() => assertFixPacketChangedFiles(expected, ["src/a.ts", "artifacts/out-of-scope.json"])).toThrow(/unexpected changed file/);
     expect(() => assertFixPacketChangedFiles(expected, ["src/a.ts", "src/extra.ts"])).toThrow(/unexpected changed file src\/extra.ts/);
+  });
+
+  it("requires exact durable blob and single-commit evidence for committed recovery", () => {
+    const blob = "c".repeat(40);
+    const packet = {
+      completion_contract: { expected_changed_files: ["src/a.ts"], allowed_generated_evidence_files: [], allow_additional_files: false },
+      verification: { commands: [], required_evidence: [] },
+    } as never;
+    const evidence = {
+      base_commit: "a".repeat(40), base_tree: "1".repeat(40),
+      head_commit: "b".repeat(40), head_tree: "2".repeat(40), head_parents: ["a".repeat(40)],
+      changed_files: ["src/a.ts"],
+      path_blobs: [{ path: "src/a.ts", head_blob: blob, worktree_blob: blob }],
+    };
+    const exact = {
+      packet, missingExpectedPaths: ["src/a.ts"], preActionHead: "a".repeat(40), preActionTree: "1".repeat(40),
+      postActionBlobs: [{ path: "src/a.ts", blob }], evidence,
+    };
+    expect(() => assertRecoveredFixPacketCommitEvidence(exact)).not.toThrow();
+    expect(() => assertRecoveredFixPacketCommitEvidence({
+      ...exact, evidence: { ...evidence, path_blobs: [{ path: "src/a.ts", head_blob: null, worktree_blob: null }] },
+    })).toThrow(/missing from the current tree/);
+    expect(() => assertRecoveredFixPacketCommitEvidence({
+      ...exact, evidence: { ...evidence, path_blobs: [{ path: "src/a.ts", head_blob: "d".repeat(40), worktree_blob: "d".repeat(40) }] },
+    })).toThrow(/content drifted/);
+    expect(() => assertRecoveredFixPacketCommitEvidence({
+      ...exact, evidence: { ...evidence, changed_files: ["README.md", "src/a.ts"] },
+    })).toThrow(/unrelated committed change README\.md/);
+    expect(() => assertRecoveredFixPacketCommitEvidence({
+      ...exact, evidence: { ...evidence, head_parents: ["a".repeat(40), "e".repeat(40)] },
+    })).toThrow(/non-merge commit transition/);
   });
 
   it("invokes the same Verifier at most once to correct an invalid claim and reuses its artifact", async () => {

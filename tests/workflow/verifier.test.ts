@@ -294,13 +294,13 @@ describe("verifyWorkItem", () => {
     expect(codex.calls).toHaveLength(0);
   });
 
-  it("rejects a work-item package after an out-of-scope commit advances HEAD", async () => {
+  it("accepts a work-item package after HEAD advances without changing bounded content", async () => {
     const { ledger, contextRef, context, worktreePath } = await boundedVerifierFixture();
     execFileSync("git", ["commit", "--allow-empty", "-m", "unrelated commit"], { cwd: worktreePath });
     const codex = new ExactCoverageVerifier();
     await expect(verifyWorkItem({ runDir: ledger.runDir, worktreePath, workItem: item, contextRef, context, phase: "work_item", final: false, intake: { ...intake, repo_root: root! }, codex, attempt: 1 }))
-      .rejects.toThrow(/HEAD.*authority/i);
-    expect(codex.calls).toHaveLength(0);
+      .resolves.toMatchObject({ review: { decision: "approve" } });
+    expect(codex.calls).toHaveLength(1);
   });
 
   it("compares the ordered changed-file list as well as the patch", async () => {
@@ -312,6 +312,17 @@ describe("verifyWorkItem", () => {
       patch: context.diff,
       patch_bytes: Buffer.byteLength(context.diff, "utf8"),
     }, { baseCommit, headCommit: baseCommit })).toThrow(/changed files/i);
+  });
+
+  it("retains exact HEAD authority for integrated verification", async () => {
+    const { context, baseCommit } = await boundedVerifierFixture();
+    expect(() => assertVerifierScopeSnapshot({ ...context, phase: "final_integrated" }, {
+      base_commit: baseCommit,
+      head_commit: "e".repeat(40),
+      changed_files: context.changed_files,
+      patch: context.diff,
+      patch_bytes: Buffer.byteLength(context.diff, "utf8"),
+    }, { baseCommit, headCommit: baseCommit })).toThrow(/HEAD.*authority/i);
   });
 
   it("produces a canonical strict action queue from a bounded request-changes review", async () => {

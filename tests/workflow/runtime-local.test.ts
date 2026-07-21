@@ -4305,7 +4305,7 @@ describe("runLocalWorkflow", () => {
     expect(new Set(collectorInputs.map(({ baseCommit }) => baseCommit))).toEqual(new Set([collectorInputs[0]!.baseCommit]));
   });
 
-  it("rejects bounded Verifier context replay when the controller Git snapshot HEAD drifts", async () => {
+  it("accepts a work-item commit identity change when the bounded content is unchanged", async () => {
     const boundedPlan = { ...plan, work_items: [item("first")] };
     const config = qualityConfig(0);
     const setupResult = await setupBounded(boundedPlan, false, config.retry_policy.quality_gate); root = setupResult.root;
@@ -4357,8 +4357,8 @@ describe("runLocalWorkflow", () => {
     headCommit = "e".repeat(40);
     const resumed = await runLocalWorkflow(workflowInput);
     expect(resumed.status).toBe("human_action_required");
-    expect(resumed.blocker).toMatch(/Git snapshot/i);
-    expect(verifierCalls).toBe(1);
+    expect(resumed.blocker).toContain("simulated Verifier transport failure");
+    expect(verifierCalls).toBe(2);
     expect(handsCalls).toBe(1);
   });
 
@@ -4962,6 +4962,8 @@ describe("runLocalWorkflow", () => {
             codex: {
               invoke: async (invocationInput) => {
                 invokedPacketModel = invocationInput.model;
+                await mkdir(join(setupResult.worktree, "src"), { recursive: true });
+                await writeFile(join(setupResult.worktree, "src/first.ts"), "export const first = 'packet-fixed';\n", "utf8");
                 const value = {
                   schema_version: 1 as const,
                   packet_id: input.packet.provenance.packet_id,
@@ -5071,6 +5073,15 @@ describe("runLocalWorkflow", () => {
         reasoning_effort: "medium",
       });
       expect(completion.completed_profile).toEqual(completion.started_profile);
+      const gitClaim = JSON.parse(await readFile(join(setupResult.runDir, "reviews/action-invocations", invocationRoots[0]!, "git-claim.json"), "utf8"));
+      const gitCompletion = JSON.parse(await readFile(join(setupResult.runDir, "reviews/action-invocations", invocationRoots[0]!, "git-completion.json"), "utf8"));
+      expect(gitClaim).toMatchObject({ pre_action_head: expect.stringMatching(/^[a-f0-9]{40}$/), pre_action_tree: expect.stringMatching(/^[a-f0-9]{40}$/) });
+      expect(gitCompletion).toMatchObject({
+        pre_action_head: gitClaim.pre_action_head,
+        pre_action_tree: gitClaim.pre_action_tree,
+        report_sha256: completion.report_sha256,
+        post_action_blobs: [{ path: "src/first.ts", blob: expect.stringMatching(/^[a-f0-9]{40}$/) }],
+      });
     },
   );
 });

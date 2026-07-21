@@ -210,7 +210,11 @@ export function assertVerifierScopeSnapshot(
   if (snapshot.base_commit !== authority.baseCommit) {
     throw new Error("Bounded Verifier Git snapshot base does not match durable authority");
   }
-  if (snapshot.head_commit !== authority.headCommit) {
+  // Work-item verification is content-scoped from the durable base. An
+  // operator may commit the same candidate tree while a run is paused; the
+  // immutable diff and changed-file checks below still reject content drift.
+  // Integrated phases remain bound to the exact candidate commit identity.
+  if (context.phase !== "work_item" && snapshot.head_commit !== authority.headCommit) {
     throw new Error("Bounded Verifier Git snapshot HEAD does not match current authority");
   }
   if (context.diff !== snapshot.patch) {

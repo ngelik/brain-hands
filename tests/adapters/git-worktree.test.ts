@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assertCleanSourceCheckout,
+  collectCommittedRecoveryEvidence,
   collectScopedWorktreeDiff,
   commitWorkItem,
   createRunWorktree,
@@ -351,6 +352,24 @@ describe("run worktrees", () => {
       "README.md",
       " leading.txt",
     ]);
+  });
+
+  it("captures exact commit/tree and current blob evidence for recovery", async () => {
+    const root = await repository();
+    const base = (await git(root, "rev-parse", "HEAD")).trim();
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src/fixed.ts"), "export const fixed = true;\n", "utf8");
+    await git(root, "add", "src/fixed.ts");
+    await git(root, "commit", "-qm", "commit recovered action");
+    const evidence = await collectCommittedRecoveryEvidence({ repoRoot: root, baseCommit: base, paths: ["src/fixed.ts"] });
+    expect(evidence.head_parents).toEqual([base]);
+    expect(evidence.changed_files).toEqual(["src/fixed.ts"]);
+    expect(evidence.path_blobs).toEqual([{
+      path: "src/fixed.ts",
+      head_blob: expect.stringMatching(/^[a-f0-9]{40}$/),
+      worktree_blob: expect.stringMatching(/^[a-f0-9]{40}$/),
+    }]);
+    expect(evidence.path_blobs[0]!.head_blob).toBe(evidence.path_blobs[0]!.worktree_blob);
   });
 
   it("restores only tracked worktree paths and preserves untracked files", async () => {

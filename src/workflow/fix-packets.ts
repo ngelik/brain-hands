@@ -1,6 +1,7 @@
 import type { ExecutionSpecV2, VerifierProblemClass } from "../core/types.js";
 import { createHash } from "node:crypto";
 import type { CodexAdapter } from "../adapters/codex.js";
+import type { CommittedRecoveryEvidence } from "../adapters/git.js";
 import type { ResourceBudgetPort } from "../core/resource-budget.js";
 import type { ReasoningEffort } from "../core/types.js";
 import { readFile } from "node:fs/promises";
@@ -235,6 +236,20 @@ export function compileReviewFixPacket(input: CompileReviewFixPacketInput): Revi
       ? evidence.output_path
       : `verification/review-fix/${evidence.id.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`,
   }));
+  const packetCommandIds = new Set(parsedClaim.verification.commands.map((command) => command.id));
+  const approvedArtifacts = new Set(input.work_item.expected_artifacts);
+  const approvedBrowserOutputs = new Set(input.work_item.browser_checks.map((check) => check.screenshot_artifact));
+  const allowedGeneratedEvidenceFiles = normalizedRequiredEvidence.flatMap((evidence) => {
+    if (evidence.kind !== "artifact" && evidence.kind !== "browser") return [];
+    if (!packetCommandIds.has(evidence.source_id)) {
+      throw new Error(`Generated evidence ${evidence.id} references unknown command ${evidence.source_id}`);
+    }
+    const approved = evidence.kind === "artifact" ? approvedArtifacts : approvedBrowserOutputs;
+    if (!approved.has(evidence.output_path)) {
+      throw new FixPacketRequiresReplanError(`Generated evidence ${evidence.output_path} is outside approved ${evidence.kind} output scope`);
+    }
+    return [evidence.output_path];
+  });
   const claim = verifierRemediationClaimV1Schema.parse({
     ...parsedClaim,
     remediation: {
@@ -249,6 +264,7 @@ export function compileReviewFixPacket(input: CompileReviewFixPacketInput): Revi
       ...parsedClaim.completion_contract,
       required_change_unit_ids: normalizedChangeUnits.map((unit) => unit.id),
       expected_changed_files: [...new Set(normalizedChangeUnits.map((unit) => unit.path))],
+      allowed_generated_evidence_files: [...new Set(allowedGeneratedEvidenceFiles)],
     },
   });
 
@@ -582,9 +598,56 @@ export function assertFixPacketCorrectionAvailable(completedCorrectionCalls: num
 
 export function assertFixPacketChangedFiles(packet: ReviewFixPacketV1, actualChangedFiles: readonly string[]): void {
   const expected = new Set(packet.completion_contract.expected_changed_files);
+  const commandIds = new Set(packet.verification.commands.map((command) => command.id));
+  const linkedEvidence = new Set(packet.verification.required_evidence
+    .filter((entry) => (entry.kind === "artifact" || entry.kind === "browser") && commandIds.has(entry.source_id))
+    .map((entry) => entry.output_path));
+  const generatedEvidence = new Set((packet.completion_contract.allowed_generated_evidence_files ?? [])
+    .filter((path) => linkedEvidence.has(path)));
   const actual = new Set(actualChangedFiles);
-  for (const path of actual) if (!expected.has(path)) throw new Error(`unexpected changed file ${path}`);
+  for (const path of actual) {
+    if (!expected.has(path) && !generatedEvidence.has(path)) throw new Error(`unexpected changed file ${path}`);
+  }
   for (const path of expected) if (!actual.has(path)) throw new Error(`required changed file is missing: ${path}`);
+}
+
+export function assertRecoveredFixPacketCommitEvidence(input: {
+  packet: ReviewFixPacketV1;
+  missingExpectedPaths: readonly string[];
+  preActionHead: string;
+  preActionTree: string;
+  postActionBlobs: ReadonlyArray<{ path: string; blob: string }>;
+  evidence: CommittedRecoveryEvidence;
+}): void {
+  const { packet, evidence } = input;
+  if (evidence.base_commit !== input.preActionHead || evidence.base_tree !== input.preActionTree) {
+    throw new Error("committed recovery base does not match immutable pre-action authority");
+  }
+  if (evidence.head_commit === evidence.base_commit || evidence.head_parents.length !== 1 || evidence.head_parents[0] !== evidence.base_commit) {
+    throw new Error("committed recovery requires one direct non-merge commit transition");
+  }
+  const allowedGenerated = new Set(packet.completion_contract.allowed_generated_evidence_files ?? []);
+  const missing = new Set(input.missingExpectedPaths);
+  const allowedTransition = new Set([...missing, ...allowedGenerated]);
+  for (const path of evidence.changed_files) {
+    if (!allowedTransition.has(path)) throw new Error(`unrelated committed change ${path}`);
+  }
+  for (const path of missing) {
+    if (!evidence.changed_files.includes(path)) {
+      throw new Error(`recovered remediation path is not accounted for by the commit transition: ${path}`);
+    }
+  }
+  const durableBlobs = new Map(input.postActionBlobs.map((entry) => [entry.path, entry.blob]));
+  const currentBlobs = new Map(evidence.path_blobs.map((entry) => [entry.path, entry]));
+  for (const path of missing) {
+    const durable = durableBlobs.get(path);
+    if (!durable) throw new Error(`durable post-action blob evidence is missing: ${path}`);
+    const current = currentBlobs.get(path);
+    if (!current?.head_blob || !current.worktree_blob) throw new Error(`recovered remediation path is missing from the current tree: ${path}`);
+    if (current.head_blob !== durable || current.worktree_blob !== durable) {
+      throw new Error(`recovered remediation content drifted from durable post-action evidence: ${path}`);
+    }
+  }
 }
 
 export interface CorrectVerifierRemediationClaimInput {

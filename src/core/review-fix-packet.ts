@@ -78,6 +78,7 @@ export const reviewFixPacketV1Schema = z.object({
   completion_contract: z.object({
     required_change_unit_ids: z.array(idSchema).min(1),
     expected_changed_files: z.array(repositoryPathSchema).min(1),
+    allowed_generated_evidence_files: z.array(repositoryPathSchema).optional(),
     allow_additional_files: z.literal(false),
   }).strict(),
 }).strict();
@@ -240,13 +241,14 @@ export function reviewFixPacketReadinessErrors(
     for (const id of condition.satisfied_by) if (!allIds.includes(id)) errors.push(`${condition.id} references unknown evidence ${id}`);
   }
   const commandIds = new Set(commands.map((entry) => entry.id));
-  for (const entry of evidence) if (!commandIds.has(entry.source_id) && entry.kind !== "artifact" && entry.kind !== "browser") errors.push(`${entry.id} references unknown command ${entry.source_id}`);
+  for (const entry of evidence) if (!commandIds.has(entry.source_id)) errors.push(`${entry.id} references unknown command ${entry.source_id}`);
 
   const paths = [
     ...packet.remediation.allowed_files,
     ...packet.remediation.forbidden_changes.map((entry) => entry.path),
     ...units.map((entry) => entry.path),
     ...packet.completion_contract.expected_changed_files,
+    ...(packet.completion_contract.allowed_generated_evidence_files ?? []),
     ...packet.targets.flatMap((target) => "path" in target ? [target.path] : []),
     ...packet.diagnosis.evidence_refs,
     ...evidence.map((entry) => entry.output_path),
@@ -268,6 +270,14 @@ export function reviewFixPacketReadinessErrors(
   const unitFiles = [...new Set(units.map((entry) => entry.path))];
   for (const path of packet.completion_contract.expected_changed_files) if (!unitFiles.includes(path)) errors.push(`completion contract contains unexpected changed file ${path}`);
   for (const path of unitFiles) if (!packet.completion_contract.expected_changed_files.includes(path)) errors.push(`completion contract is missing changed file ${path}`);
+  const linkedGenerated = [...new Set(evidence
+    .filter((entry) => (entry.kind === "artifact" || entry.kind === "browser") && commandIds.has(entry.source_id))
+    .map((entry) => entry.output_path))]
+    .sort();
+  const allowedGenerated = [...(packet.completion_contract.allowed_generated_evidence_files ?? [])].sort();
+  if (JSON.stringify(linkedGenerated) !== JSON.stringify(allowedGenerated)) {
+    errors.push("completion contract generated evidence files do not match linked artifact/browser evidence");
+  }
   const requiredUnits = packet.completion_contract.required_change_unit_ids;
   for (const id of units.map((entry) => entry.id)) if (!requiredUnits.includes(id)) errors.push(`completion contract does not require ${id}`);
   for (const id of requiredUnits) if (!units.some((entry) => entry.id === id)) errors.push(`completion contract references unknown change unit ${id}`);

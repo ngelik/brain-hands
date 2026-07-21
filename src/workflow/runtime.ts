@@ -3,10 +3,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { access, lstat, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { z } from "zod";
 import { classifyCodexFailure, CodexInvocationError, SubprocessCodexAdapter, type CodexAdapter } from "../adapters/codex.js";
 import { readModelCatalog, validateCatalogProfile, type ModelCatalogSnapshot } from "../adapters/model-catalog.js";
 import {
   collectScopedWorktreeDiff,
+  collectCommittedRecoveryEvidence,
+  collectWorktreeBlobEvidence,
   commitWorkItem,
   createRunWorktree,
   getGitSnapshot,
@@ -143,7 +146,7 @@ import {
   type HandsWorkItemInput,
   type HandsWorkItemResult,
 } from "./worker.js";
-import { classifyFixPacketCompilationFailure, compileReviewFixPacket, correctVerifierRemediationClaim, FixPacketRequiresReplanError, loadReviewFixPacket, persistReviewFixPacket, persistFixAttemptSupplement, fixAttemptSupplementPath, reviewFixPacketRoot, assertFixPacketChangedFiles } from "./fix-packets.js";
+import { classifyFixPacketCompilationFailure, compileReviewFixPacket, correctVerifierRemediationClaim, FixPacketRequiresReplanError, loadReviewFixPacket, persistReviewFixPacket, persistFixAttemptSupplement, fixAttemptSupplementPath, reviewFixPacketRoot, assertFixPacketChangedFiles, assertRecoveredFixPacketCommitEvidence } from "./fix-packets.js";
 import { fingerprintFinding } from "./findings.js";
 import { assertFixPacketResolutionMatchesPacket, assertFixPacketResultMatchesPacket, fixAttemptSupplementV1Schema, fixPacketResolutionV1Schema, fixPacketResultV1Schema, hashReviewFixPacket, type FixAttemptSupplementV1, type FixPacketResolutionV1, type ReviewFixPacketV1 } from "../core/review-fix-packet.js";
 import {
@@ -289,6 +292,8 @@ export interface LocalRuntimeDependencies {
   packetVerifier?: (input: VerifyReviewFixPacketInput) => Promise<FixPacketResolutionResult>;
   diff?: (worktreePath: string) => Promise<string>;
   collectScopedWorktreeDiff?: typeof collectScopedWorktreeDiff;
+  collectCommittedRecoveryEvidence?: typeof collectCommittedRecoveryEvidence;
+  collectWorktreeBlobEvidence?: typeof collectWorktreeBlobEvidence;
   commit?: typeof commitWorkItem;
   gitSnapshot?: (worktreePath: string) => Promise<GitSnapshot>;
   changedFiles?: typeof getWorktreeChangedFiles;
@@ -358,6 +363,26 @@ export type RuntimeCheckpoint =
   | "after_status_fixing_publication"
   | "after_status_policy_publication"
   | "after_initial_runtime_authority_bind";
+
+const gitObjectIdSchema = z.string().regex(/^[a-f0-9]{40,64}$/);
+const actionGitCoordinateShape = {
+  effect_id: z.string().regex(/^review-effect:[a-f0-9]{64}$/),
+  review_revision: z.number().int().positive(),
+  action_id: z.string().min(1),
+  action_attempt: z.number().int().positive(),
+};
+const actionGitClaimSchema = z.object({
+  ...actionGitCoordinateShape,
+  pre_action_head: gitObjectIdSchema,
+  pre_action_tree: gitObjectIdSchema,
+}).strict();
+const actionGitCompletionSchema = z.object({
+  ...actionGitCoordinateShape,
+  pre_action_head: gitObjectIdSchema,
+  pre_action_tree: gitObjectIdSchema,
+  report_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  post_action_blobs: z.array(z.object({ path: z.string().min(1), blob: gitObjectIdSchema }).strict()),
+}).strict();
 
 export interface GithubRuntimeDependencies extends LocalRuntimeDependencies {
   github: GitHubAdapter;
@@ -3718,6 +3743,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
   const commit = input.dependencies?.commit ?? commitWorkItem;
   const gitSnapshot = input.dependencies?.gitSnapshot ?? getGitSnapshot;
   const changedFiles = input.dependencies?.changedFiles ?? getWorktreeChangedFiles;
+  const committedRecoveryEvidence = input.dependencies?.collectCommittedRecoveryEvidence ?? collectCommittedRecoveryEvidence;
+  const worktreeBlobEvidence = input.dependencies?.collectWorktreeBlobEvidence ?? collectWorktreeBlobEvidence;
   const restoreTrackedFiles = input.dependencies?.restoreTrackedFiles ?? restoreTrackedWorktreeFiles;
   const worktreeHasChanges = input.dependencies?.hasWorktreeChanges
     ?? (async (worktreePath: string) => (await gitSnapshot(worktreePath)).status.trim().length > 0);
@@ -5284,6 +5311,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     const claimRoot = `reviews/action-invocations/${Buffer.from(claimId).toString("base64url")}`;
     const claimPath = `${claimRoot}/claim.json`;
     const completionPath = `${claimRoot}/completion.json`;
+    const gitClaimPath = `${claimRoot}/git-claim.json`;
+    const gitCompletionPath = `${claimRoot}/git-completion.json`;
     const reportPath = `implementation/${claimInput.workItem.id.replace(/[^a-zA-Z0-9._-]/g, "_")}/attempt-${claimInput.mutationAttempt}.json`;
     const staticProvenance = {
       effect_id: claimInput.cycle.effect_id,
@@ -5292,6 +5321,22 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       action_attempt: claimInput.actionAttempt,
       report_path: reportPath,
       substage: claimInput.cycle.decision.action === "quality_recovery" ? "quality_recovery" : "primary_fix",
+    };
+    const gitCoordinates = {
+      effect_id: claimInput.cycle.effect_id,
+      review_revision: claimInput.cycle.review_revision,
+      action_id: claimInput.action.action_id,
+      action_attempt: claimInput.actionAttempt,
+    };
+    const persistGitCompletion = async (reportSha256: string): Promise<void> => {
+      const gitClaim = actionGitClaimSchema.parse(await readRunArtifact(input.runDir, gitClaimPath));
+      const expectedPaths = claimInput.action.remediation?.completion_contract.expected_changed_files
+        ?? claimInput.workItem.completion_contract.expected_changed_files;
+      await persistImmutableJsonArtifact(input.runDir, gitCompletionPath, actionGitCompletionSchema.parse({
+        ...gitClaim,
+        report_sha256: reportSha256,
+        post_action_blobs: await worktreeBlobEvidence(input.worktreePath, expectedPaths),
+      }));
     };
     const profileForKind = (manifestAtStart: RunManifestV2, kind: "primary" | "backup"): PersistedHandsProfile => {
       const profile = kind === "primary"
@@ -5426,6 +5471,15 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       startManifest,
       claimInput.cycle.decision.action === "quality_recovery" ? "backup" : startManifest.active_hands_profile,
     );
+    if (claimInput.invokeMutation) {
+      const preActionHead = await (input.dependencies?.localHeadSha ?? resolveLocalHeadSha)(input.worktreePath);
+      const preActionCommit = await (input.dependencies?.localCommitProvenance ?? resolveLocalCommitProvenance)(input.worktreePath, preActionHead);
+      await persistImmutableJsonArtifact(input.runDir, gitClaimPath, actionGitClaimSchema.parse({
+        ...gitCoordinates,
+        pre_action_head: preActionCommit.sha,
+        pre_action_tree: preActionCommit.tree_sha,
+      }));
+    }
     await persistImmutableJsonArtifact(input.runDir, claimPath, { ...staticProvenance, state: "started", started_profile: startedProfile, completed_profile: null });
     await input.dependencies?.afterCheckpoint?.("after_action_invocation_claim");
     const invoked = claimInput.invokeMutation
@@ -5443,6 +5497,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     await loadReport();
     const identity = await loadReportIdentity();
     await validateTransfer(startedProfile, identity.profile);
+    if (claimInput.invokeMutation) await persistGitCompletion(identity.sha256);
     await persistImmutableJsonArtifact(input.runDir, completionPath, {
       ...staticProvenance,
       state: "complete",
@@ -5962,12 +6017,47 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             const activeExpected = new Set(packetState.packet.completion_contract.expected_changed_files);
             const existedBeforeAction = new Set(beforeFiles);
             const actual = await changedFiles(input.worktreePath);
-            assertFixPacketChangedFiles(
-              packetState.packet,
-              actual.filter((path) =>
-                activeExpected.has(path)
-                || (!existedBeforeAction.has(path) && !completedOnlyFiles.has(path))),
-            );
+            const scopedActual = actual.filter((path) =>
+              activeExpected.has(path)
+              || (!existedBeforeAction.has(path) && !completedOnlyFiles.has(path)));
+            if (queueInput.recoverStartedPacketInvocation) {
+              const missingExpected = [...activeExpected].filter((path) => !scopedActual.includes(path));
+              if (missingExpected.length > 0) {
+                const claimId = [queueInput.cycle!.effect_id, queueInput.cycle!.review_revision, activeAction.action_id, activeAttempt].join(":");
+                const claimRoot = `reviews/action-invocations/${Buffer.from(claimId).toString("base64url")}`;
+                const gitClaim = actionGitClaimSchema.parse(await readRunArtifact(input.runDir, `${claimRoot}/git-claim.json`));
+                const gitCompletion = actionGitCompletionSchema.parse(await readRunArtifact(input.runDir, `${claimRoot}/git-completion.json`));
+                if (
+                  gitCompletion.effect_id !== gitClaim.effect_id
+                  || gitCompletion.review_revision !== gitClaim.review_revision
+                  || gitCompletion.action_id !== gitClaim.action_id
+                  || gitCompletion.action_attempt !== gitClaim.action_attempt
+                  || gitCompletion.pre_action_head !== gitClaim.pre_action_head
+                  || gitCompletion.pre_action_tree !== gitClaim.pre_action_tree
+                ) throw new Error("Committed packet recovery Git provenance is inconsistent");
+                const reportSha256 = createHash("sha256")
+                  .update(await readFile(resolve(input.runDir, implementationResult.reportPath)))
+                  .digest("hex");
+                if (gitCompletion.report_sha256 !== reportSha256) {
+                  throw new Error("Committed packet recovery report hash is not current authority");
+                }
+                const evidence = await committedRecoveryEvidence({
+                  repoRoot: input.worktreePath,
+                  baseCommit: gitClaim.pre_action_head,
+                  paths: missingExpected,
+                });
+                assertRecoveredFixPacketCommitEvidence({
+                  packet: packetState.packet,
+                  missingExpectedPaths: missingExpected,
+                  preActionHead: gitClaim.pre_action_head,
+                  preActionTree: gitClaim.pre_action_tree,
+                  postActionBlobs: gitCompletion.post_action_blobs,
+                  evidence,
+                });
+                scopedActual.push(...missingExpected);
+              }
+            }
+            assertFixPacketChangedFiles(packetState.packet, scopedActual);
           }
           manifest = await setProgress(input.runDir, queueInput.workItem.id, {
             status: "in_progress",

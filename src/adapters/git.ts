@@ -29,6 +29,16 @@ export interface ScopedDiff {
   patch_bytes: number;
 }
 
+export interface CommittedRecoveryEvidence {
+  base_commit: string;
+  base_tree: string;
+  head_commit: string;
+  head_tree: string;
+  head_parents: string[];
+  changed_files: string[];
+  path_blobs: Array<{ path: string; head_blob: string | null; worktree_blob: string | null }>;
+}
+
 export interface CollectScopedWorktreeDiffInput {
   repoRoot: string;
   baseCommit: string;
@@ -831,6 +841,61 @@ export async function getWorktreeChangedFiles(repoRoot: string): Promise<string[
     [...tracked.stdout.split("\0"), ...untracked.stdout.split("\0")]
       .filter((path) => path.length > 0),
   )];
+}
+
+/** Hash regular worktree files without staging or changing repository state. */
+export async function collectWorktreeBlobEvidence(
+  repoRoot: string,
+  paths: readonly string[],
+): Promise<Array<{ path: string; blob: string }>> {
+  const evidence: Array<{ path: string; blob: string }> = [];
+  for (const path of [...new Set(paths)].sort()) {
+    validateContractPath(path);
+    const stat = await lstat(join(repoRoot, path)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!stat?.isFile() || stat.isSymbolicLink()) throw new Error(`Recovery evidence path is not a regular file: ${path}`);
+    evidence.push({
+      path,
+      blob: await gitValue(repoRoot, ["hash-object", "--", path], `Failed to hash recovery evidence path ${path}`),
+    });
+  }
+  return evidence;
+}
+
+/** Capture one exact committed tree transition for fail-closed packet recovery. */
+export async function collectCommittedRecoveryEvidence(input: {
+  repoRoot: string;
+  baseCommit: string;
+  paths: readonly string[];
+}): Promise<CommittedRecoveryEvidence> {
+  const base = await resolveLocalCommitProvenance(input.repoRoot, input.baseCommit);
+  const headSha = await resolveLocalHeadSha(input.repoRoot);
+  const head = await resolveLocalCommitProvenance(input.repoRoot, headSha);
+  const changed = await git(input.repoRoot, ["diff", "--name-only", "-z", "--relative", base.sha, head.sha]);
+  if (changed.exitCode !== 0) throw commandFailureError(changed, "Failed to list committed recovery changes");
+  const pathBlobs: CommittedRecoveryEvidence["path_blobs"] = [];
+  for (const path of [...new Set(input.paths)].sort()) {
+    validateContractPath(path);
+    const tree = await git(input.repoRoot, ["ls-tree", "-z", head.sha, "--", `:(literal)${path}`]);
+    if (tree.exitCode !== 0) throw commandFailureError(tree, `Failed to inspect committed recovery path ${path}`);
+    const treeMatch = tree.stdout.match(/^\d+ blob ([a-f0-9]{40,64})\t/);
+    const worktree = await collectWorktreeBlobEvidence(input.repoRoot, [path]).catch((error: Error) => {
+      if (error.message.includes("not a regular file")) return [];
+      throw error;
+    });
+    pathBlobs.push({ path, head_blob: treeMatch?.[1] ?? null, worktree_blob: worktree[0]?.blob ?? null });
+  }
+  return {
+    base_commit: base.sha,
+    base_tree: base.tree_sha,
+    head_commit: head.sha,
+    head_tree: head.tree_sha,
+    head_parents: head.parent_shas,
+    changed_files: changed.stdout.split("\0").filter(Boolean).sort(),
+    path_blobs: pathBlobs,
+  };
 }
 
 /** Restore only tracked paths that an isolated run worktree inherited from a rejected attempt. */
