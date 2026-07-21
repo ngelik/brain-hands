@@ -91,6 +91,9 @@ describe("strict Verifier remediation", () => {
     const remediation = finding.properties.remediation;
     expect(remediation.properties.targets.items).toHaveProperty("anyOf");
     expect(remediation.properties.remediation.properties.change_units.items.required).toEqual(["id", "path", "target", "operation", "requirements", "satisfies"]);
+    expect(remediation.properties.completion_contract.required).toEqual(
+      Object.keys(remediation.properties.completion_contract.properties),
+    );
   });
 
   it("publishes a provider-compatible object and complete strict finding variants", () => {

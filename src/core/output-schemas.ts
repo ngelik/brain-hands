@@ -694,7 +694,7 @@ export const verifierRemediationClaimV1OutputSchema = {
         allowed_generated_evidence_files: stringArray,
         allow_additional_files: { type: "boolean", const: false },
       },
-      required: ["required_change_unit_ids", "expected_changed_files", "allow_additional_files"],
+      required: ["required_change_unit_ids", "expected_changed_files", "allowed_generated_evidence_files", "allow_additional_files"],
     },
   },
   required: ["schema_version", "diagnosis", "targets", "remediation", "verification", "completion_contract"],
