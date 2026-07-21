@@ -34,17 +34,24 @@ type Workflow = {
 
 const workflowPath = join(process.cwd(), ".github", "workflows", "publish-npm.yml");
 
+const boundedReleaseRun = `npm run typecheck
+npm run build
+npm run validate-release
+npx vitest run tests/core/schema.test.ts tests/core/execution-spec.test.ts tests/core/testing-funnel.test.ts tests/prompts/renderer.test.ts tests/workflow/replan.test.ts tests/workflow/fix-packet-resolution.test.ts tests/workflow/recovery-runtime.test.ts tests/workflow/review-normalizer.test.ts tests/workflow/role-context.test.ts tests/verification/runner.test.ts tests/cli-smoke.test.ts tests/browser/network-pattern.test.ts
+`;
+
 const immutableContextRun = `set -euo pipefail
-test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+release_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{}")"
+test "$(git rev-parse HEAD)" = "$release_sha"
+test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
 if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
   test "$GITHUB_REF_TYPE" = "tag"
-  test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = "tag"
-  test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{}")" = "$GITHUB_SHA"
-  test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
-  npm run validate-release -- --json --tag "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY"
+  test "$release_sha" = "$GITHUB_SHA"
+  test "$(git rev-parse refs/remotes/origin/main)" = "$release_sha"
 else
-  npm run validate-release -- --json
+  git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main
 fi
+npm run validate-release -- --json --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY"
 `;
 
 async function loadWorkflow() {
@@ -85,7 +92,13 @@ describe("npm publish workflow", () => {
     const { workflow } = await loadWorkflow();
     expect(workflow.name).toBe("Publish npm package");
     expect(workflow.on?.push).toEqual({ tags: ["v*"] });
-    expect(workflow.on).toHaveProperty("workflow_dispatch");
+    expect(workflow.on?.workflow_dispatch).toEqual({ inputs: {
+      release_tag: {
+        description: "Existing annotated release tag to retry",
+        required: true,
+        type: "string",
+      },
+    } });
     expect(workflow.permissions).toEqual({ contents: "read" });
     expect(workflow.concurrency).toEqual({
       group: "npm-publish-${{ github.repository }}",
@@ -117,7 +130,7 @@ describe("npm publish workflow", () => {
     expect(validate?.steps?.filter((step) => step.run).map(({ name, run }) => ({ name, run }))).toEqual([
       { name: "Verify the trusted-publishing toolchain", run: "node scripts/check-release-toolchain.mjs" },
       { name: "Install dependencies", run: "npm ci --ignore-scripts" },
-      { name: "Bounded release verification", run: "npm run verify:ci" },
+      { name: "Bounded release verification", run: boundedReleaseRun },
       { name: "Validate immutable release context", run: immutableContextRun },
       { name: "Inspect the package artifact", run: "npm pack --dry-run --json --ignore-scripts" },
     ]);
@@ -125,7 +138,9 @@ describe("npm publish workflow", () => {
     for (const required of [
       "node scripts/check-release-toolchain.mjs",
       "npm ci --ignore-scripts",
-      "npm run verify:ci",
+      "npm run typecheck",
+      "npm run build",
+      "npm run validate-release",
       "npm pack --dry-run --json --ignore-scripts",
       "npm run validate-release -- --json",
       "git cat-file -t",
@@ -136,20 +151,20 @@ describe("npm publish workflow", () => {
     expect(combinedWorkflowRuns(workflow)).not.toContain("npm run release:e2e");
     expect(runs).not.toContain("git fetch");
     expect(runs).toContain("$GITHUB_EVENT_NAME");
-    expect(runs).toContain("$GITHUB_REF_NAME");
+    expect(runs).toContain("$RELEASE_TAG");
     expect(runs).toContain("$GITHUB_REPOSITORY");
 
     const commands = executableCommands(validate);
     const funnels = commands.filter(({ command }) =>
-      commandStartsWith(command, ["npm", "run", "verify:ci"]),
+      commandStartsWith(command, ["npx", "vitest", "run"]),
     );
     expect(funnels).toHaveLength(1);
     expect(funnels[0]?.step.name).toBe("Bounded release verification");
     for (const duplicateGate of [
       ["npm", "test"],
       ["npm", "run", "test"],
-      ["npm", "run", "typecheck"],
-      ["npm", "run", "build"],
+      ["npm", "run", "test:cross-cutting"],
+      ["npm", "run", "test:all:no-build"],
     ]) {
       expect(commands.some(({ command }) => commandStartsWith(command, duplicateGate))).toBe(false);
     }
@@ -169,22 +184,23 @@ describe("npm publish workflow", () => {
 
     const executable = commands.map(({ command }) => command.raw);
     for (const check of [
-      'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+      'test "$(git rev-parse HEAD)" = "$release_sha"',
       'test "$GITHUB_REF_TYPE" = "tag"',
-      'test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = "tag"',
-      'test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{}")" = "$GITHUB_SHA"',
-      'test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"',
+      'test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"',
+      'test "$release_sha" = "$GITHUB_SHA"',
+      'test "$(git rev-parse refs/remotes/origin/main)" = "$release_sha"',
+      'git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main',
     ]) {
       expect(executable).toContain(check);
     }
     expect(commands.filter(({ command }) =>
       commandStartsWith(command, ["npm", "run", "validate-release"])).map(({ command }) => command.argv))
       .toEqual([
+        ["npm", "run", "validate-release"],
         [
           "npm", "run", "validate-release", "--", "--json", "--tag",
-          "$GITHUB_REF_NAME", "--repository", "$GITHUB_REPOSITORY",
+          "$RELEASE_TAG", "--repository", "$GITHUB_REPOSITORY",
         ],
-        ["npm", "run", "validate-release", "--", "--json"],
       ]);
   });
 
@@ -192,7 +208,7 @@ describe("npm publish workflow", () => {
     const { workflow } = await loadWorkflow();
     const publish = workflow.jobs?.publish;
     expect(publish?.needs).toBe("validate");
-    expect(publish?.if).toContain("github.event_name == 'push'");
+    expect(publish?.if).toBe("github.event_name == 'push' || inputs.release_tag != ''");
     expect(publish?.environment).toBe("npm-publish");
     expect(publish?.permissions).toEqual({ contents: "read", "id-token": "write" });
     expect(publish?.steps?.filter((step) => step.run).map(({ name, run }) => ({ name, run }))).toEqual([
@@ -201,11 +217,11 @@ describe("npm publish workflow", () => {
       { name: "Build release files", run: "npm run build" },
       {
         name: "Revalidate the publish context",
-        run: 'npm run validate-release -- --json --tag "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY"',
+        run: 'npm run validate-release -- --json --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY"',
       },
       {
         name: "Publish and verify the exact artifact",
-        run: 'node scripts/publish-release.mjs --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"',
+        run: 'node scripts/publish-release.mjs --tag "$RELEASE_TAG" --commit "$(git rev-parse HEAD)" --repository "$GITHUB_REPOSITORY"',
       },
     ]);
     const commands = executableCommands(publish);
@@ -221,11 +237,11 @@ describe("npm publish workflow", () => {
     expect(publishRelease).toHaveLength(1);
     expect(validate[0]!.command.argv).toEqual([
       "npm", "run", "validate-release", "--", "--json", "--tag",
-      "$GITHUB_REF_NAME", "--repository", "$GITHUB_REPOSITORY",
+      "$RELEASE_TAG", "--repository", "$GITHUB_REPOSITORY",
     ]);
     expect(publishRelease[0]!.command.argv).toEqual([
-      "node", "scripts/publish-release.mjs", "--tag", "$GITHUB_REF_NAME",
-      "--commit", "$GITHUB_SHA", "--repository", "$GITHUB_REPOSITORY",
+      "node", "scripts/publish-release.mjs", "--tag", "$RELEASE_TAG",
+      "--commit", "$(git rev-parse HEAD)", "--repository", "$GITHUB_REPOSITORY",
     ]);
     expect(build[0]!.stepIndex).toBeLessThan(validate[0]!.stepIndex);
     expect(validate[0]!.stepIndex).toBeLessThan(publishRelease[0]!.stepIndex);

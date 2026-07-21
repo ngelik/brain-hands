@@ -4,7 +4,12 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated release tag to retry
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,6 +31,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -41,29 +47,36 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Bounded release verification
-        run: npm run verify:ci
+        run: |
+          npm run typecheck
+          npm run build
+          npm run validate-release
+          npx vitest run tests/core/schema.test.ts tests/core/execution-spec.test.ts tests/core/testing-funnel.test.ts tests/prompts/renderer.test.ts tests/workflow/replan.test.ts tests/workflow/fix-packet-resolution.test.ts tests/workflow/recovery-runtime.test.ts tests/workflow/review-normalizer.test.ts tests/workflow/role-context.test.ts tests/verification/runner.test.ts tests/cli-smoke.test.ts tests/browser/network-pattern.test.ts
 
       - name: Validate immutable release context
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          release_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{}")"
+          test "$(git rev-parse HEAD)" = "$release_sha"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             test "$GITHUB_REF_TYPE" = "tag"
-            test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = "tag"
-            test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{}")" = "$GITHUB_SHA"
-            test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
-            npm run validate-release -- --json --tag "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY"
+            test "$release_sha" = "$GITHUB_SHA"
+            test "$(git rev-parse refs/remotes/origin/main)" = "$release_sha"
           else
-            npm run validate-release -- --json
+            git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main
           fi
+          npm run validate-release -- --json --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY"
 
       - name: Inspect the package artifact
         run: npm pack --dry-run --json --ignore-scripts
 
   publish:
     needs: validate
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.release_tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: npm-publish
@@ -77,6 +90,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -95,7 +109,11 @@ jobs:
         run: npm run build
 
       - name: Revalidate the publish context
-        run: npm run validate-release -- --json --tag "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY"
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: npm run validate-release -- --json --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY"
 
       - name: Publish and verify the exact artifact
-        run: node scripts/publish-release.mjs --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: node scripts/publish-release.mjs --tag "$RELEASE_TAG" --commit "$(git rev-parse HEAD)" --repository "$GITHUB_REPOSITORY"
