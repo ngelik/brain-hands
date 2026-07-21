@@ -8,7 +8,7 @@
 software work that needs a clear plan, explicit approval, controlled edits, and
 independent verification.
 
-**Orbitarium is the live demo.** It is a separate Solar System app built to
+**[Orbitarium is the live demo.](https://github.com/ngelik/solar-20260520)** It is a separate Solar System app built to
 pressure-test Brain Hands on a real, visual project. The animation below is a
 Chrome capture of that app running—not the main product.
 
