@@ -4,6 +4,24 @@
 [![npm](https://img.shields.io/npm/v/%40ngelik%2Fbrain-hands)](https://www.npmjs.com/package/@ngelik/brain-hands)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+![Orbitarium planets orbiting in a live browser simulation](docs/assets/orbitarium-brain-hands-demo.gif)
+
+## Tested on a real project: Orbitarium
+
+[Orbitarium](https://github.com/ngelik/solar-20260520) is a browser-only,
+interactive Solar System built as an end-to-end real-world test of Brain Hands
+in GitHub mode. The run used Brain Hands for discovery, separate brief and plan
+approvals, issue decomposition, implementation, focused fixes, browser evidence,
+independent verification, and recovery.
+
+The test also exercised the tool the way it is meant to be used: failures found
+while building Orbitarium produced focused Brain Hands controller fixes and
+regression tests before project work continued. The public test repository
+currently contains the [Brain Hands-generated execution
+trail](https://github.com/ngelik/solar-20260520/issues); the complete Orbitarium
+code will be pushed after its final verification. The Codex build task is
+`019f8045-f48a-7f02-8042-47786810fa93`.
+
 Brain Hands is a structured way to use Codex for changes where proving the
 work matters as much as writing the code. A strong **Brain** explores and
 plans, **Hands** implements only what you approved, and an independent
