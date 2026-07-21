@@ -159,6 +159,7 @@ export interface ReplanPatchProvenance {
 }
 
 export interface ReplanPatchRecord {
+  materialization_version?: 2;
   patch: ReplanPatch;
   provenance: ReplanPatchProvenance;
 }
@@ -300,6 +301,7 @@ export interface NormalizeReviewInput {
   release_guards: ReleaseGuard[];
   severity_defaults: Record<FindingSeverity, ReviewDisposition>;
   verification_criterion_ref: string;
+  writable_paths?: string[];
   release_guard_failures?: ReleaseGuardFailure[];
   operational_failure?: Omit<OperationalBlocker, "phase">;
 }

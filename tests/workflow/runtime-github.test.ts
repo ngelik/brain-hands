@@ -3554,6 +3554,11 @@ describe("runGithubWorkflow", () => {
     expect(calls.indexOf("publish-verified-ready-status")).toBeGreaterThan(calls.indexOf("persist-final-assurance"));
     expect(verificationInputs.map((input) => input.identity?.work_item_id)).toContain("integrated");
     expect(verificationInputs.every((input) => input.stopOnFailure === true)).toBe(true);
+    const postPrVerification = verificationInputs.find((input) => input.phase === "post_pr");
+    expect(postPrVerification?.commands).toEqual([
+      ...plan.work_items.flatMap((item) => item.verification_commands.map((command) => command.argv)),
+      ...plan.integration_verification,
+    ]);
     expect((await readManifestV2(setupResult.runDir)).pull_request_numbers).toEqual([42]);
     const events = []; for await (const event of readProgressEvents(setupResult.runDir)) events.push(event);
     expect(events.map((event) => event.safe_label)).toEqual(expect.arrayContaining([
@@ -5432,6 +5437,14 @@ describe("runGithubWorkflow", () => {
       `<!-- brain-hands-run-status:${result.manifest.run_id} -->\nLocal replan status requires attention.`,
     );
     expect(github.statusUpserts.at(-1)?.body).not.toContain(result.blocker!);
+    if (candidateKind === "invalid") {
+      const resumed = await runGithubWorkflow(workflowInput);
+      expect(resumed.status).toBe("human_action_required");
+      expect(resumed.manifest.stage).toBe("replanning");
+      expect(resumed.blocker).toMatch(/Ambiguous create_replan effect has no persisted immutable patch/);
+      expect(resumed.blocker).not.toMatch(/GitHub runtime requires .* stage/);
+      expect(resumed.blocker).not.toMatch(/replanning -> final_verification/);
+    }
   }, 120_000);
 
   it("blocks a deleted post-PR replan source pointer without overwriting GitHub status", async () => {

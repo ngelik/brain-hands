@@ -54,6 +54,80 @@ describe("verifyReviewFixPacket", () => {
     expect(replay.review).toEqual(resolution);
   });
 
+  it("omits binary payloads and bounds both diffs before invoking the focused Verifier", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-packet-resolution-bounded-diff-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const codex = new RecordingVerifier();
+    const binaryPayload = "A".repeat(1_200_000);
+    const oversizedDiff = [
+      "diff --git a/public/planet.webp b/public/planet.webp",
+      "new file mode 100644",
+      "GIT binary patch",
+      "literal 1200000",
+      binaryPayload,
+      "diff --git a/src/example.ts b/src/example.ts",
+      `+${"x".repeat(100_000)}`,
+    ].join("\n");
+
+    await verifyReviewFixPacket({
+      runDir: ledger.runDir,
+      worktreePath: root,
+      packet,
+      actionAttempt: 1,
+      intake,
+      codex,
+      beforeDiff: oversizedDiff,
+      afterDiff: oversizedDiff,
+      verificationEvidence,
+      selfReviewReports: [],
+    });
+
+    const prompt = codex.calls[0]!.prompt;
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThan(96_000);
+    expect(prompt).toContain("Binary patch payload omitted from the model prompt (1200000 bytes)");
+    expect(prompt).toContain("Diff content compacted to stay within the model input limit");
+    expect(prompt).toContain("public/planet.webp");
+    expect(prompt).toContain("src/example.ts");
+    expect(prompt).not.toContain(binaryPayload);
+  });
+
+  it("writes a new immutable prompt artifact when retrying a failed focused Verifier invocation", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-packet-resolution-retry-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const failed: CodexAdapter = {
+      invoke: async () => { throw new Error("provider rejected prompt"); },
+    };
+    await expect(verifyReviewFixPacket({
+      runDir: ledger.runDir,
+      worktreePath: root,
+      packet,
+      actionAttempt: 1,
+      intake,
+      codex: failed,
+      beforeDiff: "before",
+      afterDiff: "after",
+      verificationEvidence,
+      selfReviewReports: [],
+    })).rejects.toThrow("provider rejected prompt");
+
+    const codex = new RecordingVerifier();
+    await verifyReviewFixPacket({
+      runDir: ledger.runDir,
+      worktreePath: root,
+      packet,
+      actionAttempt: 1,
+      intake,
+      codex,
+      beforeDiff: "before retry",
+      afterDiff: "after retry",
+      verificationEvidence,
+      selfReviewReports: [],
+    });
+
+    expect(codex.calls[0]!.artifactName).toContain("-resume-2-invocation-");
+    expect(codex.calls[0]!.prompt).toContain("after retry");
+  });
+
   it("binds controller-owned packet provenance instead of trusting model echoes", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-packet-resolution-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
@@ -86,6 +160,46 @@ describe("verifyReviewFixPacket", () => {
     const invalid = { ...resolution, condition_results: [{ ...resolution.condition_results[0], evidence_refs: ["verification/unknown.json"] }] };
     const output = await verifyReviewFixPacket({ runDir: ledger.runDir, worktreePath: root, packet, actionAttempt: 1, intake, codex: { invoke: async () => ({ text: JSON.stringify(invalid), parsed: invalid, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics }) }, beforeDiff: "before", afterDiff: "after", verificationEvidence, selfReviewReports: [] });
     expect(output.review.condition_results[0]!.evidence_refs).toEqual(["verification/result.json"]);
+  });
+
+  it("resolves a contradictory operational blocker when every authoritative command passed", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-packet-resolution-command-authority-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const commandPacket = {
+      ...packet,
+      verification: {
+        ...packet.verification,
+        success_conditions: [{ ...packet.verification.success_conditions[0]!, satisfied_by: ["CMD-1"] }],
+      },
+    } as ReviewFixPacketV1;
+    const blocked = {
+      packet_id: commandPacket.provenance.packet_id,
+      packet_sha256: hashReviewFixPacket(commandPacket),
+      action_attempt: 1,
+      decision: "operationally_blocked" as const,
+      condition_results: [{ success_condition_id: "SC-1", status: "unsatisfied" as const, evidence_refs: ["verification/result.json"], remaining_problem: "The command could not run." }],
+      required_next_fix: "Restore the command runtime.",
+      blocker: { code: "command_blocked", message: "The command could not run.", evidence_refs: ["verification/result.json"] },
+    };
+    const output = await verifyReviewFixPacket({
+      runDir: ledger.runDir,
+      worktreePath: root,
+      packet: commandPacket,
+      actionAttempt: 1,
+      intake,
+      codex: { invoke: async () => ({ text: JSON.stringify(blocked), parsed: blocked, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics }) },
+      beforeDiff: "before",
+      afterDiff: "after",
+      verificationEvidence,
+      selfReviewReports: [],
+    });
+
+    expect(output.review).toMatchObject({
+      decision: "resolved",
+      required_next_fix: null,
+      blocker: null,
+      condition_results: [{ status: "satisfied", remaining_problem: null, evidence_refs: ["verification/result.json"] }],
+    });
   });
 
   it("rejects a satisfied condition when its linked command failed", async () => {

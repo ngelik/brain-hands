@@ -69,3 +69,8 @@ command ran successfully and the approved work-item contract omitted the report 
 artifacts or allowed files. That is an inadequate approved plan: return `replan_required`. Reserve
 `test_infrastructure_failure` for a required, contract-authorized verification dependency that is
 unavailable or malfunctioning independently of the implementation.
+If a required compiler, typechecker, linter, or test command starts normally and exits nonzero with
+repository diagnostics, treat that as an implementation or plan-scope failure, never test
+infrastructure. Return `request_changes` when the fix is within the approved writable contract, or
+`replan_required` with a concrete finding when repository configuration, dependencies, or files
+outside that contract must change.

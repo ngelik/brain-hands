@@ -229,6 +229,29 @@ describe("assertGithubExecutionViable", () => {
     });
   }
 
+  it("permits the bound worktree to stay dirty while resuming an active work item", async () => {
+    const fixture = await setup();
+    await updateManifestV2(fixture.runDir, { current_work_item_id: "feature", stage: "fixing" });
+    const calls: string[] = [];
+    await expect(assertGithubExecutionViable({
+      runDir: fixture.runDir,
+      worktreePath: fixture.worktreePath,
+      plan,
+      config: fixture.config,
+      github: githubAdapter([]),
+      dependencies: dependencies(calls, {
+        getGitSnapshot: async () => ({
+          branch: branchName,
+          status: " M package-lock.json\n",
+          gitDir: ".git/worktrees/run",
+          gitCommonDir: ".git",
+          isLinkedWorktree: true,
+        }),
+      }),
+    })).resolves.toBeDefined();
+    expect(calls).toContain("plan-readiness");
+  });
+
   it("fails closed when any downstream GitHub effect capability is absent", async () => {
     const fixture = await setup();
     const mutations: string[] = [];

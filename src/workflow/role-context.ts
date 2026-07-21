@@ -326,6 +326,18 @@ async function canonicalWorkItem(
   planRevision: number,
 ): Promise<CurrentPlanAuthority> {
   const workItem = executionSpecV2Schema.parse(supplied);
+  const authority = await canonicalWorkItemById(runDir, workItem.id, planRevision);
+  if (!equalJson(authority.workItem, workItem)) {
+    throw new Error("Hands work item does not match the current approved plan");
+  }
+  return authority;
+}
+
+async function canonicalWorkItemById(
+  runDir: string,
+  workItemId: string,
+  planRevision: number,
+): Promise<CurrentPlanAuthority> {
   const manifest = await readManifestV2(runDir);
   if (
     manifest.workflow_protocol !== "bounded-context-v1"
@@ -336,16 +348,14 @@ async function canonicalWorkItem(
   }
   const planText = await readVerifiedPlanRevision(runDir, manifest, planRevision);
   const workItems = structuredPlanItems(planText);
-  const matches = workItem.id === "integrated"
+  const matches = workItemId === "integrated"
     ? [executionSpecV2Schema.parse(integratedWorkItem(
         parsePersistedPlan(JSON.parse(planText)),
         { includeCompletedDependencies: true },
       ))]
-    : workItems.filter((candidate) => candidate.id === workItem.id);
-  if (matches.length !== 1 || !equalJson(matches[0], workItem)) {
-    throw new Error("Hands work item does not match the current approved plan");
-  }
-  return { manifest, workItem, workItems };
+    : workItems.filter((candidate) => candidate.id === workItemId);
+  if (matches.length !== 1) throw new Error("Hands work item is missing from the current approved plan");
+  return { manifest, workItem: matches[0]!, workItems };
 }
 
 function requiredJsonArray(value: unknown[], label: string): Array<z.infer<typeof z.json>> {
@@ -465,6 +475,143 @@ function assertRequiredContextFits<T>(value: T, schema: z.ZodType<T>, totalLimit
   throw new Error(`${label} required context exceeds ${totalLimit} UTF-8 bytes`);
 }
 
+function compactTextTail(value: string, maxBytes: number, label: string): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let tail = value.slice(-maxBytes);
+  while (Buffer.byteLength(tail, "utf8") > maxBytes) tail = tail.slice(1);
+  return [
+    `[Earlier ${label} summarized: ${Buffer.byteLength(value, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(value).digest("hex")}]`,
+    tail,
+  ].join("\n");
+}
+
+function compactTextEdges(value: string, maxBytes: number, label: string): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  void label;
+  return `[sha256=${createHash("sha256").update(value).digest("hex")}]`;
+}
+
+function compactJsonSummary(value: unknown, label: string): string {
+  const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+  void label;
+  return `[sha256=${createHash("sha256").update(bytes).digest("hex")}]`;
+}
+
+function compactStringArray(values: string[], label: string): string[] {
+  const summary = [compactJsonSummary(values, label)];
+  return Buffer.byteLength(JSON.stringify(values), "utf8") <= Buffer.byteLength(JSON.stringify(summary), "utf8")
+    ? values
+    : summary;
+}
+
+function compactChangeUnits(workItem: WorkItem): WorkItem["change_units"] {
+  const compacted = workItem.change_units.map((unit) => ({
+    ...unit,
+    target: compactTextEdges(unit.target, 128, "change-unit target"),
+    requirements: compactStringArray(unit.requirements, "change-unit requirements"),
+  }));
+  if (Buffer.byteLength(JSON.stringify(compacted), "utf8") <= 12 * 1024) return compacted;
+  const representative = workItem.change_units[0]!;
+  return [{
+    id: "compact-approved-change-units",
+    path: representative.path,
+    target: "Approved change units summarized for bounded execution context.",
+    operation: representative.operation,
+    requirements: [compactJsonSummary(workItem.change_units, "approved change units")],
+  }];
+}
+
+export function compactHandsWorkItem(workItem: WorkItem): WorkItem {
+  const changeUnits = compactChangeUnits(workItem);
+  const changeUnitIds = new Set(changeUnits.map((unit) => unit.id));
+  const compactedChangeUnitId = changeUnits.length === 1 && changeUnits[0]!.id === "compact-approved-change-units"
+    ? changeUnits[0]!.id
+    : null;
+  return executionSpecV2Schema.parse({
+    ...workItem,
+    objective: compactTextTail(workItem.objective, 2 * 1024, "approved objective history"),
+    file_contract: workItem.file_contract.map((entry) => ({
+      ...entry,
+      targets: compactStringArray(entry.targets, "file-contract targets"),
+    })),
+    forbidden_changes: workItem.forbidden_changes.map((entry) => ({
+      ...entry,
+      reason: compactTextEdges(entry.reason, 128, "forbidden-change reason"),
+    })),
+    change_units: changeUnits,
+    acceptance: workItem.acceptance.map((criterion) => ({
+      ...criterion,
+      statement: compactTextEdges(criterion.statement, 96, "acceptance statement"),
+      satisfied_by: compactedChangeUnitId === null
+        ? criterion.satisfied_by.filter((id) => changeUnitIds.has(id))
+        : [compactedChangeUnitId],
+    })),
+    tests: workItem.tests.map((test) => ({
+      ...test,
+      assertion: compactTextEdges(test.assertion, 160, "test assertion"),
+    })),
+    ...(workItem.cross_cutting_impacts === undefined ? {} : {
+      cross_cutting_impacts: workItem.cross_cutting_impacts.map((impact) => ({
+        ...impact,
+        callers: compactStringArray(impact.callers, "cross-cutting callers"),
+        representative_fixtures: compactStringArray(impact.representative_fixtures, "cross-cutting fixtures"),
+      })),
+    }),
+    risks: [{
+      description: compactJsonSummary(workItem.risks, "approved risks"),
+      mitigation: "Inspect the authoritative approved plan and current fix packet before mutation.",
+    }],
+    ambiguity_policy: {
+      ...workItem.ambiguity_policy,
+      stop_when: compactStringArray(workItem.ambiguity_policy.stop_when, "ambiguity stop conditions"),
+    },
+  });
+}
+
+function compactActiveFinding(finding: JsonValue): JsonValue {
+  if (finding === null || Array.isArray(finding) || typeof finding !== "object") return finding;
+  const record = finding as Record<string, JsonValue>;
+  const remediation = record.remediation;
+  if (remediation === undefined) return finding;
+  const bytes = Buffer.from(`${JSON.stringify(remediation)}\n`, "utf8");
+  const compactedRecord = {
+    ...record,
+    ...(typeof record.problem === "string" ? { problem: compactTextEdges(record.problem, 192, "finding problem") } : {}),
+    ...(typeof record.required_fix === "string" ? { required_fix: compactTextEdges(record.required_fix, 192, "finding required fix") } : {}),
+  };
+  if (bytes.byteLength <= 1024) return compactedRecord;
+  return {
+    ...compactedRecord,
+    remediation: {
+      summary: "Structured remediation omitted from bounded active-finding context; the current fix packet remains authoritative.",
+      bytes: bytes.byteLength,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    },
+  };
+}
+
+function compactActiveFindings(findings: JsonValue[]): JsonValue[] {
+  return findings.map(compactActiveFinding);
+}
+
+function matchesFullOrCompactedWorkItem(candidate: unknown, authority: WorkItem): boolean {
+  return equalJson(candidate, authority) || equalJson(candidate, compactHandsWorkItem(authority));
+}
+
+function matchesFullOrCompactedFindings(candidate: unknown, authority: JsonValue[]): boolean {
+  return equalJson(candidate, authority) || equalJson(candidate, compactActiveFindings(authority));
+}
+
+function compactRoleDiff(diff: string): string {
+  return [
+    "# Source diff summarized to preserve bounded role context.",
+    `Git patch bytes: ${Buffer.byteLength(diff, "utf8")}`,
+    `Git patch sha256: ${createHash("sha256").update(diff).digest("hex")}`,
+    "Inspect the authoritative worktree for the complete changed files.",
+    "",
+  ].join("\n");
+}
+
 function packOptional<T>(
   required: T,
   schema: z.ZodType<T>,
@@ -472,9 +619,11 @@ function packOptional<T>(
   totalLimit: number,
   evidenceLimit?: { target: string; bytes: number },
 ): T {
+  let boundedRequired = required;
+  let diffCompacted = false;
   const selected = new Set(candidates.map((_, index) => index));
   const render = (): T => {
-    const value = { ...(required as Record<string, unknown>) };
+    const value = { ...(boundedRequired as Record<string, unknown>) };
     const targets = new Set(candidates.map((candidate) => candidate.target));
     for (const target of targets) {
       value[target] = candidates
@@ -517,6 +666,16 @@ function packOptional<T>(
       selected.add(index);
     }
     if (!removed) {
+      const currentDiff = (boundedRequired as Record<string, unknown>).diff;
+      if (!diffCompacted && typeof currentDiff === "string" && currentDiff.length > 0) {
+        boundedRequired = {
+          ...(boundedRequired as Record<string, unknown>),
+          diff: compactRoleDiff(currentDiff),
+        } as T;
+        diffCompacted = true;
+        packed = render();
+        continue;
+      }
       throw new Error(`Role context and required omission references exceed ${totalLimit} UTF-8 bytes`);
     }
   }
@@ -561,7 +720,7 @@ async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<A
     throw new Error("Hands work-item ID does not match its context identity");
   }
   const activeFindings = await activeFindingsFor(input.runDir, authority.manifest, [workItem.id]);
-  const required = handsContextV1Schema.parse({
+  let required = handsContextV1Schema.parse({
     schema_version: 1,
     role: "hands",
     work_item: workItem,
@@ -571,9 +730,27 @@ async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<A
     bounded_evidence: [],
     omitted_evidence: [],
   });
+  if (canonicalJsonBytes(handsContextV1Schema, required).byteLength > CONTEXT_LIMITS_V1.hands_total_bytes) {
+    required = handsContextV1Schema.parse({
+      ...required,
+      work_item: compactHandsWorkItem(workItem),
+      active_findings: compactActiveFindings(activeFindings),
+    });
+  }
+  if (canonicalJsonBytes(handsContextV1Schema, required).byteLength > CONTEXT_LIMITS_V1.hands_total_bytes) {
+    required = handsContextV1Schema.parse({
+      ...required,
+      diff: compactRoleDiff(required.diff),
+    });
+  }
   assertRequiredContextFits(required, handsContextV1Schema, CONTEXT_LIMITS_V1.hands_total_bytes, "Hands");
   const dependencyCandidates = await currentDependencyCandidates(input.runDir, authority);
-  const verification = await currentWorkItemVerificationAuthority(input.runDir, authority.manifest, workItem.id);
+  const verification = await currentWorkItemVerificationAuthority(
+    input.runDir,
+    authority.manifest,
+    workItem.id,
+    workItem.id === "integrated" && input.attempt > 1 ? input.attempt - 1 : undefined,
+  );
   const evidenceCandidates = (await verificationContextCandidates(
     input.runDir,
     verification?.ref ?? null,
@@ -791,7 +968,7 @@ export async function validateHandsInvocationContext(
   const suppliedContext = handsContextV1Schema.parse(input.context);
   const coordinates = handsContextReferenceCoordinates(reference, input);
   const workItem = executionSpecV2Schema.parse(input.workItem);
-  if (!equalJson(suppliedContext.work_item, workItem)) {
+  if (!matchesFullOrCompactedWorkItem(suppliedContext.work_item, workItem)) {
     throw new Error("Bounded Hands context work item does not match the invocation");
   }
   const loadedContext = await loadRoleContext(input.runDir, reference, "hands");
@@ -867,6 +1044,7 @@ async function validateHandsAuthority(
   runDir: string,
   context: HandsContextV1,
   authority: CurrentPlanAuthority,
+  attempt: number,
 ): Promise<void> {
   const summaryOmissions = context.omitted_evidence
     .filter(({ ref }) => ref.path.startsWith("summaries/work-items/"))
@@ -882,7 +1060,12 @@ async function validateHandsAuthority(
     summaryOmissions,
     "Hands dependency summaries",
   );
-  const verification = await currentWorkItemVerificationAuthority(runDir, authority.manifest, authority.workItem.id);
+  const verification = await currentWorkItemVerificationAuthority(
+    runDir,
+    authority.manifest,
+    authority.workItem.id,
+    authority.workItem.id === "integrated" && attempt > 1 ? attempt - 1 : undefined,
+  );
   const expectedEvidence = (await verificationContextCandidates(
     runDir,
     verification?.ref ?? null,
@@ -907,7 +1090,7 @@ async function validateHandsAuthority(
     "Hands omitted evidence",
   );
   const activeFindings = await activeFindingsFor(runDir, authority.manifest, [authority.workItem.id]);
-  if (!equalJson(context.active_findings, activeFindings)) {
+  if (!matchesFullOrCompactedFindings(context.active_findings, activeFindings)) {
     throw new Error("Hands active findings are not current finding authority");
   }
 }
@@ -1015,12 +1198,12 @@ async function loadRoleContextLocked(
     const coordinates = handsContextReferenceCoordinates(reference);
     const context = await readReferencedJson(runDir, reference, handsContextV1Schema);
     assertNoForbiddenKeys(context, "hands");
-    const authority = await canonicalWorkItem(
-      runDir,
-      executionSpecV2Schema.parse(context.work_item),
-      coordinates.planRevision,
-    );
+    const contextWorkItem = executionSpecV2Schema.parse(context.work_item);
+    const authority = await canonicalWorkItemById(runDir, contextWorkItem.id, coordinates.planRevision);
     const { workItem } = authority;
+    if (!matchesFullOrCompactedWorkItem(contextWorkItem, workItem)) {
+      throw new Error("Hands work item does not match the current approved plan");
+    }
     if (workItem.id !== coordinates.workItemId) {
       throw new Error("Hands role-context path does not match its work item");
     }
@@ -1033,7 +1216,7 @@ async function loadRoleContextLocked(
     if (canonicalJsonBytes(handsContextV1Schema, context).byteLength > CONTEXT_LIMITS_V1.hands_total_bytes) {
       throw new Error(`Hands context exceeds ${CONTEXT_LIMITS_V1.hands_total_bytes} UTF-8 bytes`);
     }
-    await validateHandsAuthority(runDir, context, authority);
+    await validateHandsAuthority(runDir, context, authority, coordinates.attempt);
     return context;
   }
   if (expectedRole === "verifier") {

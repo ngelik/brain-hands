@@ -43,6 +43,7 @@ import {
   executionSpecV2Schema,
   generatedReplanPatchSchema,
   planApprovalRequestSchema,
+  verificationEvidenceSchema,
 } from "../core/schema.js";
 import type {
   ReleaseGuard,
@@ -257,6 +258,8 @@ async function assertReplanEvidenceAvailable(
   runDir: string,
   repoRoot: string,
   path: string,
+  verifiedMissingRepositoryPaths: ReadonlySet<string> = new Set(),
+  verifiedMissingLocalVerificationPaths: ReadonlySet<string> = new Set(),
 ): Promise<void> {
   if (runOwnedEvidenceFiles.has(path)) {
     await readOwnedRunFile(runDir, path);
@@ -264,14 +267,17 @@ async function assertReplanEvidenceAvailable(
   }
   const root = path.split("/", 1)[0]!;
   if (runOwnedEvidenceRoots.has(root)) {
+    if (verifiedMissingLocalVerificationPaths.has(path)) return;
     await readOwnedEvidenceFile(runDir, path, `${root}/`);
     return;
   }
-  const repositoryPath = path.replace(/:[1-9]\d*(?::[1-9]\d*)?$/, "");
+  const repositoryPath = path.replace(/:[1-9]\d*(?:(?::|-)[1-9]\d*)?$/, "");
   const target = await realpath(join(repoRoot, repositoryPath)).catch((error: unknown) => {
+    if (errorCode(error) === "ENOENT" && verifiedMissingRepositoryPaths.has(repositoryPath)) return null;
     if (errorCode(error) === "ENOENT") throw new Error(`Repository evidence artifact is missing: ${path}`);
     throw error;
   });
+  if (target === null) return;
   const relation = relative(repoRoot, target);
   if (relation === "" || relation.startsWith("..") || isAbsolute(relation)) {
     throw new Error(`Repository evidence artifact escaped the authorized checkout: ${path}`);
@@ -279,6 +285,56 @@ async function assertReplanEvidenceAvailable(
   if (!(await stat(target)).isFile()) {
     throw new Error(`Repository evidence artifact is not a regular file: ${path}`);
   }
+}
+
+async function verifiedMissingLocalVerificationEvidence(
+  runDir: string,
+  evidencePaths: readonly string[],
+): Promise<Set<string>> {
+  const canonicalEvidence = await Promise.all(evidencePaths
+    .filter((path) => path.startsWith("verification/local/") && path.endsWith("/evidence.json"))
+    .map((path) => readOptionalValidatedArtifact(runDir, path, verificationEvidenceSchema)));
+  if (!canonicalEvidence.some((evidence) => evidence !== null)) return new Set();
+  const missing = new Set<string>();
+  for (const path of evidencePaths.filter((candidate) => candidate.startsWith("verification/local/"))) {
+    try {
+      await readOwnedEvidenceFile(runDir, path, "verification/");
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+      missing.add(path);
+    }
+  }
+  return missing;
+}
+
+async function verifiedMissingRepositoryEvidence(
+  runDir: string,
+  evidencePaths: readonly string[],
+): Promise<Set<string>> {
+  const missing = new Set<string>();
+  for (const path of evidencePaths) {
+    if (!path.startsWith("verification/") || !path.endsWith("/evidence.json")) continue;
+    const evidence = await readOptionalValidatedArtifact(runDir, path, verificationEvidenceSchema);
+    if (evidence === null) continue;
+    for (const artifact of evidence.artifact_checks) {
+      if (!artifact.exists && !artifact.path.startsWith("verification/")) missing.add(artifact.path);
+    }
+  }
+  return missing;
+}
+
+async function mutableGeneratedPlanArtifacts(
+  runDir: string,
+  manifest: RunManifestV2,
+): Promise<Set<string>> {
+  const revision = manifest.approved_plan_revision ?? manifest.approved_revision;
+  if (revision === null) return new Set();
+  const { plan } = await loadVerifiedPlanBundle(runDir, manifest, revision);
+  const writablePaths = new Set(plan.work_items.flatMap((item) => item.file_contract)
+    .filter((entry) => entry.permission !== "read_only")
+    .map((entry) => entry.path));
+  return new Set(plan.work_items.flatMap((item) => item.expected_artifacts)
+    .filter((path) => writablePaths.has(path)));
 }
 
 export function replanPatchPath(
@@ -347,8 +403,11 @@ async function verifyCanonicalReplanProvenance(input: {
   }
   assertEqual("canonical evidence paths", record.provenance.evidence_paths, convergence.evidence_refs);
   const repositoryRoot = await realpath(manifest.worktree_path ?? manifest.repo_root);
+  const verifiedMissing = await verifiedMissingRepositoryEvidence(runDir, convergence.evidence_refs);
+  for (const path of await mutableGeneratedPlanArtifacts(runDir, manifest)) verifiedMissing.add(path);
+  const verifiedMissingLocal = await verifiedMissingLocalVerificationEvidence(runDir, convergence.evidence_refs);
   for (const path of convergence.evidence_refs) {
-    await assertReplanEvidenceAvailable(runDir, repositoryRoot, path);
+    await assertReplanEvidenceAvailable(runDir, repositoryRoot, path, verifiedMissing, verifiedMissingLocal);
   }
 }
 
@@ -460,6 +519,7 @@ function buildReplanCandidate(
   target: WorkItem,
   patch: ReplanPatch,
   criteria: readonly { ref: string; text: string }[],
+  materializationVersion: 1 | 2,
 ): WorkItem {
   const criterionChanges = new Map(patch.added_or_changed_criteria.map(({ ref, text }) => [ref, text]));
   const criterionTextByIndex = criteria.map((criterion) => criterionChanges.get(criterion.ref) ?? criterion.text);
@@ -467,10 +527,18 @@ function buildReplanCandidate(
   const addedReadOnlyPaths = patch.added_read_only_file_contracts.map((contract) => contract.path);
   const authorizedPaths = [...new Set([...addedPaths, ...addedReadOnlyPaths])];
   const fileContract = target.file_contract.map((contract) => {
-    const addedTargets = patch.added_change_units
-      .filter((unit) => unit.path === contract.path)
+    const matchingUnits = patch.added_change_units.filter((unit) => unit.path === contract.path);
+    const addedTargets = matchingUnits
       .map((unit) => unit.target);
-    return addedTargets.length > 0 ? { ...contract, targets: [...contract.targets, ...addedTargets] } : contract;
+    const promotesReadOnly = materializationVersion === 2
+      && contract.permission === "read_only"
+      && matchingUnits.length > 0
+      && matchingUnits.every((unit) => unit.operation === "modify");
+    return addedTargets.length > 0 ? {
+      ...contract,
+      permission: promotesReadOnly ? "modify" as const : contract.permission,
+      targets: promotesReadOnly ? addedTargets : [...contract.targets, ...addedTargets],
+    } : contract;
   });
   for (const path of addedPaths) {
     if (fileContract.some((contract) => contract.path === path)) continue;
@@ -487,7 +555,9 @@ function buildReplanCandidate(
   })));
   return {
     ...target,
-    objective: patch.revised_objective ?? target.objective,
+    objective: materializationVersion === 2
+      ? [patch.revised_objective ?? target.objective, ...patch.changed_instructions].join("\n")
+      : patch.revised_objective ?? target.objective,
     file_contract: fileContract,
     forbidden_changes: target.forbidden_changes.map((forbidden) => forbidden.path === "*"
       ? { ...forbidden, except: [...forbidden.except, ...authorizedPaths.filter((path) => !forbidden.except.includes(path))] }
@@ -507,15 +577,20 @@ function buildReplanCandidate(
         satisfied_by: [...criterion.satisfied_by, ...addedEvidence],
       };
     }),
-    change_units: [...(patch.changed_instructions.length > 0
-      ? target.change_units.map((unit, index) => index === 0
-        ? { ...unit, requirements: patch.changed_instructions }
-        : unit)
-      : target.change_units), ...patch.added_change_units.map(({ satisfies: _satisfies, ...unit }) => unit)],
-    cross_cutting_impacts: [
-      ...(target.cross_cutting_impacts ?? []),
-      ...patch.added_cross_cutting_impacts,
+    change_units: [
+      ...(materializationVersion === 2 || patch.changed_instructions.length === 0
+        ? target.change_units
+        : target.change_units.map((unit, index) => index === 0
+          ? { ...unit, requirements: patch.changed_instructions }
+          : unit)),
+      ...patch.added_change_units.map(({ satisfies: _satisfies, ...unit }) => unit),
     ],
+    cross_cutting_impacts: materializationVersion === 2
+      ? mergeCrossCuttingImpacts(target.cross_cutting_impacts ?? [], patch.added_cross_cutting_impacts)
+      : [
+          ...(target.cross_cutting_impacts ?? []),
+          ...patch.added_cross_cutting_impacts,
+        ],
     verification_commands: [
       ...target.verification_commands,
       ...patch.added_verification_commands.map(({ satisfies: _satisfies, ...command }) => command),
@@ -530,10 +605,28 @@ function buildReplanCandidate(
   };
 }
 
+function mergeCrossCuttingImpacts(
+  existing: WorkItem["cross_cutting_impacts"],
+  added: ReplanPatch["added_cross_cutting_impacts"],
+): NonNullable<WorkItem["cross_cutting_impacts"]> {
+  const replacements = new Map(added.map((impact) => [
+    `${impact.change_unit_id}\0${impact.category}`,
+    impact,
+  ]));
+  const merged = (existing ?? []).map((impact) => {
+    const key = `${impact.change_unit_id}\0${impact.category}`;
+    const replacement = replacements.get(key);
+    if (replacement) replacements.delete(key);
+    return replacement ?? impact;
+  });
+  return [...merged, ...replacements.values()];
+}
+
 function validatePatch(
   patch: ReplanPatch,
   input: CreateReplanPatchInput,
   criteria: readonly { ref: string; text: string }[],
+  materializationVersion: 1 | 2,
 ): void {
   const criterionRefs = criteria.map((criterion) => criterion.ref);
   if (patch.target_work_item_id !== input.target_work_item.id) {
@@ -573,7 +666,10 @@ function validatePatch(
       }
     }
     const contract = contracts.get(unit.path);
-    if (contract && contract.permission !== unit.operation) {
+    const promotesReadOnly = materializationVersion === 2
+      && contract?.permission === "read_only"
+      && unit.operation === "modify";
+    if (contract && contract.permission !== unit.operation && !promotesReadOnly) {
       throw new Error(`Replan patch change unit ${unit.id} conflicts with ${unit.path} permission`);
     }
     const existingOperation = addedPaths.get(unit.path);
@@ -630,7 +726,7 @@ function validatePatch(
     ...patch.explicitly_rejected_hardening,
   ];
   for (const value of outputText) assertNoSecretMaterial("Brain replan output", value);
-  assertSparkReady(buildReplanCandidate(input.target_work_item, patch, criteria));
+  assertSparkReady(buildReplanCandidate(input.target_work_item, patch, criteria, materializationVersion));
 }
 
 function findingContext(findings: Awaited<ReturnType<typeof loadFindingRevisionRecords>>): ReplanFindingContext[] {
@@ -647,16 +743,53 @@ function findingContext(findings: Awaited<ReturnType<typeof loadFindingRevisionR
   }));
 }
 
-function canonicalizeGeneratedPatch(patch: ReplanPatch): ReplanPatch {
+function canonicalizeGeneratedPatch(
+  patch: ReplanPatch,
+  target: WorkItem,
+  criteria: readonly { ref: string; text: string }[],
+): ReplanPatch {
+  const localAcceptanceIdByRef = new Map(criteria.flatMap((criterion, index) => {
+    const localId = target.acceptance[index]?.id;
+    return localId === undefined ? [] : [[criterion.ref, localId] as const];
+  }));
+  const localizeSatisfies = (refs: readonly string[]) => [...new Set(
+    refs.map((ref) => localAcceptanceIdByRef.get(ref) ?? ref),
+  )];
+  const existingCommandArgv = new Set(target.verification_commands.map((command) => canonical(command.argv)));
+  const redundantControllerEnvCommandIds = new Set(patch.added_verification_commands.flatMap((command) => {
+    const controllerReportAssignment = command.argv[0] === "env"
+      && command.argv[1]?.startsWith("BRAIN_HANDS_BROWSER_EVIDENCE_REPORT=");
+    return controllerReportAssignment && existingCommandArgv.has(canonical(command.argv.slice(2)))
+      ? [command.id]
+      : [];
+  }));
+  const addedVerificationCommands = patch.added_verification_commands.filter(
+    (command) => !redundantControllerEnvCommandIds.has(command.id),
+  );
   const crossCuttingCommandIds = new Set(
-    patch.added_cross_cutting_impacts.flatMap((impact) => impact.verification_command_ids),
+    patch.added_cross_cutting_impacts.flatMap((impact) => impact.verification_command_ids)
+      .filter((commandId) => !redundantControllerEnvCommandIds.has(commandId)),
   );
   return {
     ...patch,
-    added_verification_commands: patch.added_verification_commands.map((command) =>
-      crossCuttingCommandIds.has(command.id) && command.tier !== "cross_cutting"
-        ? { ...command, tier: "cross_cutting" as const }
-        : command),
+    added_change_units: patch.added_change_units.map((unit) => ({
+      ...unit,
+      satisfies: localizeSatisfies(unit.satisfies),
+    })),
+    added_verification_commands: addedVerificationCommands.map((command) =>
+      ({
+        ...command,
+        ...(crossCuttingCommandIds.has(command.id) && command.tier !== "cross_cutting"
+          ? { tier: "cross_cutting" as const }
+          : {}),
+        satisfies: localizeSatisfies(command.satisfies),
+      })),
+    added_cross_cutting_impacts: patch.added_cross_cutting_impacts.map((impact) => ({
+      ...impact,
+      verification_command_ids: impact.verification_command_ids.filter(
+        (commandId) => !redundantControllerEnvCommandIds.has(commandId),
+      ),
+    })),
   };
 }
 
@@ -711,8 +844,11 @@ export async function createReplanPatch(
   assertEqual("finding set", input.unresolved_finding_ids, convergence.unresolved_finding_ids);
   assertEqual("evidence paths", input.evidence_paths, convergence.evidence_refs);
   assertEqual("release guards", input.release_guards, manifest.release_guards ?? []);
+  const verifiedMissing = await verifiedMissingRepositoryEvidence(input.run_dir, input.evidence_paths);
+  for (const path of await mutableGeneratedPlanArtifacts(input.run_dir, manifest)) verifiedMissing.add(path);
+  const verifiedMissingLocal = await verifiedMissingLocalVerificationEvidence(input.run_dir, input.evidence_paths);
   for (const path of input.evidence_paths) {
-    await assertReplanEvidenceAvailable(input.run_dir, brainRoot, path);
+    await assertReplanEvidenceAvailable(input.run_dir, brainRoot, path, verifiedMissing, verifiedMissingLocal);
   }
 
   const criterionRefs = criteria.map((criterion) => criterion.ref);
@@ -800,14 +936,14 @@ export async function createReplanPatch(
     if (canonical(existing.provenance) !== canonical(provenance)) {
       throw new Error(`Replan patch already exists with different content or provenance: ${relativePath}`);
     }
-    validatePatch(existing.patch, input, criteria);
+    validatePatch(existing.patch, input, criteria, existing.materialization_version ?? 1);
     return { patch: existing.patch, path: join(input.run_dir, relativePath), model_profile: input.model_profile };
   }
   const artifactName = relativePath.slice(0, -".json".length).replaceAll("/", "-");
   const persistGeneratedPatch = async (rawPatch: unknown): Promise<ReplanPatchResult> => {
-    const patch = canonicalizeGeneratedPatch(generatedReplanPatchSchema.parse(rawPatch));
-    validatePatch(patch, input, criteria);
-    const record: ReplanPatchRecord = replanPatchRecordSchema.parse({ patch, provenance });
+    const patch = canonicalizeGeneratedPatch(generatedReplanPatchSchema.parse(rawPatch), target, criteria);
+    validatePatch(patch, input, criteria, 2);
+    const record: ReplanPatchRecord = replanPatchRecordSchema.parse({ materialization_version: 2, patch, provenance });
     const raced = await readOptionalValidatedArtifact(input.run_dir, relativePath, replanPatchRecordSchema);
     if (raced) {
       if (canonical(raced) !== canonical(record)) {
@@ -1767,6 +1903,7 @@ export async function prepareReplanApprovalBoundary(
       patch: record.patch,
       durableCriteria,
       workflowProtocol: manifest.workflow_protocol,
+      materializationVersion: record.materialization_version ?? 1,
     });
     proposed = parseExecutionPlan(proposed, { mode: manifest.mode, repoRoot: manifest.repo_root }, manifest.workflow_protocol);
     if (manifest.workflow_protocol === "durable-discovery-v1") {
@@ -2172,6 +2309,7 @@ export async function approvePreparedReplanRevision(
       patch: record.patch,
       durableCriteria,
       workflowProtocol: manifest.workflow_protocol,
+      materializationVersion: record.materialization_version ?? 1,
     });
     const reconstructedSha256 = createHash("sha256")
       .update(serializePersistedPlan(reconstructed, manifest.workflow_protocol), "utf8")

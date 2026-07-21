@@ -1179,6 +1179,16 @@ describe("runLocalWorkflow", () => {
     const boundedPlan = { ...plan, work_items: [workItem] };
     const config = qualityConfig(0);
     const setupResult = await setupBounded(boundedPlan, false, config.retry_policy.quality_gate); root = setupResult.root;
+    await updateManifestV2(setupResult.runDir, {
+      work_item_progress: {
+        ...(await readManifestV2(setupResult.runDir)).work_item_progress,
+        first: {
+          status: "pending",
+          attempts: 0,
+          fix_packet_supplement_path: "reviews/fix-packets/stale/attempts/2/attempt-supplement.json",
+        },
+      },
+    });
     const harness = boundedDependencies();
     const baseVerifier = harness.dependencies.verifier!;
     let itemReviews = 0;
@@ -2286,19 +2296,24 @@ describe("runLocalWorkflow", () => {
     expect(progress?.implementation_path).toBeUndefined();
   });
 
-  it("blocks before verification when the worktree contains an unapproved file", async () => {
+  it("routes an out-of-scope worktree change through Verifier so it can require replanning", async () => {
     const setupResult = await setup(); root = setupResult.root;
     let verifierCalls = 0;
+    let verificationCalls = 0;
     const deps = {
       hands: async (input: { workItem: WorkItem }) => ({
-        implementation: implementation(input.workItem.id),
+        implementation: { ...implementation(input.workItem.id), changed_files: ["src/first.ts", "src/unapproved.ts"] },
         reportPath: "implementation/first.json",
         invocation: {} as never,
       }),
-      verification: async (input: RunVerificationInput) => evidenceForInput(input),
-      verifier: async () => {
+      verification: async (input: RunVerificationInput) => {
+        verificationCalls += 1;
+        return evidenceForInput(input);
+      },
+      verifier: async (input: VerifyWorkItemInput) => {
         verifierCalls += 1;
-        throw new Error("Verifier must not run for an out-of-scope worktree");
+        const value = review("replan_required", input.workItem.id, input.attempt, input.final);
+        return { review: value, reviewPath: await persistReview(input.runDir, "reviews/first/attempt-1.json", value), invocation: {} as never };
       },
       changedFiles: async () => ["src/unapproved.ts"],
       gitSnapshot: cleanSnapshot,
@@ -2314,8 +2329,77 @@ describe("runLocalWorkflow", () => {
     });
 
     expect(result.status).toBe("human_action_required");
+    expect(result.blocker).toContain("Verifier requires replanning");
+    expect(verificationCalls).toBeGreaterThan(0);
+    expect(verifierCalls).toBe(1);
+    expect((await readManifestV2(setupResult.runDir)).stage).toBe("replanning");
+  });
+
+  it("fails closed when Verifier approves an out-of-scope worktree change", async () => {
+    const setupResult = await setup(); root = setupResult.root;
+    let commitCalls = 0;
+    const deps = {
+      hands: async (input: { workItem: WorkItem }) => ({
+        implementation: { ...implementation(input.workItem.id), changed_files: ["src/first.ts", "src/unapproved.ts"] },
+        reportPath: "implementation/first.json",
+        invocation: {} as never,
+      }),
+      verification: async (input: RunVerificationInput) => evidenceForInput(input),
+      verifier: async (input: VerifyWorkItemInput) => {
+        const value = review("approve", input.workItem.id, input.attempt, input.final);
+        return { review: value, reviewPath: await persistReview(input.runDir, "reviews/first/attempt-1.json", value), invocation: {} as never };
+      },
+      commit: async () => { commitCalls += 1; return "sha"; },
+      changedFiles: async () => ["src/unapproved.ts"],
+      gitSnapshot: cleanSnapshot,
+    } as unknown as LocalRuntimeDependencies;
+
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: setupResult.worktree,
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: { ...plan, work_items: [item("first")] },
+      codex: {} as never,
+      dependencies: deps,
+    });
+
+    expect(result.status).toBe("human_action_required");
     expect(result.blocker).toContain("Worktree contains out-of-scope files: src/unapproved.ts");
-    expect(verifierCalls).toBe(0);
+    expect((await readManifestV2(setupResult.runDir)).work_item_progress.first?.blocker_code).toBe("replan_required");
+    expect(commitCalls).toBe(0);
+  });
+
+  it("restores tracked out-of-scope files inherited from a rejected attempt", async () => {
+    const setupResult = await setup(); root = setupResult.root;
+    let dirty = ["src/first.ts", "src/stale.ts"];
+    const restored: string[] = [];
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: setupResult.worktree,
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: { ...plan, work_items: [item("first")] },
+      codex: {} as never,
+      dependencies: {
+        hands: async () => ({ implementation: implementation("first"), reportPath: "implementation/first.json", invocation: {} as never }),
+        changedFiles: async () => dirty,
+        restoreTrackedFiles: async (_repoRoot, paths) => {
+          restored.push(...paths);
+          dirty = dirty.filter((path) => !paths.includes(path));
+          return [...paths];
+        },
+        verification: async (input) => evidenceForInput(input),
+        verifier: async (input) => {
+          const value = review("approve", input.workItem.id, input.attempt, input.final);
+          const path = input.final ? "reviews/integrated/final-attempt-1.json" : "reviews/first/attempt-1.json";
+          return { review: value, reviewPath: await persistReview(input.runDir, path, value), invocation: {} as never };
+        },
+        commit: async () => "sha",
+        gitSnapshot: cleanSnapshot,
+      },
+    });
+
+    expect(result.status, result.blocker).toBe("local_ready");
+    expect(restored).toEqual(["src/stale.ts"]);
   });
 
   it("passes only argv arrays from canonical verification command objects", async () => {
@@ -3010,11 +3094,18 @@ describe("runLocalWorkflow", () => {
     const pinnedWorktree = await materializePinnedWorktreeFixture(setupResult.runDir, setupResult.worktree);
     let finalReviews = 0;
     let handsCalls = 0;
-    let interruptAfterEffect = true;
+    let interruptFinalHands = true;
+    let interruptFinalVerifier = true;
     const dependencies: LocalRuntimeDependencies = {
       hands: async (input) => {
         handsCalls += 1;
-        const value = implementation(input.workItem.id);
+        if (input.workItem.id === "integrated" && interruptFinalHands) {
+          interruptFinalHands = false;
+          throw new Error("interrupt final Hands before report");
+        }
+        const value = input.workItem.id === "integrated"
+          ? { ...implementation("integrated"), changed_files: ["src/first.ts"] }
+          : implementation(input.workItem.id);
         const reportPath = `implementation/${input.workItem.id}/attempt-${input.attempt}.json`;
         await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(value)}\n`);
         return { implementation: value, reportPath, invocation: {} as never };
@@ -3026,6 +3117,10 @@ describe("runLocalWorkflow", () => {
       },
       verifier: async (input) => {
         const requested = input.final && finalReviews++ === 0;
+        if (input.final && input.attempt === 2 && interruptFinalVerifier) {
+          interruptFinalVerifier = false;
+          throw new Error("interrupt final Verifier after persisted quality gate");
+        }
         const value = {
           ...review(requested ? "request_changes" : "approve", input.workItem.id, input.attempt, input.final),
           failure_class: requested ? "implementation_failure" as const : "none" as const,
@@ -3046,12 +3141,6 @@ describe("runLocalWorkflow", () => {
       },
       hasWorktreeChanges: async () => false,
       gitSnapshot: cleanSnapshot,
-      afterCheckpoint: async (checkpoint) => {
-        if (interruptAfterEffect && checkpoint === "after_final_integrated_effect_complete") {
-          interruptAfterEffect = false;
-          throw new Error("interrupt after final phase effect completion");
-        }
-      },
     };
     const workflowInput = {
       runDir: setupResult.runDir,
@@ -3063,10 +3152,21 @@ describe("runLocalWorkflow", () => {
       dependencies,
     } as RunLocalWorkflowInput;
     expect((await runLocalWorkflow(workflowInput)).status).toBe("human_action_required");
+    const interruptedManifest = await readManifestV2(setupResult.runDir);
+    await updateManifestV2(setupResult.runDir, {
+      work_item_progress: {
+        ...interruptedManifest.work_item_progress,
+        integrated: {
+          ...interruptedManifest.work_item_progress.integrated!,
+          blocker: "Recovery diagnostic stop after repeated hands-invocation",
+        },
+      },
+    });
+    expect((await runLocalWorkflow(workflowInput)).status).toBe("human_action_required");
     const result = await runLocalWorkflow(workflowInput);
-    expect(result.status).toBe("human_action_required");
-    expect(result.blocker).toContain("ambiguous persisted in-progress claim");
-    expect(handsCalls).toBe(2);
+    expect(result.blocker).toBeUndefined();
+    expect(result.status).toBe("local_ready");
+    expect(handsCalls).toBe(3);
   });
 
   it("projects a multi-item final-integrated replan onto its highest-priority Verifier target", async () => {
@@ -3466,6 +3566,53 @@ describe("runLocalWorkflow", () => {
     expect(result.status).toBe("human_action_required"); expect(verifierCalls).toBe(0); expect((await readManifestV2(setupResult.runDir)).stage).toBe("verifying");
   });
 
+  it("routes failed verification through Verifier when review policy is enabled", async () => {
+    const workflowPlan = { ...plan, work_items: [item("first")] };
+    const setupResult = await setupBounded(workflowPlan, true); root = setupResult.root; let verifierCalls = 0;
+    const policyManifest = await readManifestV2(setupResult.runDir);
+    await writeFile(join(setupResult.runDir, "manifest.json"), `${JSON.stringify({
+      ...policyManifest,
+      review_accounting: {
+        ...policyManifest.review_accounting!,
+        fix_cycles_used: policyManifest.review_policy_snapshot!.max_fix_cycles,
+      },
+      updated_at: new Date().toISOString(),
+    }, null, 2)}\n`);
+    const dependencies: LocalRuntimeDependencies = {
+      hands: async (input) => {
+        const value = implementation(input.workItem.id);
+        const reportPath = "implementation/item.json";
+        await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(value)}\n`);
+        return { implementation: value, reportPath, invocation: {} as never };
+      },
+      verification: async (input) => {
+        const evidenceValue = evidenceForInput(input);
+        const failed = {
+          ...evidenceValue,
+          commands: evidenceValue.commands.map((command) => ({ ...command, exit_code: 1 })),
+        };
+        await persistEvidenceBundle(input.runDir, failed);
+        return failed;
+      },
+      verifier: async () => { verifierCalls += 1; throw new Error("stop after verifier classification proof"); },
+      gitSnapshot: cleanSnapshot,
+    };
+
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: setupResult.worktree,
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: workflowPlan,
+      codex: {} as never,
+      dependencies,
+    });
+
+    expect(result.status).toBe("human_action_required");
+    expect(result.blocker).toContain("stop after verifier classification proof");
+    expect(verifierCalls).toBe(1);
+    expect((await readManifestV2(setupResult.runDir)).stage).toBe("verifier_review");
+  });
+
   it("resumes a blocked verification in the next immutable attempt namespace", async () => {
     const setupResult = await setup(); root = setupResult.root;
     const verificationAttempts: number[] = [];
@@ -3560,6 +3707,7 @@ describe("runLocalWorkflow", () => {
     const browserPlan: BrainPlan = { ...plan, work_items: [{ ...item("first"), browser_checks: [browserCheck], expected_artifacts: ["reports/browser.json"] }] };
     const result = await runLocalWorkflow({ runDir: setupResult.runDir, worktreePath: setupResult.worktree, intake: { ...intake, repo_root: setupResult.root }, plan: browserPlan, codex: {} as never, dependencies: deps });
     expect(result.status).toBe("local_ready");
+    expect(verificationInputs.at(-1)?.identity).toEqual({ scope: "integrated", work_item_id: "integrated" });
     expect(verificationInputs.at(-1)?.browserChecks).toEqual([browserCheck]);
     expect(verificationInputs.at(-1)?.expectedArtifacts).toContain("reports/browser.json");
     expect(verificationInputs.map((input) => input.identity?.work_item_id)).toContain("integrated");
@@ -3888,7 +4036,7 @@ describe("runLocalWorkflow", () => {
     const failedManifest = await readManifestV2(setupResult.runDir);
     expect(failedManifest.recovery.scopes["work-item:first"]).toMatchObject({
       disposition: "awaiting_external_fix",
-      head_sequence: 2,
+      head_sequence: 1,
       consecutive_without_progress: 1,
     });
     expect(failedManifest.work_item_progress.first).toMatchObject({

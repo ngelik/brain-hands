@@ -3,6 +3,7 @@ import type {
   AcceptanceCriterion,
   BrainPlan,
   ReplanPatch,
+  WorkItem,
   WorkflowProtocol,
 } from "../core/types.js";
 
@@ -12,6 +13,7 @@ export interface MaterializeReplanCandidateInput {
   patch: ReplanPatch;
   durableCriteria: AcceptanceCriterion[];
   workflowProtocol: WorkflowProtocol;
+  materializationVersion?: 1 | 2;
 }
 
 /** Apply an already-validated immutable patch without reading or writing workflow state. */
@@ -21,6 +23,7 @@ export function materializeReplanCandidate({
   patch,
   durableCriteria,
   workflowProtocol,
+  materializationVersion = 1,
 }: MaterializeReplanCandidateInput): BrainPlan {
   const targetIndex = basePlan.work_items.findIndex((item) => item.id === targetWorkItemId);
   if (targetIndex < 0) throw new Error("Replan approval target is absent from the approved base plan");
@@ -31,10 +34,18 @@ export function materializeReplanCandidate({
   const addedReadOnlyPaths = patch.added_read_only_file_contracts.map((contract) => contract.path);
   const authorizedPaths = [...new Set([...addedPaths, ...addedReadOnlyPaths])];
   const fileContract = target.file_contract.map((contract) => {
-    const addedTargets = patch.added_change_units
-      .filter((unit) => unit.path === contract.path)
+    const matchingUnits = patch.added_change_units.filter((unit) => unit.path === contract.path);
+    const addedTargets = matchingUnits
       .map((unit) => unit.target);
-    return addedTargets.length > 0 ? { ...contract, targets: [...contract.targets, ...addedTargets] } : contract;
+    const promotesReadOnly = materializationVersion === 2
+      && contract.permission === "read_only"
+      && matchingUnits.length > 0
+      && matchingUnits.every((unit) => unit.operation === "modify");
+    return addedTargets.length > 0 ? {
+      ...contract,
+      permission: promotesReadOnly ? "modify" as const : contract.permission,
+      targets: promotesReadOnly ? addedTargets : [...contract.targets, ...addedTargets],
+    } : contract;
   });
   for (const path of addedPaths) {
     if (fileContract.some((contract) => contract.path === path)) continue;
@@ -51,7 +62,9 @@ export function materializeReplanCandidate({
   })));
   const nextTarget = {
     ...target,
-    objective: patch.revised_objective ?? target.objective,
+    objective: materializationVersion === 2
+      ? [patch.revised_objective ?? target.objective, ...patch.changed_instructions].join("\n")
+      : patch.revised_objective ?? target.objective,
     file_contract: fileContract,
     forbidden_changes: target.forbidden_changes.map((forbidden) => forbidden.path === "*"
       ? { ...forbidden, except: [...forbidden.except, ...authorizedPaths.filter((path) => !forbidden.except.includes(path))] }
@@ -71,15 +84,20 @@ export function materializeReplanCandidate({
         satisfied_by: [...criterion.satisfied_by, ...addedEvidence],
       };
     }),
-    change_units: [...(patch.changed_instructions.length > 0
-      ? target.change_units.map((unit, index) => index === 0
-        ? { ...unit, requirements: patch.changed_instructions }
-        : unit)
-      : target.change_units), ...patch.added_change_units.map(({ satisfies: _satisfies, ...unit }) => unit)],
-    cross_cutting_impacts: [
-      ...(target.cross_cutting_impacts ?? []),
-      ...patch.added_cross_cutting_impacts,
+    change_units: [
+      ...(materializationVersion === 2 || patch.changed_instructions.length === 0
+        ? target.change_units
+        : target.change_units.map((unit, index) => index === 0
+          ? { ...unit, requirements: patch.changed_instructions }
+          : unit)),
+      ...patch.added_change_units.map(({ satisfies: _satisfies, ...unit }) => unit),
     ],
+    cross_cutting_impacts: materializationVersion === 2
+      ? mergeCrossCuttingImpacts(target.cross_cutting_impacts ?? [], patch.added_cross_cutting_impacts)
+      : [
+          ...(target.cross_cutting_impacts ?? []),
+          ...patch.added_cross_cutting_impacts,
+        ],
     verification_commands: [
       ...target.verification_commands,
       ...patch.added_verification_commands.map(({ satisfies: _satisfies, ...command }) => command),
@@ -97,4 +115,21 @@ export function materializeReplanCandidate({
     work_items: basePlan.work_items.map((item, index) =>
       index === targetIndex ? nextTarget : item),
   }, workflowProtocol);
+}
+
+function mergeCrossCuttingImpacts(
+  existing: WorkItem["cross_cutting_impacts"],
+  added: ReplanPatch["added_cross_cutting_impacts"],
+): NonNullable<WorkItem["cross_cutting_impacts"]> {
+  const replacements = new Map(added.map((impact) => [
+    `${impact.change_unit_id}\0${impact.category}`,
+    impact,
+  ]));
+  const merged = (existing ?? []).map((impact) => {
+    const key = `${impact.change_unit_id}\0${impact.category}`;
+    const replacement = replacements.get(key);
+    if (replacement) replacements.delete(key);
+    return replacement ?? impact;
+  });
+  return [...merged, ...replacements.values()];
 }

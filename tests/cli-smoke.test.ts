@@ -287,6 +287,8 @@ describe("buildCli", () => {
     expect(names).toContain("close-run");
     expect(names).toContain("status");
     expect(names).toContain("recover-controller");
+    expect(names).toContain("reconcile-budget-model-usage");
+    expect(names).toContain("extend-resource-budget");
     expect(names).toContain("accept-risk");
     expect(names).toContain("abandon");
     expect(names).toContain("logs");
@@ -849,6 +851,30 @@ describe("buildCli", () => {
     expect(optionNames("proceed-discovery")).toEqual(["run", "question", "input-file", "dry-run", "json", "follow"]);
     expect(optionNames("approve-discovery")).toEqual(["run", "revision", "dry-run", "json", "follow"]);
     expect(optionNames("revise-discovery")).toEqual(["run", "revision", "input-file", "dry-run", "json", "follow"]);
+  });
+
+  it("registers explicit measured model-usage reconciliation options", () => {
+    const command = buildCli().commands.find((candidate) => candidate.name() === "reconcile-budget-model-usage")!;
+    expect(command.options.map((option) => option.name())).toEqual([
+      "run",
+      "claim",
+      "actor",
+      "reason",
+      "evidence",
+      "input-tokens",
+      "cached-input-tokens",
+      "output-tokens",
+      "reasoning-output-tokens",
+      "json",
+    ]);
+  });
+
+  it("registers an explicit append-only budget extension boundary", () => {
+    const command = buildCli().commands.find((candidate) => candidate.name() === "extend-resource-budget")!;
+    expect(command.options.map((option) => option.name())).toEqual([
+      "run", "actor", "reason", "evidence", "max-model-invocations", "max-workflow-attempts",
+      "max-total-tokens", "max-active-elapsed-ms", "max-external-effects", "json",
+    ]);
   });
 
   it("keeps plan approval explicit and exact", () => {

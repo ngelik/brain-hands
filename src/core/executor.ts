@@ -10,6 +10,7 @@ export interface RunCommandInput {
   args: string[];
   cwd: string;
   timeoutMs: number;
+  env?: NodeJS.ProcessEnv;
   stdin?: string;
   onStarted?: (process: { pid: number | null }) => void | Promise<void>;
   onStdoutChunk?: (chunk: string) => void | Promise<void>;
@@ -83,6 +84,7 @@ async function runCommandUnsafe(input: RunCommandInput): Promise<CommandResult> 
   try {
     const subprocess = execa(input.command, input.args, {
       cwd: input.cwd,
+      env: input.env,
       input: input.stdin,
       reject: false,
       timeout: input.timeoutMs,

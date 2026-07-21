@@ -21,6 +21,7 @@ import type {
 import { verificationIdentityDirectory } from "../core/types.js";
 import { browserEvidenceBundleSchema } from "../core/schema.js";
 import { currentExecutionAuthority, recordActiveExecutionChild, withCurrentExecutionEffect } from "../core/execution-context.js";
+import { missingExpectedNetwork } from "./network-pattern.js";
 
 export function assertBrowserProcessTreeSupport(platform = process.platform): void {
   if (platform === "win32" && currentExecutionAuthority()) {
@@ -546,9 +547,7 @@ export function buildBrowserEvidenceReport(
   const missingSelectors = check.required_selectors.filter(
     (selector) => !capture.observedSelectors.includes(selector),
   );
-  const missingNetwork = check.expected_network.filter(
-    (networkEntry) => !capture.observedNetwork.includes(networkEntry),
-  );
+  const missingNetwork = missingExpectedNetwork(check.expected_network, capture.observedNetwork);
   const failureReasons = [
     ...missingSelectors.map((selector) => `missing selector: ${selector}`),
     ...missingNetwork.map((networkEntry) => `missing expected network: ${networkEntry}`),

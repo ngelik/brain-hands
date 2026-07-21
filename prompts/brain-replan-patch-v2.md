@@ -51,10 +51,32 @@ Requirements:
   linking it to its change unit and cross_cutting verification command IDs. Otherwise return an empty array.
 - When creating a reusable helper, either add its path to the reviewed critical-surface registry in the same change or classify its change unit as shared_helper and enumerate its callers.
 - Include callers and representative fixtures as read_only file_contract paths when they are not modified.
+- When a previously read_only file must now be modified to resolve the finding, add a `modify`
+  change unit for that existing path. Version 2 materialization promotes that contract to `modify`.
 - Record those representative fixture paths in representative_fixtures.
 - Add every previously undeclared caller or fixture path to `added_read_only_file_contracts` with
   explicit targets. These paths authorize compatibility inspection only and must not become changed files.
   Otherwise return an empty array.
 - Do not use npm test, npm run build, or npm run clean as a work-item verification command.
+- GitHub pull-request creation is controller-owned and happens only after the integrated commit exists.
+  For a pre-delivery release-guard finding, revise the objective and affected criterion so Hands never
+  creates or mutates a pull request. A repository delivery verifier may inspect GitHub strictly only
+  when `BRAIN_HANDS_VERIFICATION_PHASE=post_pr`; it must exit successfully without requiring a pull
+  request during `work_item` or `pre_pr`. The controller reruns every work-item verification command
+  after opening the integrated pull request.
+- When browser checks need interactions that the generic capture contract cannot express, instruct the
+  approved browser test to write a normalized evidence bundle to the absolute path in
+  `BRAIN_HANDS_BROWSER_EVIDENCE_REPORT`. The JSON bundle contains `generated_at`, aggregate `status`,
+  and one report per check with: `check_name`, `url`, `status`, `observed_selectors`, `missing_selectors`,
+  `console_errors`, `expected_network`, `observed_network`, `screenshot_artifact`,
+  `console_error_policy`, optional `viewport`, `horizontal_overflow`, `overlap_failures`, `pixel_check`,
+  `failure_reasons`, and `skipped_reason`. Evidence must come from the real browser interaction; never
+  synthesize passing observations. Both aggregate and report `status` must be exactly `passed`, `failed`,
+  or `skipped`; `horizontal_overflow` is a boolean; and `pixel_check`, when present, contains the
+  non-negative integers `sampled_pixels`, `non_blank_pixels`, and `unique_colors`. Every report must use
+  the exact planned `check_name`, `screenshot_artifact`, and required selectors.
+- The controller injects `BRAIN_HANDS_BROWSER_EVIDENCE_REPORT` into every existing approved verification
+  command. Never add an `env BRAIN_HANDS_BROWSER_EVIDENCE_REPORT=...` wrapper, never choose a `/tmp` report
+  path, and never add a duplicate of an existing verification command merely to produce this report.
 - Put rejected speculative hardening in explicitly_rejected_hardening.
 - Do not output a replacement plan, approval, accounting reset, credentials, secrets, or evidence contents.

@@ -111,6 +111,23 @@ describe("Codex progress consumer", () => {
     });
   });
 
+  it("accepts additive Codex usage fields while retaining the budgeted counters", async () => {
+    const consumer = createCodexProgressConsumer({
+      context: { source: "brain", mode: "planning", model: "gpt", reasoningEffort: "high" },
+    });
+
+    await consumer.write('{"type":"turn.started"}\n');
+    await consumer.write('{"type":"turn.completed","usage":{"input_tokens":80132,"cached_input_tokens":54528,"cache_write_input_tokens":0,"output_tokens":4971,"reasoning_output_tokens":1664}}\n');
+    await consumer.end();
+
+    expect(consumer.terminalUsage()).toEqual({
+      input_tokens: 80132,
+      cached_input_tokens: 54528,
+      output_tokens: 4971,
+      reasoning_output_tokens: 1664,
+    });
+  });
+
   it("treats malformed terminal usage as uncertain instead of zero", async () => {
     const intents: ProgressIntent[] = [];
     const consumer = createCodexProgressConsumer({

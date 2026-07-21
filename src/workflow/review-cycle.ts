@@ -392,6 +392,12 @@ async function activeFixReservations(runDir: string): Promise<number> {
     }
     const completion = await readOptionalValidatedArtifact(runDir, `reviews/accounting/reservations/${entry.name}/completion.json`, fixReservationCompletionReadSchema);
     if (!completion) {
+      const completedEffect = await readOptionalValidatedArtifact(
+        runDir,
+        effectCompletionPath(reservation.effect_id),
+        reviewCycleStateSchema,
+      );
+      if (completedEffect?.effect_state === "complete") continue;
       active += 1;
       continue;
     }

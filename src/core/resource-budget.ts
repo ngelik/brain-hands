@@ -110,12 +110,40 @@ export const resourceBudgetReconciliationV1Schema = z.object({
   token_usage: tokenUsageSchema,
 }).strict();
 
+export const resourceBudgetExtensionV1Schema = z.object({
+  schema_version: z.literal(1),
+  extension_id: z.string().regex(/^budget-extension:[a-f0-9]{64}$/),
+  extended_at: z.string().datetime({ offset: true }),
+  actor: z.string().trim().min(1).max(200),
+  reason: z.string().trim().min(1).max(1_000),
+  evidence_refs: z.array(z.string().trim().min(1).max(512)).min(1),
+  previous_policy: resourceBudgetPolicyV1Schema,
+  policy: resourceBudgetPolicyV1Schema,
+}).strict().superRefine((extension, context) => {
+  const dimensions = [
+    "max_model_invocations",
+    "max_workflow_attempts",
+    "max_total_tokens",
+    "max_active_elapsed_ms",
+    "max_external_effects",
+  ] as const;
+  let increased = false;
+  for (const dimension of dimensions) {
+    if (extension.policy[dimension] < extension.previous_policy[dimension]) {
+      context.addIssue({ code: "custom", path: ["policy", dimension], message: "Budget extensions cannot reduce limits" });
+    }
+    if (extension.policy[dimension] > extension.previous_policy[dimension]) increased = true;
+  }
+  if (!increased) context.addIssue({ code: "custom", path: ["policy"], message: "Budget extension must increase at least one limit" });
+});
+
 export type ResourceBudgetPolicyV1 = z.infer<typeof resourceBudgetPolicyV1Schema>;
 export type ResourceBudgetClaimKind = z.infer<typeof resourceBudgetClaimKindSchema>;
 export type ResourceBudgetClaimV1 = z.infer<typeof resourceBudgetClaimV1Schema>;
 export type TokenUsage = z.infer<typeof tokenUsageSchema>;
 export type ResourceBudgetCompletionV1 = z.infer<typeof resourceBudgetCompletionV1Schema>;
 export type ResourceBudgetReconciliationV1 = z.infer<typeof resourceBudgetReconciliationV1Schema>;
+export type ResourceBudgetExtensionV1 = z.infer<typeof resourceBudgetExtensionV1Schema>;
 
 export interface ResourceBudgetUsage {
   model_invocations: number;
@@ -252,8 +280,23 @@ export function reduceResourceBudgetArtifacts(
     if (claim?.kind !== "model_invocation" || completion === undefined) {
       throw new Error(`Resource budget reconciliation ${reconciliation.claim_id} requires a completed model claim`);
     }
-    if (completion.token_usage !== null || !completion.structured_terminal_error) {
-      throw new Error(`Resource budget reconciliation ${reconciliation.claim_id} requires an uncertain structured terminal error`);
+    const successfulStartedTurn = completion.outcome === "succeeded"
+      && completion.process_started
+      && completion.turn_started
+      && !completion.structured_terminal_error;
+    const failedBeforeTurn = completion.outcome === "failed"
+      && completion.process_started
+      && !completion.turn_started
+      && !completion.structured_terminal_error;
+    const reconciledNonzero = Object.values(reconciliation.token_usage).some((value) => value !== 0);
+    if (
+      completion.token_usage !== null
+      || (!completion.structured_terminal_error && !successfulStartedTurn && !failedBeforeTurn)
+      || (failedBeforeTurn && reconciledNonzero)
+    ) {
+      throw new Error(
+        `Resource budget reconciliation ${reconciliation.claim_id} requires an uncertain provider rejection or successful started turn; a failed pre-turn rejection requires zero usage`,
+      );
     }
     const existing = reconciliationsByClaimId.get(reconciliation.claim_id);
     if (existing !== undefined && artifactBytes(existing) !== artifactBytes(reconciliation)) {

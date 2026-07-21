@@ -171,21 +171,47 @@ function verifierFindingInput(
   ref: string,
 ): FindingRevisionInput {
   const releaseGuard = input.release_guards.some((guard) => guard.id === ref);
+  const writablePaths = input.writable_paths === undefined ? null : new Set(input.writable_paths);
+  const remediationRequiresReplan = writablePaths !== null && claim.remediation !== undefined && (
+    claim.remediation.remediation.allowed_files.some((path) => !writablePaths.has(path))
+    || claim.remediation.remediation.change_units.some((unit) => !writablePaths.has(unit.path))
+  );
+  const preDeliveryReleaseGuard = input.phase === "work_item"
+    && claim.problem_class === "release_guard"
+    && !releaseGuard
+    && (writablePaths === null || claim.remediation === undefined || remediationRequiresReplan);
+  const canonicalLocalVerificationRefs = new Set(verificationRefs(input, [
+    ...input.verification.commands.flatMap((command) => [command.result_path, command.stdout_path, command.stderr_path]),
+    ...input.verification.browser_evidence.flatMap((browser) => [
+      browser.evidence_report_path,
+      browser.screenshot_exists ? browser.screenshot_artifact : undefined,
+    ]),
+  ]));
+  const hadLocalVerificationRef = claim.evidence_refs!.some((evidenceRef) =>
+    evidenceRef.startsWith("verification/local/"));
+  const evidenceRefs = claim.evidence_refs!.filter((evidenceRef) =>
+    !evidenceRef.startsWith("verification/local/") || canonicalLocalVerificationRefs.has(evidenceRef));
+  if (hadLocalVerificationRef
+    && !evidenceRefs.some((evidenceRef) => evidenceRef.startsWith("verification/local/"))) {
+    evidenceRefs.push(input.verification.evidence_path);
+  }
   return {
     work_item_id: input.work_item_id,
     source: releaseGuard ? "release_guard" : "verifier",
     severity: claim.severity,
-    disposition: releaseGuard && (claim.severity === "critical" || claim.severity === "high")
-      ? "blocking"
-      : input.review.decision === "replan_required"
-        ? "requires_replan"
+    disposition: preDeliveryReleaseGuard || remediationRequiresReplan
+      ? "requires_replan"
+      : releaseGuard && (claim.severity === "critical" || claim.severity === "high")
+        ? "blocking"
+        : input.review.decision === "replan_required"
+          ? "requires_replan"
         : dispositionFor(claim.severity, input.severity_defaults, releaseGuard),
     criterion_ref: ref,
     normalized_location: claim.line === null ? claim.file : `${claim.file}:${claim.line}`,
     problem_class: claim.problem_class!,
     problem: claim.problem,
     required_fix: claim.required_fix,
-    evidence_refs: claim.evidence_refs!,
+    evidence_refs: [...new Set(evidenceRefs)],
     review_revision: input.review_revision,
   };
 }
@@ -339,6 +365,19 @@ export function normalizeReviewInputs(input: NormalizeReviewInput): NormalizedRe
       || typeof blockerCode !== "string"
       || !compatibleCode
     ) return invalidContract(input, "Verifier blocked claim requires a matching failure class and blocker");
+    const deterministicCommandFailure = input.verification.commands.some((command) =>
+      command.exit_code !== null
+      && command.exit_code !== 0
+      && !command.timed_out
+      && command.signal === null
+      && classifyOperationalCode(command.error_code) === null);
+    if (failureClass === "test_infrastructure_blocker" && deterministicCommandFailure) {
+      return invalidContract(
+        input,
+        "Verifier test-infrastructure claim contradicts deterministic required verification diagnostics",
+        input.review.evidence_reviewed,
+      );
+    }
     return operationalFailure(
       input,
       blockerCode,

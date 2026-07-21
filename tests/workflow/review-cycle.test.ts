@@ -1019,6 +1019,45 @@ describe("review accounting", () => {
       .rejects.toThrow(/quality recovery|eligible|exhausted/i);
   });
 
+  it("does not let an abandoned reservation from a completed effect exhaust later fix capacity", async () => {
+    const { runDir, policyHash } = await setup({ backup: true, maxFixCycles: 1 });
+    const firstCycle = await beginReviewCycle(cycleInput(runDir, policyHash, () => decision));
+    const firstInput = {
+      run_dir: runDir,
+      cycle: firstCycle,
+      owner: "worker-1",
+      mutation_id: "R1-A1:attempt-1",
+      effect_action: "fix" as const,
+    };
+    await claimReviewEffect(firstInput);
+    await reserveFixSlot(firstInput);
+    await completeReviewEffect({
+      ...firstInput,
+      outcome: "complete",
+      result: { kind: "still_blocking", successful_hands_fixes: 0, evidence_paths: [] },
+    });
+
+    const current = (await readManifestV2(runDir)).review_accounting!;
+    const secondCycle = await beginReviewCycle({
+      ...cycleInput(runDir, policyHash, () => decision),
+      review_revision: 2,
+      accounting_before: current,
+    });
+    const secondInput = {
+      run_dir: runDir,
+      cycle: secondCycle,
+      owner: "worker-2",
+      mutation_id: "R2-A1:attempt-1",
+      effect_action: "fix" as const,
+    };
+    await claimReviewEffect(secondInput);
+
+    await expect(reserveFixSlot(secondInput)).resolves.toEqual({
+      status: "admitted",
+      mutation_id: secondInput.mutation_id,
+    });
+  });
+
   it.each([
     ["marker", "afterMarkerPersisted"],
     ["accounting projection", "afterAccountingPersisted"],

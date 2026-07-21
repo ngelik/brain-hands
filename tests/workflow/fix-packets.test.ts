@@ -65,6 +65,49 @@ describe("fix packets", () => {
     expect(packet.remediation.change_units[0]!.satisfies).toEqual(["SC-1"]);
   });
 
+  it("normalizes absolute command evidence destinations into the controller verification namespace", () => {
+    const workItem = executionSpec("item-1");
+    const claim = validClaimFor(workItem);
+    claim.verification.required_evidence[0]!.output_path = "/private/tmp/invented-result.txt";
+
+    const packet = compileReviewFixPacket({
+      claim,
+      work_item: workItem,
+      finding_id: "finding:absolute-evidence",
+      action_id: "R1-A1",
+      review_revision: 1,
+      criterion_ref: workItem.acceptance[0]!.id,
+      severity: "medium",
+      problem_class: "verification",
+      approved_plan_sha256: "a".repeat(64),
+    });
+
+    expect(packet.verification.required_evidence[0]!.output_path)
+      .toBe("verification/review-fix/EVID-1.json");
+  });
+
+  it("derives the completion boundary from change units instead of broader allowed outputs", () => {
+    const workItem = executionSpec("item-1");
+    workItem.file_contract.push({ path: "artifacts/result.png", permission: "create", targets: ["generated evidence"] });
+    const claim = validClaimFor(workItem);
+    claim.remediation.allowed_files.push("artifacts/result.png");
+    claim.completion_contract.expected_changed_files.push("artifacts/result.png");
+    const packet = compileReviewFixPacket({
+      claim,
+      work_item: workItem,
+      finding_id: "finding:completion-boundary",
+      action_id: "R1-A1",
+      review_revision: 1,
+      criterion_ref: workItem.acceptance[0]!.id,
+      severity: "high",
+      problem_class: "artifact",
+      approved_plan_sha256: "a".repeat(64),
+    });
+    expect(packet.remediation.allowed_files).toEqual(["src/item-1.ts", "artifacts/result.png"]);
+    expect(packet.completion_contract.expected_changed_files).toEqual(["src/item-1.ts"]);
+    expect(packet.completion_contract.required_change_unit_ids).toEqual(["FIX-1"]);
+  });
+
   it("persists immutable retry supplements and permits only one contract correction", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-packet-"));
     const supplement = {
@@ -221,28 +264,47 @@ describe("fix packets", () => {
     }
   });
 
-  it("treats an in-scope remediation target label mismatch as correctable output", () => {
+  it("normalizes an in-scope remediation unit to its sole approved file contract", () => {
     const workItem = executionSpec("item-1");
     const claim = validClaimFor(workItem);
     claim.remediation.change_units[0]!.target = "descriptive but unapproved target label";
+    claim.remediation.change_units[0]!.operation = "create";
 
-    try {
-      compileReviewFixPacket({
-        claim,
-        work_item: workItem,
-        finding_id: "finding:target",
-        action_id: "R1-A1",
-        review_revision: 1,
-        criterion_ref: workItem.acceptance[0]!.id,
-        severity: "high",
-        problem_class: "correctness",
-        approved_plan_sha256: "a".repeat(64),
-      });
-      throw new Error("Expected packet compilation to fail");
-    } catch (error) {
-      expect(classifyFixPacketCompilationFailure(error)).toBe("invalid_contract");
-      expect((error as Error).message).toContain("approved file target or operation");
-    }
+    const packet = compileReviewFixPacket({
+      claim,
+      work_item: workItem,
+      finding_id: "finding:target",
+      action_id: "R1-A1",
+      review_revision: 1,
+      criterion_ref: workItem.acceptance[0]!.id,
+      severity: "high",
+      problem_class: "correctness",
+      approved_plan_sha256: "a".repeat(64),
+    });
+
+    expect(packet.remediation.change_units[0]).toMatchObject({
+      target: workItem.file_contract[0]!.targets[0],
+      operation: workItem.file_contract[0]!.permission,
+    });
+  });
+
+  it("keeps an ambiguous remediation target mismatch on the invalid-contract path", () => {
+    const workItem = executionSpec("item-1");
+    workItem.file_contract[0]!.targets.push("second approved target");
+    const claim = validClaimFor(workItem);
+    claim.remediation.change_units[0]!.target = "descriptive but unapproved target label";
+
+    expect(() => compileReviewFixPacket({
+      claim,
+      work_item: workItem,
+      finding_id: "finding:ambiguous-target",
+      action_id: "R1-A1",
+      review_revision: 1,
+      criterion_ref: workItem.acceptance[0]!.id,
+      severity: "high",
+      problem_class: "correctness",
+      approved_plan_sha256: "a".repeat(64),
+    })).toThrow(/approved file target or operation/);
   });
 
   it("does not reinvoke a contract correction after ambiguous dispatch", async () => {

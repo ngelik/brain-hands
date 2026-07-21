@@ -576,6 +576,39 @@ describe("createReplanPatch", () => {
     await expect(createReplanPatch(input)).rejects.toThrow(/unknown acceptance ID/i);
   });
 
+  it("maps canonical criterion refs in satisfies to target-local acceptance IDs", async () => {
+    const input = await validInput(validPatch({
+      added_change_units: [{
+        id: "BH-005-CH-99",
+        path: "src/helper.ts",
+        target: "Shared helper",
+        operation: "create",
+        requirements: ["Provide the verified shared behavior."],
+        satisfies: ["BH-001:AC-1"],
+      }],
+    }));
+
+    const result = await createReplanPatch(input);
+    expect(result.patch.added_change_units[0]?.satisfies).toEqual(["BH-005-AC-01"]);
+  });
+
+  it("removes a redundant browser-report env wrapper around an existing command", async () => {
+    const existing = plan.work_items[0]!.verification_commands[0]!;
+    const input = await validInput(validPatch({
+      added_verification_commands: [{
+        id: "BH-005-VERIFY-BROWSER-EVIDENCE",
+        argv: ["env", "BRAIN_HANDS_BROWSER_EVIDENCE_REPORT=/tmp/browser-evidence.json", ...existing.argv],
+        expected_exit_code: 0,
+        tier: "cross_cutting",
+        satisfies: ["BH-005-AC-01"],
+      }],
+    }));
+
+    const result = await createReplanPatch(input);
+
+    expect(result.patch.added_verification_commands).toEqual([]);
+  });
+
   it.each([
     ["mutable conflict", { path: "src/BH-005.ts", targets: ["existing caller"] }, /duplicate file_contract path|conflict/i],
     ["invalid path", { path: "../outside.ts", targets: ["escaped fixture"] }, /repository-relative|normalized/i],
@@ -597,6 +630,7 @@ describe("createReplanPatch", () => {
     expect(result.path).toContain("replans/");
     expect(result.model_profile).toEqual(intake.roles.brain);
     expect(JSON.parse(await readFile(result.path, "utf8"))).toMatchObject({
+      materialization_version: 2,
       patch: result.patch,
       provenance: {
         base_plan_revision: 1,
@@ -616,7 +650,7 @@ describe("createReplanPatch", () => {
   it("accepts repository source alongside run-owned replan evidence", async () => {
     const input = await validInput();
     const repositoryEvidence = "src/replan-evidence.ts";
-    const repositoryEvidenceRef = `${repositoryEvidence}:1`;
+    const repositoryEvidenceRef = `${repositoryEvidence}:1-1`;
     await mkdir(join(input.repo_root, "src"), { recursive: true });
     await writeFile(join(input.repo_root, repositoryEvidence), "export const evidence = true;\n");
     const convergenceFile = join(input.run_dir, convergencePath);
@@ -690,6 +724,82 @@ describe("createReplanPatch", () => {
     const convergenceFile = join(input.run_dir, convergencePath);
     const convergence = JSON.parse(await readFile(convergenceFile, "utf8"));
     convergence.evidence_refs = [...cycleEvidencePaths, contextPath].sort();
+    await writeFile(convergenceFile, `${JSON.stringify(convergence)}\n`);
+    input.evidence_paths = convergence.evidence_refs;
+
+    await expect(createReplanPatch(input)).resolves.toMatchObject({
+      patch: { target_work_item_id: "BH-005" },
+    });
+    expect(input.brain.calls).toHaveLength(1);
+  });
+
+  it("accepts a missing repository artifact when canonical verification records it as absent", async () => {
+    const input = await validInput();
+    const missingPath = "artifacts/screenshots/missing.png";
+    const evidenceFile = join(input.run_dir, evidencePath);
+    const evidence = JSON.parse(await readFile(evidenceFile, "utf8"));
+    evidence.artifact_checks = [{ path: missingPath, exists: false, required: true }];
+    await writeFile(evidenceFile, `${JSON.stringify(evidence)}\n`);
+    const convergenceFile = join(input.run_dir, convergencePath);
+    const convergence = JSON.parse(await readFile(convergenceFile, "utf8"));
+    convergence.evidence_refs = [...cycleEvidencePaths, missingPath].sort();
+    await writeFile(convergenceFile, `${JSON.stringify(convergence)}\n`);
+    input.evidence_paths = convergence.evidence_refs;
+
+    await expect(createReplanPatch(input)).resolves.toMatchObject({
+      patch: { target_work_item_id: "BH-005" },
+    });
+    expect(input.brain.calls).toHaveLength(1);
+  });
+
+  it("accepts a missing mutable generated artifact after a failed capture invalidates stale output", async () => {
+    const missingPath = "artifacts/screenshots/generated.png";
+    const target = plan.work_items[0]!;
+    const generatedPlan: BrainPlan = {
+      ...plan,
+      work_items: [{
+        ...target,
+        file_contract: [...target.file_contract, {
+          path: missingPath,
+          permission: "modify",
+          targets: ["Regenerated browser evidence"],
+        }],
+        forbidden_changes: target.forbidden_changes.map((entry) => entry.path === "*"
+          ? { ...entry, except: [...entry.except, missingPath] }
+          : entry),
+        change_units: [...target.change_units, {
+          id: "CU-generated-artifact",
+          path: missingPath,
+          target: "Regenerated browser evidence",
+          operation: "modify",
+          requirements: ["Regenerate the browser evidence after validation passes."],
+        }],
+        expected_artifacts: [...target.expected_artifacts, missingPath],
+        completion_contract: {
+          ...target.completion_contract,
+          expected_changed_files: [...target.completion_contract.expected_changed_files, missingPath],
+        },
+      }, plan.work_items[1]!],
+    };
+    const input = await validInput(validPatch(), [], {}, generatedPlan);
+    const convergenceFile = join(input.run_dir, convergencePath);
+    const convergence = JSON.parse(await readFile(convergenceFile, "utf8"));
+    convergence.evidence_refs = [...cycleEvidencePaths, missingPath].sort();
+    await writeFile(convergenceFile, `${JSON.stringify(convergence)}\n`);
+    input.evidence_paths = convergence.evidence_refs;
+
+    await expect(createReplanPatch(input)).resolves.toMatchObject({
+      patch: { target_work_item_id: "BH-005" },
+    });
+    expect(input.brain.calls).toHaveLength(1);
+  });
+
+  it("accepts an invented supplemental local verification ref when canonical evidence exists", async () => {
+    const input = await validInput();
+    const inventedPath = "verification/local/invented/attempt-1/command-2.json";
+    const convergenceFile = join(input.run_dir, convergencePath);
+    const convergence = JSON.parse(await readFile(convergenceFile, "utf8"));
+    convergence.evidence_refs = [...cycleEvidencePaths, inventedPath].sort();
     await writeFile(convergenceFile, `${JSON.stringify(convergence)}\n`);
     input.evidence_paths = convergence.evidence_refs;
 
@@ -2319,12 +2429,12 @@ describe("approvePreparedReplanRevision", () => {
     const applied = JSON.parse(await readFile(join(input.run_dir, after.plan_revisions["2"]!.path), "utf8")) as BrainPlan;
     expect(applied.work_items[0]).toMatchObject({
       id: "BH-005",
-      objective: validPatch().revised_objective,
+      objective: [validPatch().revised_objective, ...validPatch().changed_instructions].join("\n"),
     });
     expect(applied.work_items[0]!.acceptance.map((criterion) => criterion.statement)).toEqual([
       validPatch().added_or_changed_criteria[0]!.text,
     ]);
-    expect(applied.work_items[0]!.change_units[0]!.requirements).toEqual(validPatch().changed_instructions);
+    expect(applied.work_items[0]!.change_units[0]!.requirements).toEqual(plan.work_items[0]!.change_units[0]!.requirements);
     expect(applied.work_items[1]).toEqual(plan.work_items[1]);
   });
 
@@ -2452,6 +2562,82 @@ describe("approvePreparedReplanRevision", () => {
       readOnlyContracts.map((contract) => contract.path),
     ));
     expect(applied.work_items[1]).toEqual(plan.work_items[1]);
+  });
+
+  it("replaces an approved same-key cross-cutting impact without duplicating it", async () => {
+    const existingCommand = {
+      id: "BH-005-VERIFY-BASE-CROSS",
+      argv: ["npm", "run", "typecheck"],
+      expected_exit_code: 0 as const,
+      tier: "cross_cutting" as const,
+    };
+    const existingImpact = {
+      change_unit_id: plan.work_items[0]!.change_units[0]!.id,
+      category: "runtime" as const,
+      callers: ["src/BH-005.ts"],
+      representative_fixtures: ["tests/BH-005.test.ts"],
+      verification_command_ids: [existingCommand.id],
+    };
+    const replacementImpact = {
+      ...existingImpact,
+      callers: ["src/BH-005.ts", "tests/BH-005.test.ts"],
+    };
+    const baseTarget = {
+      ...plan.work_items[0]!,
+      verification_commands: [...plan.work_items[0]!.verification_commands, existingCommand],
+      cross_cutting_impacts: [existingImpact],
+    };
+    const input = await pendingApproval(validPatch({
+      added_cross_cutting_impacts: [replacementImpact],
+    }), {
+      ...plan,
+      work_items: [baseTarget, plan.work_items[1]!],
+    });
+
+    const after = await approvePreparedReplanRevision(input.run_dir, "BH-005", 2);
+    const applied = JSON.parse(await readFile(join(input.run_dir, after.plan_revisions["2"]!.path), "utf8")) as BrainPlan;
+
+    expect(applied.work_items[0]!.cross_cutting_impacts).toEqual([replacementImpact]);
+  });
+
+  it("promotes an approved read-only file contract to modify", async () => {
+    const target = plan.work_items[0]!;
+    const promotedPath = "src/inspected.ts";
+    const promotedTarget = "approved write boundary";
+    const inspectedContract = {
+      path: promotedPath,
+      permission: "read_only" as const,
+      targets: ["inspected dependency"],
+    };
+    const baseTarget = {
+      ...target,
+      file_contract: [...target.file_contract, inspectedContract],
+      forbidden_changes: target.forbidden_changes.map((forbidden) => forbidden.path === "*"
+        ? { ...forbidden, except: [...forbidden.except, promotedPath] }
+        : forbidden),
+    };
+    const input = await pendingApproval(validPatch({
+      added_change_units: [{
+        id: "BH-005-CH-READ-ONLY-PROMOTION",
+        path: promotedPath,
+        target: promotedTarget,
+        operation: "modify",
+        requirements: ["Modify the previously inspected dependency."],
+        satisfies: [target.acceptance[0]!.id],
+      }],
+    }), {
+      ...plan,
+      work_items: [baseTarget, plan.work_items[1]!],
+    });
+
+    const after = await approvePreparedReplanRevision(input.run_dir, "BH-005", 2);
+    const applied = JSON.parse(await readFile(join(input.run_dir, after.plan_revisions["2"]!.path), "utf8")) as BrainPlan;
+
+    expect(applied.work_items[0]!.file_contract).toContainEqual({
+      ...inspectedContract,
+      permission: "modify",
+      targets: [promotedTarget],
+    });
   });
 
   it("appends an approved focused command through explicit acceptance linkage", async () => {

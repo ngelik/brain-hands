@@ -46,7 +46,7 @@ import {
   type ResourceBudgetPolicyV1,
   type ResourceBudgetUsage,
 } from "../core/resource-budget.js";
-import { openResourceBudget } from "./resource-budget.js";
+import { openResourceBudget, readEffectiveResourceBudgetPolicy } from "./resource-budget.js";
 import { classifySemanticBoundary } from "./semantic-boundary.js";
 
 export interface ResumeRunInput {
@@ -443,7 +443,8 @@ async function readResourceBudgetStatus(runDir: string, manifest: RunManifestV2)
   if (manifest.resource_budget_policy === undefined) {
     throw new Error("Bounded run manifest is missing resource budget policy");
   }
-  const policy = resourceBudgetPolicyV1Schema.parse(manifest.resource_budget_policy);
+  resourceBudgetPolicyV1Schema.parse(manifest.resource_budget_policy);
+  const policy = await readEffectiveResourceBudgetPolicy(runDir);
   const budget = await openResourceBudget(runDir);
   const usage = await budget.usage();
   return {

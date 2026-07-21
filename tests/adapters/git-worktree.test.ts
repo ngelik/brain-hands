@@ -15,6 +15,7 @@ import {
   pushCommitToBranch,
   requireRemoteBranchAtLocalHead,
   resolveLocalCommitProvenance,
+  restoreTrackedWorktreeFiles,
 } from "../../src/adapters/git.js";
 import type { WorkItem } from "../../src/core/types.js";
 
@@ -350,6 +351,21 @@ describe("run worktrees", () => {
       "README.md",
       " leading.txt",
     ]);
+  });
+
+  it("restores only tracked worktree paths and preserves untracked files", async () => {
+    const root = await repository();
+    await writeFile(join(root, "stale.txt"), "before\n", "utf8");
+    await git(root, "add", "--", "stale.txt");
+    await git(root, "commit", "-qm", "add stale fixture");
+    await writeFile(join(root, "stale.txt"), "after\n", "utf8");
+    await writeFile(join(root, "untracked.txt"), "preserve\n", "utf8");
+
+    await expect(restoreTrackedWorktreeFiles(root, ["stale.txt", "untracked.txt"]))
+      .resolves.toEqual(["stale.txt"]);
+    await expect(readFile(join(root, "stale.txt"), "utf8")).resolves.toBe("before\n");
+    await expect(readFile(join(root, "untracked.txt"), "utf8")).resolves.toBe("preserve\n");
+    await expect(getWorktreeChangedFiles(root)).resolves.toEqual(["untracked.txt"]);
   });
 
   it("records the exact parent, message, and intended tree for commit replay validation", async () => {

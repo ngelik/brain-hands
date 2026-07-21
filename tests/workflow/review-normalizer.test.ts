@@ -141,6 +141,175 @@ describe("normalizeReviewInputs", () => {
     })]);
   });
 
+  it("replaces invented local verification refs with canonical evidence", () => {
+    const review = findingReview({
+      findings: [{
+        ...findingReview().findings[0]!,
+        evidence_refs: [
+          "verification/local/invented/attempt-1/command-1.json",
+          "src/example.ts",
+        ],
+      }],
+    });
+    const { issue_number: _issueNumber, ...localPassedEvidence } = passedEvidence;
+    const verification: VerificationEvidence = {
+      ...localPassedEvidence,
+      verification_scope: "local" as const,
+      evidence_path: "verification/local/current/attempt-1/evidence.json",
+      commands: [{
+        ...passedEvidence.commands[0]!,
+        result_path: "verification/local/current/attempt-1/command-1.json",
+      }],
+    };
+
+    expect(normalizeReviewInputs(input({ review, verification }))).toMatchObject({
+      operational_blocker: null,
+      findings: [{
+        evidence_refs: [
+          "src/example.ts",
+          "verification/local/current/attempt-1/evidence.json",
+        ],
+      }],
+    });
+  });
+
+  it("requires replanning when packet remediation needs an unapproved writable path", () => {
+    const baseFinding = findingReview().findings[0]!;
+    const result = normalizeReviewInputs(input({
+      writable_paths: ["src/example.ts"],
+      review: findingReview({
+        findings: [{
+          ...baseFinding,
+          remediation: {
+            schema_version: 1,
+            diagnosis: {
+              observed_behavior: "The implementation returns the wrong value",
+              expected_behavior: "The implementation returns the approved value",
+              failure_mechanism: "The fix crosses the approved work-item boundary",
+              reproduction: ["npm test"],
+              evidence_refs: ["verification/claims/correctness.json"],
+            },
+            targets: [{ kind: "code", path: "src/shared.ts", symbol: "sharedValue", line_hint: null }],
+            remediation: {
+              strategy: "Update the shared implementation",
+              change_units: [{
+                id: "FIX-1",
+                path: "src/shared.ts",
+                target: "sharedValue",
+                operation: "modify",
+                requirements: ["Return the approved shared value."],
+                satisfies: ["SC-1"],
+              }],
+              allowed_files: ["src/shared.ts"],
+              forbidden_changes: [],
+            },
+            verification: {
+              commands: [{ id: "CMD-1", argv: ["npm", "test"] }],
+              success_conditions: [{ id: "SC-1", statement: "The value is correct", satisfied_by: ["CMD-1", "EVID-1"] }],
+              required_evidence: [{ id: "EVID-1", kind: "test_result", source_id: "CMD-1", output_path: "verification/packet.json" }],
+            },
+            completion_contract: {
+              required_change_unit_ids: ["FIX-1"],
+              expected_changed_files: ["src/shared.ts"],
+              allow_additional_files: false,
+            },
+          },
+        }],
+      }),
+    }));
+
+    expect(result).toMatchObject({
+      operational_blocker: null,
+      findings: [{ disposition: "requires_replan" }],
+    });
+  });
+
+  it("requires replanning for a delivery release guard raised during a work item", () => {
+    const baseFinding = findingReview().findings[0]!;
+    const result = normalizeReviewInputs(input({
+      phase: "work_item",
+      review: findingReview({
+        findings: [{
+          ...baseFinding,
+          problem_class: "release_guard",
+          problem: "The pull request does not exist before integration.",
+          required_fix: "Create the pull request after the integrated commit exists.",
+        }],
+      }),
+    }));
+
+    expect(result).toMatchObject({
+      operational_blocker: null,
+      findings: [{ disposition: "requires_replan", problem_class: "release_guard" }],
+    });
+  });
+
+  it("keeps a repository-scoped pre-delivery release guard fix in scope", () => {
+    const baseFinding = findingReview().findings[0]!;
+    const result = normalizeReviewInputs(input({
+      phase: "work_item",
+      writable_paths: ["tests/e2e/solar-system.spec.ts"],
+      review: findingReview({
+        findings: [{
+          ...baseFinding,
+          file: "tests/e2e/solar-system.spec.ts",
+          problem_class: "release_guard",
+          problem: "The complete browser evidence bundle is missing one viewport.",
+          required_fix: "Make repository evidence publication retain both viewports.",
+          remediation: {
+            schema_version: 1,
+            diagnosis: {
+              observed_behavior: "Only one viewport remains in the browser bundle.",
+              expected_behavior: "The bundle retains both approved viewports.",
+              failure_mechanism: "Repository-side publication overwrites a prior report.",
+              reproduction: ["npx playwright test"],
+              evidence_refs: [passedEvidence.evidence_path],
+            },
+            targets: [{
+              kind: "test",
+              path: "tests/e2e/solar-system.spec.ts",
+              test_name: "browser evidence publication",
+              line_hint: null,
+            }],
+            remediation: {
+              strategy: "Merge repository-owned reports deterministically.",
+              change_units: [{
+                id: "FIX-1",
+                path: "tests/e2e/solar-system.spec.ts",
+                target: "browser evidence publication",
+                operation: "modify",
+                requirements: ["Retain both approved viewports."],
+                satisfies: ["SC-1"],
+              }],
+              allowed_files: ["tests/e2e/solar-system.spec.ts"],
+              forbidden_changes: [],
+            },
+            verification: {
+              commands: [{ id: "CMD-1", argv: ["npx", "playwright", "test"] }],
+              success_conditions: [{ id: "SC-1", statement: "Both viewports remain.", satisfied_by: ["CMD-1"] }],
+              required_evidence: [{
+                id: "EVID-1",
+                kind: "test_result",
+                source_id: "CMD-1",
+                output_path: passedEvidence.evidence_path,
+              }],
+            },
+            completion_contract: {
+              required_change_unit_ids: ["FIX-1"],
+              expected_changed_files: ["tests/e2e/solar-system.spec.ts"],
+              allow_additional_files: false,
+            },
+          },
+        }],
+      }),
+    }));
+
+    expect(result).toMatchObject({
+      operational_blocker: null,
+      findings: [{ disposition: "fix_in_scope", problem_class: "release_guard" }],
+    });
+  });
+
   it.each([
     ["operational_blocker", "network_failure"],
     ["test_infrastructure_blocker", "test_infrastructure_failure"],
@@ -158,6 +327,37 @@ describe("normalizeReviewInputs", () => {
         code,
         message: "The verification service is unavailable",
         evidence_refs: approvedReview.evidence_reviewed,
+      },
+    });
+  });
+
+  it("rejects a test-infrastructure blocker for deterministic compiler diagnostics", () => {
+    const failedEvidence: VerificationEvidence = {
+      ...passedEvidence,
+      commands: [{
+        ...passedEvidence.commands[0]!,
+        command: "npx tsc -b",
+        argv: ["npx", "tsc", "-b"],
+        exit_code: 1,
+        error_message: "src/example.ts(1,1): error TS2307: Cannot find module 'node:fs'",
+      }],
+    };
+    const result = normalizeReviewInputs(input({
+      verification: failedEvidence,
+      review: {
+        ...approvedReview,
+        decision: "blocked",
+        failure_class: "test_infrastructure_blocker",
+        blocker: "Node declarations are unavailable",
+        blocker_code: "test_infrastructure_failure",
+      },
+    }));
+
+    expect(result).toMatchObject({
+      findings: [],
+      operational_blocker: {
+        code: "invalid_verifier_contract",
+        message: "Verifier test-infrastructure claim contradicts deterministic required verification diagnostics",
       },
     });
   });

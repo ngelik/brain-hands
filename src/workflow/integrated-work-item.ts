@@ -12,6 +12,19 @@ export function integratedWorkItem(
     ...command,
     id: `${item.id}:${command.id}`,
   })));
+  const forbiddenChanges = [...plan.work_items
+    .flatMap((item) => item.forbidden_changes)
+    .reduce((byPath, change) => {
+      const current = byPath.get(change.path);
+      if (current === undefined) {
+        byPath.set(change.path, { ...change, except: [...change.except] });
+        return byPath;
+      }
+      current.except = [...new Set([...current.except, ...change.except])];
+      if (current.reason !== change.reason) current.reason = `${current.reason} ${change.reason}`;
+      return byPath;
+    }, new Map<string, WorkItem["forbidden_changes"][number]>())
+    .values()];
   verificationCommands.push(...plan.integration_verification.map((argv, index) => ({
     id: `integrated:VERIFY-${index + 1}`,
     argv,
@@ -26,7 +39,7 @@ export function integratedWorkItem(
       ? plan.work_items.map((item) => item.id)
       : [],
     file_contract: fileContract,
-    forbidden_changes: plan.work_items.flatMap((item) => item.forbidden_changes),
+    forbidden_changes: forbiddenChanges,
     change_units: plan.work_items.flatMap((item) => item.change_units.map((unit) => ({
       ...unit,
       id: `${item.id}:${unit.id}`,

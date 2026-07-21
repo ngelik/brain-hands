@@ -43,6 +43,7 @@ import type {
   ExecutionLeaseClaim,
   ExecutionLeaseV1,
 } from "./types.js";
+import { browserEvidenceReportPathForIdentity } from "./verification-provenance.js";
 import type { TaskLineageRecordV1, TaskLineageState } from "./task-lineage.js";
 import {
   CANONICAL_REVIEW_POLICY,
@@ -428,7 +429,7 @@ export async function assertVerificationNamespaceAvailable(
     }
     for (const browser of evidence.browser_evidence) {
       addPath(browser.screenshot_artifact, "browser screenshot provenance");
-      addPath(browser.evidence_report_path, "browser report provenance");
+      addPath(browserEvidenceReportPathForIdentity(evidence, browser, expectedPrefix), "browser report provenance");
     }
     return files;
   };

@@ -14,6 +14,29 @@ evidence on disk, pauses at explicit approval points, and can safely resume an
 interrupted run. You can work entirely locally or use GitHub issues and one
 pull request. Brain Hands never merges or deploys automatically.
 
+## Built with Codex and GPT-5.6
+
+I used Codex throughout the project: to explore the workflow design, turn rough
+ideas into explicit contracts and file-level plans, implement changes, write
+focused regression tests, review diffs, and verify the release surface. GPT-5.6
+handled the judgment-heavy work, including architecture and safety reviews,
+debugging failed planning and recovery paths, and checking that the final code
+matched the approved intent.
+
+Codex accelerated the parts that normally require repeated repository-wide
+tracing. It followed state across the CLI, controller, ledger, prompts, GitHub
+projection, and tests; helped reproduce failures; and turned each confirmed
+failure into a focused fix and regression check. I kept the product and
+engineering decisions: separate discovery and plan approvals, write access only
+for Hands, an independent read-only Verifier, controller-enforced limits on
+nested agents and retries, a durable local ledger as the source of truth, and no
+automatic merge or deployment.
+
+The result was not a one-prompt generation. It was an iterative collaboration:
+Codex proposed and challenged approaches, I chose the boundaries and tradeoffs,
+and the repository's tests and release checks decided whether each change was
+actually ready.
+
 > Brain Hands is under active pre-1.0 development. Breaking changes may occur,
 > with migration guidance provided in release notes.
 

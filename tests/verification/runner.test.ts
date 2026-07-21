@@ -103,6 +103,32 @@ describe("runVerification", () => {
     expect(integrated.commands[0].stdout_path).toContain("verification/integrated/attempt-1/");
   });
 
+  it("exposes the verification phase and controller-owned browser report path", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-verification-"));
+    const evidence = await runVerification({
+      repoRoot: process.cwd(),
+      runDir,
+      identity: { scope: "local", work_item_id: "browser-proof" },
+      phase: "post_pr",
+      commands: [[process.execPath, "-e", "process.stdout.write(JSON.stringify({phase:process.env.BRAIN_HANDS_VERIFICATION_PHASE,report:process.env.BRAIN_HANDS_BROWSER_EVIDENCE_REPORT}))"]],
+      browserChecks: [{
+        name: "desktop",
+        url: "http://127.0.0.1:4173/",
+        local_server_command: "npx vite preview --host 127.0.0.1 --port 4173",
+        required_selectors: ["#app"],
+        console_error_policy: "no_errors",
+        expected_network: [],
+        screenshot_artifact: "artifacts/desktop.png",
+      }],
+    });
+    const commandOutput = JSON.parse(await readFile(join(runDir, evidence.commands[0]!.stdout_path), "utf8"));
+
+    expect(commandOutput).toEqual({
+      phase: "post_pr",
+      report: join(runDir, "verification/local/YnJvd3Nlci1wcm9vZg/attempt-1/browser-evidence.json"),
+    });
+  });
+
   it("rejects issue-number-only run-scoped calls before writing", async () => {
     runDir = await mkdtemp(join(tmpdir(), "brain-hands-verification-"));
     await expect(runVerification({
@@ -468,6 +494,126 @@ describe("runVerification", () => {
       .rejects.toThrow(/already contains artifacts/i);
     expect(await readFile(counterPath, "utf8")).toBe("x");
     expect(await readFile(join(runDir, first.evidence_path!), "utf8")).toContain('"issue_number": 29');
+  });
+
+  it("resumes after a completed command without executing that command twice", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-verification-"));
+    const input = {
+      repoRoot: process.cwd(),
+      runDir,
+      identity: githubIdentity(34),
+      attempt: 1,
+      commands: [
+        [process.execPath, "-e", "process.stdout.write('first')"],
+        [process.execPath, "-e", "process.stdout.write('second')"],
+      ],
+    };
+    mockedRunCommand
+      .mockResolvedValueOnce({
+        command: process.execPath, args: ["-e", "process.stdout.write('first')"],
+        exitCode: 0, stdout: "first", stderr: "", failed: false, timedOut: false,
+      })
+      .mockRejectedValueOnce(new Error("controller interrupted"));
+
+    await expect(runVerification(input)).rejects.toThrow("controller interrupted");
+    mockedRunCommand.mockClear();
+    mockedRunCommand.mockResolvedValueOnce({
+      command: process.execPath, args: ["-e", "process.stdout.write('second')"],
+      exitCode: 0, stdout: "second", stderr: "", failed: false, timedOut: false,
+    });
+
+    const resumed = await runVerification({ ...input, resumeExistingNamespace: true });
+
+    expect(mockedRunCommand).toHaveBeenCalledTimes(1);
+    expect(resumed.commands.map((command) => command.stdout_path)).toEqual([
+      "verification/issue-34/attempt-1/command-1.stdout.txt",
+      "verification/issue-34/attempt-1/command-2.stdout.txt",
+    ]);
+    expect(await readFile(join(runDir, resumed.commands[0]!.stdout_path), "utf8")).toBe("first");
+    expect(await readFile(join(runDir, resumed.commands[1]!.stdout_path), "utf8")).toBe("second");
+  });
+
+  it("pre-authorizes a command-produced browser report and adopts it on resume", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-verification-"));
+    const priorReportPath = "verification/issue-2/attempt-29/browser-evidence.json";
+    const check: BrowserCheckSpec = {
+      name: "desktop",
+      url: "http://127.0.0.1:4173/",
+      local_server_command: "npx vite preview --host 127.0.0.1 --port 4173",
+      required_selectors: ["#app"],
+      console_error_policy: "no_errors",
+      expected_network: [],
+      screenshot_artifact: "artifacts/desktop.png",
+    };
+    const input = {
+      repoRoot: process.cwd(),
+      runDir,
+      identity: { scope: "local" as const, work_item_id: "browser-proof" },
+      attempt: 1,
+      commands: [[process.execPath, "first"], [process.execPath, "second"]],
+      expectedArtifacts: [priorReportPath],
+      browserChecks: [check],
+    };
+    await mkdir(join(runDir, "verification/issue-2/attempt-29"), { recursive: true });
+    await writeFile(join(runDir, priorReportPath), `${JSON.stringify({
+      generated_at: "2026-07-20T00:00:00.000Z",
+      status: "failed",
+      reports: [{
+        check_name: check.name,
+        url: check.url,
+        status: "failed",
+        observed_selectors: [],
+        missing_selectors: check.required_selectors,
+        console_errors: [],
+        expected_network: [],
+        observed_network: [],
+        screenshot_artifact: check.screenshot_artifact,
+        console_error_policy: check.console_error_policy,
+        failure_reasons: ["stale report"],
+        skipped_reason: null,
+      }],
+    })}\n`);
+    mockedRunCommand.mockImplementationOnce(async (command) => {
+      const reportPath = command.env?.BRAIN_HANDS_BROWSER_EVIDENCE_REPORT;
+      if (!reportPath) throw new Error("browser report path missing");
+      await writeFile(reportPath, `${JSON.stringify({
+        generated_at: "2026-07-21T00:00:00.000Z",
+        status: "passed",
+        reports: [{
+          check_name: check.name,
+          url: check.url,
+          status: "passed",
+          observed_selectors: check.required_selectors,
+          missing_selectors: [],
+          console_errors: [],
+          expected_network: [],
+          observed_network: [],
+          screenshot_artifact: check.screenshot_artifact,
+          console_error_policy: check.console_error_policy,
+          failure_reasons: [],
+          skipped_reason: null,
+        }],
+      })}\n`);
+      return { command: process.execPath, args: ["first"], exitCode: 0, stdout: "first", stderr: "", failed: false, timedOut: false };
+    }).mockRejectedValueOnce(new Error("controller interrupted"));
+
+    await expect(runVerification(input)).rejects.toThrow("controller interrupted");
+    mockedRunCommand.mockClear();
+    mockedRunCommand.mockResolvedValueOnce({
+      command: process.execPath, args: ["second"], exitCode: 0, stdout: "second", stderr: "", failed: false, timedOut: false,
+    });
+
+    const resumed = await runVerification({ ...input, resumeExistingNamespace: true });
+
+    expect(mockedRunCommand).toHaveBeenCalledTimes(1);
+    expect(resumed.commands).toHaveLength(2);
+    expect(resumed.browser_evidence[0]?.evidence_report_path)
+      .toBe("verification/local/YnJvd3Nlci1wcm9vZg/attempt-1/browser-evidence.json");
+
+    mockedRunCommand.mockClear();
+    const replayed = await runVerification({ ...input, resumeExistingNamespace: true });
+    expect(mockedRunCommand).not.toHaveBeenCalled();
+    expect(replayed).toEqual(resumed);
   });
 
   it("rejects undeclared artifacts in an in-progress durable namespace before running commands", async () => {
@@ -853,6 +999,62 @@ describe("runVerification", () => {
         screenshot_artifact: "verification/issue-24/attempt-1/reports/desktop.png",
         evidence_report_path: "verification/issue-24/attempt-1/reports/browser-evidence.json",
       });
+    } finally {
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("records schema diagnostics for an invalid normalized browser evidence bundle", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-verification-"));
+    const repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-repo-"));
+    await mkdir(join(repoRoot, "reports"), { recursive: true });
+    await writeFile(join(repoRoot, "reports/desktop.png"), "png\n", "utf8");
+    await writeFile(
+      join(repoRoot, "reports/browser-evidence.json"),
+      `${JSON.stringify({
+        generated_at: "2026-07-08T12:00:00.000Z",
+        status: "successful",
+        reports: [{
+          check_name: "desktop smoke",
+          url: "http://127.0.0.1:5177/app.html",
+          status: "successful",
+          observed_selectors: ["#app"],
+          missing_selectors: [],
+          console_errors: [],
+          expected_network: [],
+          observed_network: [],
+          screenshot_artifact: "reports/desktop.png",
+          console_error_policy: "no_errors",
+          horizontal_overflow: { passed: true },
+        }],
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    try {
+      const evidence = await runVerification({
+        repoRoot,
+        runDir,
+        identity: githubIdentity(35),
+        commands: [[process.execPath, "-e", "process.stdout.write('verified')"]],
+        expectedArtifacts: ["reports/browser-evidence.json"],
+        browserChecks: [{
+          name: "desktop smoke",
+          url: "http://127.0.0.1:5177/app.html",
+          local_server_command: "python3 -m http.server 5177 --bind 127.0.0.1",
+          required_selectors: ["#app"],
+          console_error_policy: "no_errors",
+          expected_network: [],
+          screenshot_artifact: "reports/desktop.png",
+        }],
+      });
+
+      expect(evidence.browser_evidence[0]).toMatchObject({
+        status: "failed",
+        evidence_report_path: "verification/issue-35/attempt-1/reports/browser-evidence.json",
+        skipped_reason: "No valid browser evidence report matched this check.",
+      });
+      expect(evidence.browser_evidence[0]?.failure_reasons.join(" ")).toMatch(/status.*Invalid option/i);
     } finally {
       await rm(repoRoot, { recursive: true, force: true });
     }

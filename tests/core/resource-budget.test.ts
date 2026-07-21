@@ -5,6 +5,7 @@ import {
   resourceBudgetClaimV1Schema,
   resourceBudgetCompletionV1Schema,
   resourceBudgetPolicyV1Schema,
+  resourceBudgetReconciliationV1Schema,
   type ResourceBudgetClaimV1,
   type ResourceBudgetCompletionV1,
 } from "../../src/core/resource-budget.js";
@@ -170,6 +171,36 @@ describe("reduceResourceBudgetArtifacts", () => {
       processUnknown.claim_id,
       openUnknown.claim_id,
     ]);
+  });
+
+  it("reconciles an evidenced failed pre-turn provider rejection only as zero usage", () => {
+    const model = claim("model_invocation", "a");
+    const rejected = completion(model, {
+      outcome: "failed",
+      process_started: true,
+      turn_started: false,
+      structured_terminal_error: false,
+      token_usage: null,
+    });
+    const zero = resourceBudgetReconciliationV1Schema.parse({
+      schema_version: 1,
+      claim_id: model.claim_id,
+      reconciled_at: "2026-07-16T12:00:02.000Z",
+      actor: "operator@example.test",
+      reason: "Provider rejected the request before starting a model turn.",
+      evidence_refs: ["responses/provider-rejection.stderr.txt"],
+      token_usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 },
+    });
+
+    expect(reduceResourceBudgetArtifacts(policy, [model], [rejected], [zero])).toMatchObject({
+      token_accounting: "known",
+      uncertain_model_claim_ids: [],
+      total_tokens: 0,
+    });
+    expect(() => reduceResourceBudgetArtifacts(policy, [model], [rejected], [{
+      ...zero,
+      token_usage: { ...zero.token_usage, input_tokens: 1 },
+    }])).toThrow(/pre-turn.*zero/i);
   });
 
   it("reduces uncertain claim identities in canonical order", () => {

@@ -16,6 +16,8 @@ Keep the packet ID graph exact and globally unique: every
 `verification.commands[].id` or `verification.required_evidence[].id`, with at least one such
 command/evidence ID per condition. For artifact proof, reference the required-evidence `id` from
 `satisfied_by`, not its `source_id` or the target artifact ID.
+Every `required_evidence[].output_path` and diagnosis evidence reference must be a safe normalized
+repository/run-relative path. Never use `/tmp`, `/private/tmp`, another absolute path, or `..`.
 
 ## Original remediation
 {{remediation_json}}

@@ -107,10 +107,8 @@ export async function currentWorkItemVerificationAuthority(
   const ref = artifactRefFromBytes(progress.verification_path, bytes);
   const evidence = await validateVerificationContextSource(runDir, ref, identity);
   const qualityGateIdentity = identity.scope === "local" && identity.work_item_id.startsWith(`${workItemId}:quality-gate:`);
-  if (
-    (!qualityGateIdentity && evidence.attempt !== progress.attempts)
-    || (expectedAttempt !== undefined && evidence.attempt !== expectedAttempt)
-  ) {
+  const authoritativeAttempt = expectedAttempt ?? progress.attempts;
+  if (!qualityGateIdentity && evidence.attempt !== authoritativeAttempt) {
     throw new Error(`Current verification authority does not match ${workItemId} attempt ${expectedAttempt ?? progress.attempts}`);
   }
   return { ref, identity };

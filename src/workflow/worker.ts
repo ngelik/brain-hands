@@ -23,6 +23,7 @@ import { readOptionalValidatedArtifact } from "../core/ledger.js";
 import type { ArtifactRefV1, HandsContextV1 } from "../core/context-contracts.js";
 import { validateHandsInvocationContext } from "./role-context.js";
 import { invocationArtifactName } from "./invocation-artifacts.js";
+import { compactModelDiff } from "./model-diff.js";
 
 const legacyHandsWorkItemTemplate = `# Hands: implement one approved work item
 
@@ -91,6 +92,7 @@ command outcome only in \`commands_attempted\`. For \`implemented\`, return exac
 \`unresolved_requirements: []\` and \`blocker: null\`; never copy a verification-command failure
 into \`blocker\`. The controller independently verifies the change.
 Echo this controller-owned packet hash exactly as \`packet_sha256\`: {{fix_packet_sha256}}
+Echo this controller-owned packet attempt exactly as \`action_attempt\`: {{action_attempt}}
 In \`commands_attempted\`, report only commands whose \`command_id\` and exact \`argv\` appear in
 the packet's \`verification.commands\`. Do not invent packet command IDs or report auxiliary commands.
 
@@ -140,6 +142,22 @@ const persistedFixPacketInvocationClaimSchema = z.union([
   fixPacketInvocationClaimSchema,
   legacyFixPacketInvocationClaimSchema,
 ]);
+
+function fixPacketResultOutputSchema(
+  packetId: string,
+  packetSha256: string,
+  actionAttempt: number,
+) {
+  return {
+    ...fixPacketResultV1OutputSchema,
+    properties: {
+      ...fixPacketResultV1OutputSchema.properties,
+      packet_id: { type: "string", enum: [packetId] },
+      packet_sha256: { type: "string", enum: [packetSha256] },
+      action_attempt: { type: "integer", enum: [actionAttempt] },
+    },
+  } as const;
+}
 
 export type HandsFixPacketInvocationProfile = {
   kind: HandsProfileKind;
@@ -452,10 +470,12 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
     }
   }
   const root = `${reviewFixPacketRoot(packet.provenance.packet_id)}/attempts/${input.actionAttempt}`;
-  const reportPath = `${root}/hands-result.json`;
+  const primaryReportPath = `${root}/hands-result.json`;
+  let reportPath = primaryReportPath;
   const claimPath = `${root}/hands-invocation-claim.json`;
-  const existingResult = await readOptionalValidatedArtifact(input.runDir, reportPath, fixPacketResultV1Schema);
-  if (existingResult) {
+  const existingResult = await readOptionalValidatedArtifact(input.runDir, primaryReportPath, fixPacketResultV1Schema);
+  const retryOperationalBlock = existingResult?.status === "operationally_blocked" && input.recoverStartedInvocation === true;
+  if (existingResult && !retryOperationalBlock) {
     if (existingResult.packet_id !== packet.provenance.packet_id || existingResult.packet_sha256 !== packetSha256 || existingResult.action_attempt !== input.actionAttempt) {
       throw new Error("Persisted Hands fix packet result provenance does not match the active packet");
     }
@@ -466,6 +486,19 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
       invocation: {} as never,
       profile: await readHandsFixPacketInvocationProfile(input.runDir, input.packet, input.actionAttempt),
     };
+  }
+  if (retryOperationalBlock) {
+    reportPath = `${root}/hands-result-recovery.json`;
+    const recoveredResult = await readOptionalValidatedArtifact(input.runDir, reportPath, fixPacketResultV1Schema);
+    if (recoveredResult) {
+      assertFixPacketResultMatchesPacket(input.packet, recoveredResult);
+      return {
+        result: recoveredResult,
+        reportPath,
+        invocation: {} as never,
+        profile: await readHandsFixPacketInvocationProfile(input.runDir, input.packet, input.actionAttempt),
+      };
+    }
   }
   const existingClaim = await readOptionalValidatedArtifact(input.runDir, claimPath, fixPacketInvocationClaimSchema);
   const profile = input.profile ?? input.intake.roles.hands;
@@ -489,21 +522,28 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
           context: boundedContext.context,
           fix_packet: packet,
           fix_packet_sha256: packetSha256,
+          action_attempt: input.actionAttempt,
           retry_supplement: supplement,
         }, null, 2),
       })
     : renderTemplate(template, {
         fix_packet_json: JSON.stringify(packet, null, 2), work_item_json: JSON.stringify(workItem, null, 2),
         source_context_json: JSON.stringify(input.relevantSourceContext, null, 2), evidence_context_json: JSON.stringify(input.evidenceContext, null, 2),
-        completed_dependencies_json: JSON.stringify(input.completedDependencies, null, 2), current_diff: input.currentDiff,
+        completed_dependencies_json: JSON.stringify(input.completedDependencies, null, 2), current_diff: compactModelDiff(input.currentDiff),
         supplement_json: JSON.stringify(supplement, null, 2), fix_packet_sha256: packetSha256,
+        action_attempt: String(input.actionAttempt),
       });
   const baseArtifactName = `hands-fix-packet-${artifactId(packet.provenance.packet_id)}-attempt-${input.actionAttempt}`;
   const artifactName = existingClaim
     ? await invocationArtifactName(input.runDir, baseArtifactName)
     : baseArtifactName;
   await writeTextArtifact(input.runDir, `prompts/${artifactName}.md`, prompt);
-  await writeTextArtifact(input.runDir, `schemas/${artifactName}.json`, `${JSON.stringify(fixPacketResultV1OutputSchema, null, 2)}\n`);
+  const outputSchema = fixPacketResultOutputSchema(
+    packet.provenance.packet_id,
+    packetSha256,
+    input.actionAttempt,
+  );
+  await writeTextArtifact(input.runDir, `schemas/${artifactName}.json`, `${JSON.stringify(outputSchema, null, 2)}\n`);
   if (!existingClaim) {
     await writeCreateOnceValidated(input.runDir, claimPath, {
       packet_id: packet.provenance.packet_id, packet_sha256: packetSha256,
@@ -513,7 +553,7 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
   }
   const invocation = await input.codex.invoke({
     role: "hands", model: profile.model, reasoningEffort: profile.reasoning_effort, sandbox: "workspace-write", cwd: input.worktreePath,
-    prompt, runDir: input.runDir, artifactName, outputSchema: fixPacketResultV1OutputSchema, outputParser: fixPacketResultV1Schema,
+    prompt, runDir: input.runDir, artifactName, outputSchema, outputParser: fixPacketResultV1Schema,
     budget: input.budget,
     attemptKey: boundedContext === null
       ? undefined

@@ -7,6 +7,7 @@ import type {
   WorkItem,
   WorkItemProgress,
 } from "../core/types.js";
+import { compactModelDiff } from "./model-diff.js";
 
 export type HandsRecoveryAction =
   | { kind: "approve" }
@@ -71,7 +72,7 @@ export function buildHandsRecoveryPacket(input: {
     "# Independent recovery diagnosis",
     "\n## Approved criteria\n", JSON.stringify(input.workItem.acceptance),
     "\n## Excluded scope\n", JSON.stringify(input.workItem.forbidden_changes),
-    "\n## Current diff\n", input.currentDiff.slice(0, 24_000),
+    "\n## Current diff\n", compactModelDiff(input.currentDiff, 24_000),
     "\n## Unresolved findings\n", JSON.stringify(input.latestFindings),
     "\n## Prior attempts\n", JSON.stringify(input.attempts),
     "\n## Verification artifacts\n", JSON.stringify(input.verificationPaths),

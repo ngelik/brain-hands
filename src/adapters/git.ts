@@ -833,6 +833,20 @@ export async function getWorktreeChangedFiles(repoRoot: string): Promise<string[
   )];
 }
 
+/** Restore only tracked paths that an isolated run worktree inherited from a rejected attempt. */
+export async function restoreTrackedWorktreeFiles(repoRoot: string, paths: readonly string[]): Promise<string[]> {
+  const requested = [...new Set(paths)];
+  for (const path of requested) validateContractPath(path);
+  if (requested.length === 0) return [];
+  const listed = await git(repoRoot, ["ls-files", "-z", "--", ...requested]);
+  if (listed.exitCode !== 0) throw commandFailureError(listed, "Failed to identify tracked rejected-attempt files");
+  const tracked = listed.stdout.split("\0").filter((path) => path.length > 0);
+  if (tracked.length === 0) return [];
+  const restored = await git(repoRoot, ["restore", "--source=HEAD", "--worktree", "--", ...tracked]);
+  if (restored.exitCode !== 0) throw commandFailureError(restored, "Failed to restore tracked rejected-attempt files");
+  return tracked;
+}
+
 function validateContractPath(path: string): void {
   const segments = path.split("/");
   if (

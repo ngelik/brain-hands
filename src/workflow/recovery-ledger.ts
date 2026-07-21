@@ -622,6 +622,15 @@ function diagnosticSubjectId(scopeId: string): string {
   return scopeId;
 }
 
+function isCurrentDiagnosticBinding(
+  manifest: RunManifestV2,
+  scopeId: string,
+  diagnosticPath: string,
+): boolean {
+  return manifest.recovery.active_scope === scopeId
+    && manifest.recovery.scopes[scopeId]?.diagnostic_path === diagnosticPath;
+}
+
 export function recoveryReviewScopeSubject(
   scopeId: string,
   phase: ReviewPhase,
@@ -933,7 +942,6 @@ async function scanDiagnosticDirectory(input: {
   const manifest = runManifestV2Schema.parse(JSON.parse(
     (await readOwnedRunFile(input.runDir, "manifest.json")).toString("utf8"),
   )) as RunManifestV2;
-  const repairedSequences = new Set<number>();
   for (let index = 0; index < input.decisions.length; index += 1) {
     const decision = input.decisions[index];
     const terminal = decision.guard_action === "diagnostic_stop" || decision.guard_action === "exhausted_stop";
@@ -943,19 +951,13 @@ async function scanDiagnosticDirectory(input: {
       throw new Error("Terminal recovery decision is missing its exact diagnostic intent");
     }
     const diagnosticPath = recoveryDiagnosticPath(decision.scope_id, decision.sequence);
-    const existing = await readOptionalValidatedArtifact(
-      input.runDir,
-      diagnosticPath,
-      diagnosticRecoveryArtifactV1Schema,
-    );
     await validateDiagnosticAuthority(
       input.runDir,
       manifest,
       intent,
-      existing === null || manifest.recovery.active_scope === decision.scope_id,
+      isCurrentDiagnosticBinding(manifest, decision.scope_id, diagnosticPath),
     );
     await writeDiagnosticRecoveryArtifact({ runDir: input.runDir, artifact: intent });
-    if (existing === null) repairedSequences.add(decision.sequence);
   }
   const identity = await captureDirectory(
     input.directoryPath,
@@ -1053,7 +1055,7 @@ async function scanDiagnosticDirectory(input: {
       input.runDir,
       manifest,
       artifact,
-      repairedSequences.has(sequence) || manifest.recovery.active_scope === artifact.scope_id,
+      isCurrentDiagnosticBinding(manifest, artifact.scope_id, relativePath),
     );
     fileSnapshots.push({ diagnostic: captured.snapshot, evidence: evidenceSnapshots });
   }

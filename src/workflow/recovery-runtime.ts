@@ -470,6 +470,55 @@ export async function gateOperationalRecoveryAttempt(input: {
   let manifest = await readManifestV2(input.runDir);
   await ensureRecoveryRoot(input.runDir, manifest);
   manifest = await reconcileRecoveryJournal(input.runDir);
+  const scopeBeforeGate = Object.prototype.hasOwnProperty.call(manifest.recovery.scopes, input.scopeId)
+    ? manifest.recovery.scopes[input.scopeId]
+    : undefined;
+  if (scopeBeforeGate?.authorization_path) {
+    const pendingAuthorization = diagnosticRecoveryAuthorizationV1Schema.parse(JSON.parse(
+      (await readOwnedRunFile(input.runDir, scopeBeforeGate.authorization_path)).toString("utf8"),
+    ));
+    const consumption = await readOwnedRunFile(
+      input.runDir,
+      diagnosticRecoveryConsumptionPath(input.scopeId, pendingAuthorization.authorization_id),
+    ).then((bytes) => diagnosticRecoveryConsumptionV1Schema.parse(JSON.parse(bytes.toString("utf8"))))
+      .catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      });
+    if (consumption !== null && pendingAuthorization.progress_subject_sha256 !== progress.sha256) {
+      const authorizedDecision = recoveryDecisionArtifactV1Schema.parse(JSON.parse(
+        (await readOwnedRunFile(input.runDir, pendingAuthorization.decision_path)).toString("utf8"),
+      ));
+      const authorizedFindingIds = canonicalFindingIds(authorizedDecision.observation.finding_ids);
+      const authorizedProgressSubject = recoveryProgressSubjectV1Schema.parse({
+        ...progress.subject,
+        finding_ids: authorizedFindingIds,
+      }) as RecoveryProgressSubjectV1;
+      await recordAuthorizedRecoveryOutcome({
+        runDir: input.runDir,
+        scopeId: input.scopeId,
+        operation: authorizedDecision.observation.operation,
+        authorizationId: pendingAuthorization.authorization_id,
+        effectAttemptId: consumption.effect_attempt_id,
+        outcome: {
+          kind: "success",
+          requestedEffect: authorizedDecision.requested_effect,
+          requestedEffectReason: authorizedDecision.requested_effect_reason,
+          findingIds: authorizedFindingIds,
+          classification: {
+            failure_class: authorizedDecision.observation.failure_class,
+            blocker_code: authorizedDecision.observation.blocker_code,
+          },
+        },
+        progress: {
+          subject: authorizedProgressSubject,
+          sha256: progressSubjectSha256(authorizedProgressSubject),
+        },
+        observationStage: authorizedDecision.observation.stage,
+      });
+      manifest = await readManifestV2(input.runDir);
+    }
+  }
   const authorization = await activeAuthorization(
     input.runDir,
     manifest,
@@ -627,6 +676,7 @@ export async function recordAuthorizedRecoveryOutcome(input: {
     error?: unknown;
   };
   progress: BuiltRecoveryProgress;
+  observationStage?: RunManifestV2["stage"];
   ownedEvidenceRefs?: Partial<RecoveryOwnedEvidenceRefs>;
   hooks?: RecoveryRuntimeHooks;
 }): Promise<RecoveryRuntimeResult & { recovery_decision: RecoveryDecisionArtifactV1 }> {
@@ -703,7 +753,7 @@ export async function recordAuthorizedRecoveryOutcome(input: {
   const recovery = await recordRecoveryObservation({
     runDir: input.runDir,
     observation: observation({
-      manifest,
+      manifest: input.observationStage === undefined ? manifest : { ...manifest, stage: input.observationStage },
       scopeId: input.scopeId,
       operation: input.operation,
       failureClass: classification.failure_class,

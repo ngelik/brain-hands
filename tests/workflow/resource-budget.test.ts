@@ -13,7 +13,9 @@ import { createRunLedgerV2, readManifestV2, updateManifestV2 } from "../../src/c
 import { createLegacyRunLedgerV2 } from "../fixtures/legacy-run.js";
 import {
   initializeResourceBudgetPolicy,
+  extendResourceBudget,
   openResourceBudget,
+  readEffectiveResourceBudgetPolicy,
   reconcileInterruptedResourceBudgetModelInvocation,
   reconcileResourceBudgetModelInvocation,
 } from "../../src/workflow/resource-budget.js";
@@ -51,6 +53,69 @@ function completion(
 }
 
 describe("resource budget controller", () => {
+  it("extends an exhausted token budget append-only with owned evidence", async () => {
+    const policy = { ...DEFAULT_RESOURCE_BUDGET_V1, max_total_tokens: 10 };
+    const { runDir } = await boundedRun(policy);
+    await initializeResourceBudgetPolicy(runDir, policy);
+    const budget = await openResourceBudget(runDir);
+    const claim = await budget.claim({ kind: "model_invocation", key: "large", elapsed_reservation_ms: 1_000 });
+    await budget.complete(completion(claim.claim_id, {
+      token_usage: { input_tokens: 15, cached_input_tokens: 10, output_tokens: 5, reasoning_output_tokens: 1 },
+    }));
+    await expect(budget.claim({ kind: "model_invocation", key: "blocked", elapsed_reservation_ms: 100 }))
+      .rejects.toThrow(/total_tokens/i);
+    await writeFile(join(runDir, "responses", "operator-evidence.txt"), "approved extension\n", "utf8");
+
+    const extension = await extendResourceBudget({
+      runDir,
+      actor: "operator@example.test",
+      reason: "Continue after an approved external recovery.",
+      evidenceRefs: ["responses/operator-evidence.txt"],
+      policy: { ...policy, max_total_tokens: 100 },
+    });
+
+    expect(extension.previous_policy.max_total_tokens).toBe(10);
+    expect(extension.policy.max_total_tokens).toBe(100);
+    await expect(budget.claim({ kind: "model_invocation", key: "unblocked", elapsed_reservation_ms: 100 }))
+      .resolves.toMatchObject({ key: "unblocked" });
+    expect((await readManifestV2(runDir)).resource_budget_policy).toEqual(policy);
+    await expect(extendResourceBudget({
+      runDir,
+      actor: "operator@example.test",
+      reason: "Invalid reduction.",
+      evidenceRefs: ["responses/operator-evidence.txt"],
+      policy: { ...policy, max_total_tokens: 50 },
+    })).rejects.toThrow(/cannot reduce/i);
+  });
+
+  it("extends non-token resource dimensions through the same append-only policy chain", async () => {
+    const policy = { ...DEFAULT_RESOURCE_BUDGET_V1, max_workflow_attempts: 2 };
+    const { runDir } = await boundedRun(policy);
+    await initializeResourceBudgetPolicy(runDir, policy);
+    await writeFile(join(runDir, "responses", "operator-evidence.txt"), "approved extension\n", "utf8");
+
+    const extension = await extendResourceBudget({
+      runDir,
+      actor: "operator@example.test",
+      reason: "Continue the approved workflow after controller recovery.",
+      evidenceRefs: ["responses/operator-evidence.txt"],
+      policy: {
+        ...policy,
+        max_workflow_attempts: 8,
+        max_model_invocations: policy.max_model_invocations + 10,
+      },
+    });
+
+    expect(extension.previous_policy.max_workflow_attempts).toBe(2);
+    expect(extension.policy).toMatchObject({
+      max_workflow_attempts: 8,
+      max_model_invocations: policy.max_model_invocations + 10,
+    });
+    await expect(readEffectiveResourceBudgetPolicy(runDir)).resolves.toMatchObject({
+      max_workflow_attempts: 8,
+      max_model_invocations: policy.max_model_invocations + 10,
+    });
+  });
   it("initializes policy once and stores the identical bounded manifest snapshot", async () => {
     const { runDir, policy } = await boundedRun();
 
@@ -262,6 +327,43 @@ describe("resource budget controller", () => {
     expect(await budget.usage()).toMatchObject({
       active_elapsed_ms: 300,
       total_tokens: 1_200,
+      token_accounting: "known",
+      uncertain_model_claim_ids: [],
+    });
+  });
+
+  it("reconciles measured usage for a successful invocation with additive telemetry", async () => {
+    const { runDir, policy } = await boundedRun();
+    await initializeResourceBudgetPolicy(runDir, policy);
+    const budget = await openResourceBudget(runDir);
+    const claim = await budget.claim({ kind: "model_invocation", key: "brain:successful", elapsed_reservation_ms: 1_200 });
+    await budget.complete(completion(claim.claim_id, {
+      outcome: "succeeded",
+      duration_ms: 300,
+      process_started: true,
+      turn_started: true,
+      structured_terminal_error: false,
+      token_usage: null,
+    }));
+    await writeFile(
+      join(runDir, "responses", "successful.stdout.txt"),
+      '{"type":"turn.completed","usage":{"input_tokens":80132,"cached_input_tokens":54528,"cache_write_input_tokens":0,"output_tokens":4971,"reasoning_output_tokens":1664}}\n',
+      "utf8",
+    );
+
+    await reconcileResourceBudgetModelInvocation({
+      runDir,
+      claimId: claim.claim_id,
+      actor: "operator@example.test",
+      reason: "Charge the exact terminal usage preserved by Codex.",
+      evidenceRefs: ["responses/successful.stdout.txt"],
+      tokenUsage: { input_tokens: 80132, cached_input_tokens: 54528, output_tokens: 4971, reasoning_output_tokens: 1664 },
+    });
+
+    expect(await budget.usage()).toMatchObject({
+      total_tokens: 85103,
+      cached_input_tokens: 54528,
+      reasoning_output_tokens: 1664,
       token_accounting: "known",
       uncertain_model_claim_ids: [],
     });

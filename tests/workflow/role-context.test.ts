@@ -24,6 +24,7 @@ import {
 } from "../../src/core/ledger.js";
 import {
   assuranceAssessmentSchema,
+  executionSpecV2Schema,
   implementationResultSchema,
   persistedVerifierReviewSchema,
   verificationBrowserEvidenceSchema,
@@ -633,11 +634,16 @@ describe("bounded role contexts", () => {
     }))).resolves.toBeDefined();
     const overItem = item("BH-001", [], "x".repeat(padding + 2));
     const overRun = await runDir([overItem]);
-    await expect(buildHandsContext(handsInput(overRun, {
+    const overRef = await buildHandsContext(handsInput(overRun, {
       attempt: 4,
       workItem: overItem,
       diff: "",
-    }))).rejects.toThrow("Hands required context exceeds 65536 UTF-8 bytes");
+    }));
+    const overContext = await loadRoleContext(overRun, overRef, "hands");
+    expect(executionSpecV2Schema.parse(overContext.work_item).objective)
+      .toContain("Earlier approved objective history summarized");
+    expect(canonicalJsonBytes(handsContextV1Schema, overContext).byteLength)
+      .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
   });
 
   it("summarizes an oversized generated lockfile section while preserving adjacent source patches", () => {
@@ -737,7 +743,92 @@ describe("bounded role contexts", () => {
     expect(JSON.stringify(context)).not.toContain("é".repeat(100));
   });
 
-  it("rejects stale current verification authority and checks required size first", async () => {
+  it("compacts the diff when required omission references consume the remaining role budget", async () => {
+    const diff = "diff --git a/src/app.ts b/src/app.ts\n" + "y".repeat(7_000);
+    const seedItem = item("BH-001");
+    const seedRun = await runDir([seedItem]);
+    await setVerificationAuthority(seedRun, "BH-001", 1, {
+      commands: [{ command: "é".repeat(9_000) }],
+    });
+    const seedRef = await buildHandsContext(handsInput(seedRun, { workItem: seedItem, diff }));
+    const seedContext = await loadRoleContext(seedRun, seedRef, "hands");
+    const padding = CONTEXT_LIMITS_V1.hands_total_bytes
+      - canonicalJsonBytes(handsContextV1Schema, seedContext).byteLength
+      + 1;
+    const largeItem = item("BH-001", [], `${seedItem.objective}${"x".repeat(padding)}`);
+    const run = await runDir([largeItem]);
+    await setVerificationAuthority(run, "BH-001", 1, {
+      commands: [{ command: "é".repeat(9_000) }],
+    });
+    const ref = await buildHandsContext(handsInput(run, {
+      workItem: largeItem,
+      diff,
+    }));
+    const context = await loadRoleContext(run, ref, "hands");
+    expect(context.diff).toContain("Source diff summarized to preserve bounded role context");
+    expect(context.bounded_evidence).toEqual([]);
+    expect(context.omitted_evidence).toHaveLength(1);
+    expect(canonicalJsonBytes(handsContextV1Schema, context).byteLength)
+      .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
+  });
+
+  it("compacts oversized required work-item prose before sacrificing the Hands diff", async () => {
+    const largeItem = {
+      ...item("BH-001"),
+      risks: [{
+        description: `Risk authority ${"r".repeat(45_000)}`,
+        mitigation: "Keep the bounded context authoritative.",
+      }],
+    };
+    const run = await runDir([largeItem]);
+    const diff = [
+      "diff --git a/src/app.ts b/src/app.ts",
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "@@ -0,0 +1 @@",
+      `+${"d".repeat(CONTEXT_LIMITS_V1.hands_diff_bytes - 256)}`,
+      "",
+    ].join("\n");
+
+    const ref = await buildHandsContext(handsInput(run, { workItem: largeItem, diff }));
+    const context = await loadRoleContext(run, ref, "hands");
+
+    expect(executionSpecV2Schema.parse(context.work_item).risks[0]!.description)
+      .toContain("sha256=");
+    expect(context.diff).toContain("diff --git a/src/app.ts b/src/app.ts");
+    expect(canonicalJsonBytes(handsContextV1Schema, context).byteLength)
+      .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
+  });
+
+  it("compacts oversized integrated work-item prose before rejecting required Hands context", async () => {
+    const prose = "scope detail ".repeat(1_000);
+    const largeItem = {
+      ...item("BH-001"),
+      file_contract: [{ path: "src/app.ts", permission: "modify" as const, targets: [prose] }],
+      forbidden_changes: [{ path: "package.json", except: [], reason: prose }],
+      change_units: [{
+        id: "CU1", path: "src/app.ts", target: prose, operation: "modify" as const,
+        requirements: [prose],
+      }],
+      acceptance: [{ id: "AC1", statement: prose, satisfied_by: ["CU1"] }],
+      tests: [{ id: "T1", path: "src/app.test.ts", assertion: prose, verification_command_ids: ["V1"] }],
+      risks: [{ description: prose, mitigation: prose }],
+      ambiguity_policy: { default: "stop_and_report" as const, stop_when: [prose] },
+      completion_contract: {
+        expected_changed_files: ["src/app.ts"], allow_additional_files: false, required_acceptance_ids: ["AC1"],
+      },
+    };
+    const run = await runDir([largeItem]);
+    const ref = await buildHandsContext(handsInput(run, { workItem: largeItem }));
+    const context = await loadRoleContext(run, ref, "hands");
+
+    expect(executionSpecV2Schema.parse(context.work_item).acceptance[0]!.statement)
+      .toContain("sha256=");
+    expect(canonicalJsonBytes(handsContextV1Schema, context).byteLength)
+      .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
+  });
+
+  it("rejects stale current verification authority and compacts oversized approved objectives", async () => {
     const run = await runDir();
     await setVerificationAuthority(run, "BH-001", 1, { commands: [{ command: "current" }] });
     const ref = await buildHandsContext(handsInput(run));
@@ -759,10 +850,13 @@ describe("bounded role contexts", () => {
 
     const hugeItem = item("BH-001", [], "x".repeat(CONTEXT_LIMITS_V1.hands_total_bytes));
     const hugeRun = await runDir([hugeItem]);
-    await expect(buildHandsContext(handsInput(hugeRun, {
+    const hugeRef = await buildHandsContext(handsInput(hugeRun, {
       attempt: 3,
       workItem: hugeItem,
-    }))).rejects.toThrow("Hands required context exceeds 65536 UTF-8 bytes");
+    }));
+    const hugeContext = await loadRoleContext(hugeRun, hugeRef, "hands");
+    expect(executionSpecV2Schema.parse(hugeContext.work_item).objective)
+      .toContain("Earlier approved objective history summarized");
   });
 
   it("requires the exact authoritative summary set for declared Hands dependencies", async () => {

@@ -18,10 +18,12 @@ import {
   artifactPathSchema,
   browserEvidenceBundleSchema,
   browserEvidenceReportSchema,
+  verificationExecutionResultSchema,
   verificationEvidenceSchema,
 } from "../core/schema.js";
 import { validatePersistedVerificationEvidence } from "./evidence.js";
 import type { ResourceBudgetClaimV1, ResourceBudgetPort } from "../core/resource-budget.js";
+import { missingExpectedNetwork } from "../browser/network-pattern.js";
 
 export interface RunVerificationInput {
   repoRoot: string;
@@ -45,6 +47,8 @@ export interface RunVerificationInput {
   budget?: ResourceBudgetPort;
   expectedArtifacts?: string[];
   browserChecks?: BrowserCheckSpec[];
+  /** Exposes the controller lifecycle phase to approved verification commands. */
+  phase?: "work_item" | "pre_pr" | "post_pr";
   progress?: ProgressReporter;
   progressContext?: { workItem: WorkItemCoordinate };
 }
@@ -69,6 +73,7 @@ function persistedCommandErrorMessage(result: { exitCode: number | null; timedOu
 interface LoadedBrowserEvidence {
   path: string;
   reports: BrowserEvidenceReport[];
+  diagnostic?: string;
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -211,7 +216,17 @@ async function loadBrowserEvidenceReports(
     }
 
     const raw = await readFile(absolutePath, "utf8");
-    const parsed = JSON.parse(raw);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      loaded.push({
+        path: artifactPath,
+        reports: [],
+        diagnostic: `Invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      continue;
+    }
     const singleReport = browserEvidenceReportSchema.safeParse(parsed);
     const bundle = browserEvidenceBundleSchema.safeParse(parsed);
     const reports = singleReport.success
@@ -222,7 +237,19 @@ async function loadBrowserEvidenceReports(
 
     if (reports.length > 0) {
       loaded.push({ path: artifactPath, reports });
+      continue;
     }
+
+    const issues = bundle.error?.issues ?? singleReport.error?.issues ?? [];
+    const diagnostic = issues.slice(0, 8).map((issue) => {
+      const path = issue.path.length > 0 ? issue.path.join(".") : "root";
+      return `${path}: ${issue.message}`;
+    }).join("; ");
+    loaded.push({
+      path: artifactPath,
+      reports: [],
+      diagnostic: diagnostic || "Report did not match a supported browser evidence schema.",
+    });
   }
 
   return loaded;
@@ -301,16 +328,23 @@ async function buildBrowserEvidence(
   return Promise.all(
     browserChecks.map(async (check): Promise<BrowserEvidenceEntry> => {
       const match = findBrowserReport(check, loadedEvidence);
+      const invalidEvidence = loadedEvidence.find((evidence) => evidence.diagnostic);
       const screenshotExists = await fileExists(runDir && check.screenshot_artifact.startsWith("verification/")
         ? join(runDir, check.screenshot_artifact)
         : join(repoRoot, check.screenshot_artifact));
       const observedNetwork = match?.report.observed_network ?? [];
       const expectedNetwork = check.expected_network;
-      const missingNetwork = expectedNetwork.filter((entry) => !observedNetwork.includes(entry));
+      const missingNetwork = missingExpectedNetwork(expectedNetwork, observedNetwork);
       const missingSelectors = match?.report.missing_selectors ?? check.required_selectors;
       const consoleErrors = match?.report.console_errors ?? [];
-      const failureReasons = match?.report.failure_reasons ?? [];
-      const skippedReason = match?.report.skipped_reason ?? (match ? null : "No browser evidence report matched this check.");
+      const failureReasons = match?.report.failure_reasons ?? (invalidEvidence
+        ? [`Invalid browser evidence report at ${invalidEvidence.path}: ${invalidEvidence.diagnostic}`]
+        : []);
+      const skippedReason = match?.report.skipped_reason ?? (match
+        ? null
+        : invalidEvidence
+          ? "No valid browser evidence report matched this check."
+          : "No browser evidence report matched this check.");
       const status: BrowserEvidenceEntry["status"] =
         match &&
         match.report.status === "passed" &&
@@ -335,7 +369,7 @@ async function buildBrowserEvidence(
         console_errors: consoleErrors,
         missing_selectors: missingSelectors,
         failure_reasons: failureReasons,
-        evidence_report_path: match?.path ?? null,
+        evidence_report_path: match?.path ?? invalidEvidence?.path ?? null,
         skipped_reason: skippedReason,
       };
     }),
@@ -348,6 +382,45 @@ function verificationBudgetKey(
   commandId: string,
 ): string {
   return `verification:${identity.scope}:${identity.work_item_id}:${attempt}:${commandId}`;
+}
+
+async function loadPersistedCommandResult(input: {
+  runDir: string;
+  command: string;
+  argv: string[];
+  stdoutPath: string;
+  stderrPath: string;
+  resultPath: string;
+}): Promise<VerificationEvidence["commands"][number] | null> {
+  const absolutePaths = [input.stdoutPath, input.stderrPath, input.resultPath]
+    .map((path) => join(input.runDir, path));
+  const present = await Promise.all(absolutePaths.map(fileExists));
+  if (present.every((value) => !value)) return null;
+  if (!present.every(Boolean)) {
+    throw new Error(`Interrupted verification command artifacts are incomplete: ${input.resultPath}`);
+  }
+  const [stdout, stderr, resultRaw] = await Promise.all(absolutePaths.map((path) => readFile(path, "utf8")));
+  const result = verificationExecutionResultSchema.parse(JSON.parse(resultRaw!));
+  if (
+    JSON.stringify(result.argv) !== JSON.stringify(input.argv)
+    || result.stdout !== stdout
+    || result.stderr !== stderr
+  ) {
+    throw new Error(`Interrupted verification command artifacts do not match: ${input.resultPath}`);
+  }
+  return {
+    command: input.command,
+    argv: input.argv,
+    exit_code: result.exit_code,
+    timed_out: result.timed_out,
+    error_code: result.error_code,
+    error_message: result.error_message,
+    signal: result.signal,
+    stdout_path: input.stdoutPath,
+    stderr_path: input.stderrPath,
+    result_path: input.resultPath,
+    duration_ms: result.duration_ms,
+  };
 }
 
 async function claimVerificationCommandBudget(
@@ -395,6 +468,16 @@ export async function runVerification(
   }
   const attempt = input.attempt ?? 1;
   const evidenceDirectory = `${verificationIdentityDirectory(identity)}/attempt-${attempt}`;
+  const scopedBrowserReportPath = `${evidenceDirectory}/browser-evidence.json`;
+  const commandEnvironment: NodeJS.ProcessEnv = {
+    ...process.env,
+    BRAIN_HANDS_VERIFICATION_PHASE: input.phase ?? "work_item",
+    ...(browserChecks.length > 0
+      ? { BRAIN_HANDS_BROWSER_EVIDENCE_REPORT: join(input.runDir, scopedBrowserReportPath) }
+      : {}),
+  };
+  const browserReportExists = browserChecks.length > 0
+    && await fileExists(join(input.runDir, scopedBrowserReportPath));
   if (input.resumeExistingNamespace) {
     try {
       return await validatePersistedVerificationEvidence({
@@ -406,8 +489,16 @@ export async function runVerification(
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
+    if (browserReportExists) {
+      await recordVerificationAttemptArtifacts(input.runDir, identity, attempt, [scopedBrowserReportPath]);
+    }
   }
   await beginVerificationAttempt(input.runDir, identity, attempt);
+  if (browserChecks.length > 0) {
+    // Approved verification commands may write this report at any point. Declare
+    // the exact controller-owned path before a child process can create it.
+    await recordVerificationAttemptArtifacts(input.runDir, identity, attempt, [scopedBrowserReportPath]);
+  }
   const writeArtifact = writeTextArtifact;
 
   for (const [index, command] of input.commands.entries()) {
@@ -432,6 +523,33 @@ export async function runVerification(
 
     const executable = argv[0];
     const args = argv.slice(1);
+    const commandLabel = typeof command === "string" ? command : argv.join(" ");
+    const stdoutRelative = `${evidenceDirectory}/command-${index + 1}.stdout.txt`;
+    const stderrRelative = `${evidenceDirectory}/command-${index + 1}.stderr.txt`;
+    const resultRelative = `${evidenceDirectory}/command-${index + 1}.json`;
+    const persisted = input.resumeExistingNamespace
+      ? await loadPersistedCommandResult({
+          runDir: input.runDir,
+          command: commandLabel,
+          argv,
+          stdoutPath: stdoutRelative,
+          stderrPath: stderrRelative,
+          resultPath: resultRelative,
+        })
+      : null;
+    if (persisted !== null) {
+      commands.push(persisted);
+      await input.progress?.emit({
+        code: persisted.exit_code === 0 && !persisted.timed_out
+          ? "verification_command_passed"
+          : "verification_command_failed",
+        source: "verification",
+        workItem,
+        operation: { index: index + 1, total: input.commands.length, kind: "command", safe_tool: safeToolLabel(executable), duration_ms: persisted.duration_ms },
+      });
+      if (input.stopOnFailure === true && (persisted.exit_code !== 0 || persisted.timed_out)) break;
+      continue;
+    }
     await input.progress?.emit({
       code: "verification_command_started",
       source: "verification",
@@ -445,6 +563,7 @@ export async function runVerification(
       args,
       cwd: input.repoRoot,
       timeoutMs: budgetClaim?.timeoutMs ?? DEFAULT_COMMAND_RESERVATION_MS,
+      env: commandEnvironment,
     });
     const durationMs = Math.max(0, Date.now() - startedAt);
     const persistedErrorMessage = persistedCommandErrorMessage(result);
@@ -454,10 +573,6 @@ export async function runVerification(
       workItem,
       operation: { index: index + 1, total: input.commands.length, kind: "command", safe_tool: safeToolLabel(executable), duration_ms: durationMs },
     });
-
-    const stdoutRelative = `${evidenceDirectory}/command-${index + 1}.stdout.txt`;
-    const stderrRelative = `${evidenceDirectory}/command-${index + 1}.stderr.txt`;
-    const resultRelative = `${evidenceDirectory}/command-${index + 1}.json`;
 
     await recordVerificationAttemptArtifacts(input.runDir, identity, attempt, [
       stdoutRelative,
@@ -495,7 +610,7 @@ export async function runVerification(
     }
 
     commands.push({
-      command: typeof command === "string" ? command : argv.join(" "),
+      command: commandLabel,
       argv,
       exit_code: result.exitCode,
       timed_out: result.timedOut,
@@ -513,7 +628,6 @@ export async function runVerification(
   }
 
   await input.progress?.emit({ code: "artifact_checks_started", source: "verification", workItem });
-  const scopedBrowserReportPath = `${evidenceDirectory}/browser-evidence.json`;
   const stagedBrowserArtifacts = await stageBrowserArtifacts(
     input.repoRoot,
     input.runDir,
@@ -529,7 +643,7 @@ export async function runVerification(
     stagedBrowserArtifacts.has(path) ? `${evidenceDirectory}/${path}` : path
   );
   if (await fileExists(join(input.runDir, scopedBrowserReportPath))) {
-    effectiveExpectedArtifacts.push(scopedBrowserReportPath);
+    effectiveExpectedArtifacts.unshift(scopedBrowserReportPath);
   }
   const artifactChecks = await buildArtifactChecks(input.repoRoot, effectiveExpectedArtifacts, effectiveBrowserChecks, input.runDir);
   if (artifactChecks.length > 0) {

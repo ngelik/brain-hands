@@ -13,12 +13,14 @@ import {
   reduceResourceBudgetArtifacts,
   resourceBudgetClaimV1Schema,
   resourceBudgetCompletionV1Schema,
+  resourceBudgetExtensionV1Schema,
   resourceBudgetPolicyV1Schema,
   resourceBudgetReconciliationV1Schema,
   type ResourceBudgetClaimInput,
   type ResourceBudgetClaimV1,
   type ResourceBudgetCompletionInput,
   type ResourceBudgetCompletionV1,
+  type ResourceBudgetExtensionV1,
   type ResourceBudgetPolicyV1,
   type ResourceBudgetReconciliationV1,
   type ResourceBudgetPort,
@@ -50,6 +52,30 @@ function reconciliationPath(claimId: string): string {
   return `budgets/reconciliations/${artifactSegment(claimId)}.json`;
 }
 
+function extensionPath(extensionId: string): string {
+  return `budgets/extensions/${artifactSegment(extensionId)}.json`;
+}
+
+function extensionIdFor(extension: Omit<ResourceBudgetExtensionV1, "extension_id" | "extended_at">): string {
+  return `budget-extension:${createHash("sha256").update(JSON.stringify(extension)).digest("hex")}`;
+}
+
+function applyBudgetExtensions(
+  original: ResourceBudgetPolicyV1,
+  extensions: readonly ResourceBudgetExtensionV1[],
+): ResourceBudgetPolicyV1 {
+  let current = original;
+  const remaining = [...extensions];
+  while (remaining.length > 0) {
+    const matches = remaining.filter((candidate) => sameJson(candidate.previous_policy, current));
+    if (matches.length !== 1) throw new Error("Resource budget extensions contain a gap, fork, or unrelated policy");
+    const next = matches[0]!;
+    current = next.policy;
+    remaining.splice(remaining.indexOf(next), 1);
+  }
+  return current;
+}
+
 function claimIdFor(runId: string, kind: ResourceBudgetClaimInput["kind"], key: string): string {
   const bytes = canonicalJsonBytes(claimIdentitySchema, { run_id: runId, kind, key });
   return `budget-claim:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -60,6 +86,7 @@ async function readBudgetArtifacts(runDir: string): Promise<{
   claims: ResourceBudgetClaimV1[];
   completions: ResourceBudgetCompletionV1[];
   reconciliations: ResourceBudgetReconciliationV1[];
+  extensions: ResourceBudgetExtensionV1[];
 }> {
   const manifest = await readManifestV2(runDir);
   if (manifest.workflow_protocol !== "bounded-context-v1") {
@@ -82,7 +109,49 @@ async function readBudgetArtifacts(runDir: string): Promise<{
     "budgets/reconciliations",
     resourceBudgetReconciliationV1Schema,
   );
-  return { policy: filePolicy, claims, completions, reconciliations };
+  const extensions = await readArtifactDirectory(
+    runDir,
+    "budgets/extensions",
+    resourceBudgetExtensionV1Schema,
+  );
+  return { policy: applyBudgetExtensions(filePolicy, extensions), claims, completions, reconciliations, extensions };
+}
+
+export async function readEffectiveResourceBudgetPolicy(runDir: string): Promise<ResourceBudgetPolicyV1> {
+  return withRunLedgerTransaction(runDir, async () => (await readBudgetArtifacts(runDir)).policy);
+}
+
+export async function extendResourceBudget(input: {
+  runDir: string;
+  actor: string;
+  reason: string;
+  evidenceRefs: string[];
+  policy: ResourceBudgetPolicyV1;
+}): Promise<ResourceBudgetExtensionV1> {
+  return withRunLedgerTransaction(input.runDir, async () => {
+    const { policy: previousPolicy } = await readBudgetArtifacts(input.runDir);
+    for (const evidenceRef of input.evidenceRefs) await readOwnedRunFile(input.runDir, evidenceRef);
+    const identity = {
+      schema_version: 1 as const,
+      actor: input.actor,
+      reason: input.reason,
+      evidence_refs: input.evidenceRefs,
+      previous_policy: previousPolicy,
+      policy: resourceBudgetPolicyV1Schema.parse(input.policy),
+    };
+    const extension = resourceBudgetExtensionV1Schema.parse({
+      ...identity,
+      extension_id: extensionIdFor(identity),
+      extended_at: new Date().toISOString(),
+    });
+    await writeImmutableValidatedJson(
+      input.runDir,
+      extensionPath(extension.extension_id),
+      resourceBudgetExtensionV1Schema,
+      extension,
+    );
+    return extension;
+  });
 }
 
 async function readArtifactDirectory<T>(

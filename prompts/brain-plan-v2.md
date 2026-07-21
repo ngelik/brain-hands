@@ -67,6 +67,18 @@ Planning requirements:
 - Record those representative fixture paths in representative_fixtures.
 - Do not use npm test, npm run build, or npm run clean as a work-item verification command.
 - Keep browser_checks[].local_server_command within the same verification policy.
+- Pull-request creation and mutation are controller-owned post-integration effects. Do not put PR
+  creation in a work-item objective, instruction, change unit, acceptance criterion, or required
+  work-item state. Repository delivery verifiers must use `BRAIN_HANDS_VERIFICATION_PHASE`: return
+  successfully during `work_item` and `pre_pr`, and perform strict read-only PR checks during `post_pr`.
+- Approved verification commands receive `BRAIN_HANDS_BROWSER_EVIDENCE_REPORT` when browser checks are
+  present. If a check needs interaction beyond initial navigation, require the browser test to write
+  its real observed normalized evidence bundle to that controller-owned absolute path. Both aggregate
+  and report `status` must be exactly `passed`, `failed`, or `skipped`; `horizontal_overflow` is a boolean;
+  and optional `pixel_check` contains non-negative integer `sampled_pixels`, `non_blank_pixels`, and
+  `unique_colors`. Require exact planned check names, screenshot paths, and selector strings. Never put
+  an `env BRAIN_HANDS_BROWSER_EVIDENCE_REPORT=...` wrapper or a fixed report path in command argv; the
+  controller injects the authoritative path.
  - Make file_contract permissions and completion_contract.expected_changed_files exact.
  - Keep repository paths case-insensitively unique. Never target .git or a path below it.
  - Set expected_artifacts and screenshot_artifact as portable repository-relative paths only,

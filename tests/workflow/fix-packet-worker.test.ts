@@ -258,8 +258,15 @@ describe("runHandsFixPacket", () => {
     expect(output.profile).toEqual({ kind: "primary", model: "hands", reasoning_effort: "medium" });
     expect(output.reportPath).toBe(`${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-result.json`);
     expect(codex.calls[0]).toMatchObject({ role: "hands", sandbox: "workspace-write", outputSchema: expect.anything() });
+    const outputSchema = codex.calls[0]!.outputSchema as { properties: Record<string, unknown> };
+    expect(outputSchema.properties).toMatchObject({
+      packet_id: { enum: ["R1-A1"] },
+      packet_sha256: { enum: [hashReviewFixPacket(packet)] },
+      action_attempt: { enum: [1] },
+    });
     const prompt = await readFile(join(ledger.runDir, "prompts/hands-fix-packet-R1-A1-attempt-1.md"), "utf8");
     expect(prompt).toContain('"packet_id": "R1-A1"');
+    expect(prompt).toContain("`action_attempt`: 1");
     expect(prompt).toContain('"path": "src/item-1.ts"');
     expect(prompt).not.toContain("R1-A2");
     expect(JSON.parse(await readFile(join(ledger.runDir, `${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-invocation-claim.json`), "utf8")))
@@ -295,6 +302,7 @@ describe("runHandsFixPacket", () => {
     expect(prompt).toContain(fixture.contextRef.sha256);
     expect(prompt).toContain("COMPLETE_FIX_DIFF_SENTINEL");
     expect(prompt).toContain(`"packet_id": "${fixture.boundedPacket.provenance.packet_id}"`);
+    expect(prompt).toContain('"action_attempt": 1');
     expect(prompt).toContain("must quote one requirement string exactly");
     expect(prompt).toContain("when every change unit is complete, return");
     expect(prompt).toContain("`unresolved_requirements: []` and `blocker: null`");
@@ -774,6 +782,36 @@ describe("runHandsFixPacket", () => {
     expect(recoveryArtifactName).toMatch(/-resume-2$/);
     expect(recoveryPrompt).toContain(hashReviewFixPacket(packet));
     expect(recoveryPrompt).toContain("Do not invent packet command IDs");
+  });
+
+  it("reinvokes an exact operationally blocked packet into a separate immutable recovery result", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-fix-worker-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const blocked = {
+      ...result,
+      status: "operationally_blocked" as const,
+      change_units: result.change_units.map((unit) => ({ ...unit, status: "not_completed" as const, changed_files: [] })),
+      changed_files: [],
+      blocker: { code: "DEPENDENCY_REGISTRY_UNAVAILABLE", message: "Registry unavailable", evidence_refs: [] },
+    };
+    const base = { runDir: ledger.runDir, worktreePath: root, workItem: item, packet, actionAttempt: 1, intake: { ...intake, repo_root: root }, relevantSourceContext: [], evidenceContext: [], completedDependencies: [], currentDiff: "", supplement: null };
+    await runHandsFixPacket({ ...base, codex: new RecordingHands(blocked) });
+    let reinvocations = 0;
+
+    const recovered = await runHandsFixPacket({
+      ...base,
+      recoverStartedInvocation: true,
+      codex: { invoke: async () => {
+        reinvocations += 1;
+        return { text: JSON.stringify(result), parsed: result, exitCode: 0, promptPath: "p", stdoutPath: "o", stderrPath: "e", ...codexMetrics };
+      } },
+    });
+
+    expect(recovered.result.status).toBe("implemented");
+    expect(recovered.reportPath).toMatch(/hands-result-recovery\.json$/);
+    expect(reinvocations).toBe(1);
+    const replayed = await runHandsFixPacket({ ...base, recoverStartedInvocation: true, codex: { invoke: async () => { throw new Error("must not reinvoke"); } } });
+    expect(replayed.result.status).toBe("implemented");
   });
 
   it("resumes a legacy persisted primary claim and result without reinvoking Hands", async () => {

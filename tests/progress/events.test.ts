@@ -49,6 +49,26 @@ describe("safe progress events", () => {
     expect(first.safe_label).toBe("Hands is still running");
   });
 
+  it("renders reviewer-action namespaces as readable progress coordinates", () => {
+    const fix = materializeProgressEvent({
+      code: "work_item_fix",
+      source: "hands",
+      workItem: { index: 5, total: 5, attempt: 28_000_101, final: false },
+    }, 1, "2026-07-11T20:00:00.000Z");
+    const verification = materializeProgressEvent({
+      code: "verification_started",
+      source: "verification",
+      workItem: { index: 5, total: 5, attempt: 28_000_102, final: false },
+    }, 2, "2026-07-11T20:01:00.000Z");
+
+    expect(fix.safe_label).toBe("Work item 5 of 5 - fix review 28, action 1, attempt 1");
+    expect(verification.safe_label).toBe("Verification started - review 28, action 1, attempt 2");
+    expect(safeProgressEventSchema.parse({
+      ...fix,
+      safe_label: "Work item 5 of 5 - fix attempt 28000101",
+    })).toMatchObject({ safe_label: "Work item 5 of 5 - fix attempt 28000101" });
+  });
+
   it("keeps retries in one worker session distinct by model invocation", () => {
     const base = {
       code: "brain_turn_completed" as const,

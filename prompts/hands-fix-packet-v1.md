@@ -14,9 +14,14 @@ command outcome only in `commands_attempted`. For `implemented`, return exactly
 `unresolved_requirements: []` and `blocker: null`; never copy a verification-command failure
 into `blocker`. The controller independently verifies the change.
 Echo `fix_packet_sha256` exactly as `packet_sha256`; do not calculate or infer this controller-owned hash.
+Echo `action_attempt` exactly as the controller-owned `action_attempt` value in the context package.
 In `commands_attempted`, report only commands whose `command_id` and exact `argv` appear in
 `fix_packet.verification.commands`. You may use scoped inspection or remediation commands while
 working, but do not invent packet command IDs or include those auxiliary commands in the result.
+When remediation writes `BRAIN_HANDS_BROWSER_EVIDENCE_REPORT`, aggregate and report `status` must be
+exactly `passed`, `failed`, or `skipped`; `horizontal_overflow` is a boolean; optional `pixel_check`
+contains non-negative integer `sampled_pixels`, `non_blank_pixels`, and `unique_colors`; and check names,
+screenshot paths, and selectors exactly match the approved plan and real browser observations.
 
 ## Controller-owned immutable fix context
 

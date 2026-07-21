@@ -75,11 +75,12 @@ describe("materializeReplanCandidate", () => {
       patch,
       durableCriteria: [{ ref: "BH-005:AC-1", text: "The target behavior is correct." }],
       workflowProtocol: "durable-discovery-v1",
+      materializationVersion: 2,
     });
 
     const target = proposed.work_items[0]!;
     expect(target).toMatchObject({
-      objective: patch.revised_objective,
+      objective: [patch.revised_objective, ...patch.changed_instructions].join("\n"),
       completion_contract: {
         expected_changed_files: ["src/BH-005.ts", "tests/BH-005.test.ts", "src/new.ts"],
       },
@@ -101,7 +102,7 @@ describe("materializeReplanCandidate", () => {
       operation: "create",
       requirements: ["Implement the verified edge case."],
     });
-    expect(target.change_units[0]!.requirements).toEqual(patch.changed_instructions);
+    expect(target.change_units[0]!.requirements).toEqual(discoveredBase.work_items[0]!.change_units[0]!.requirements);
     const { satisfies: _satisfies, ...persistedCommand } = patch.added_verification_commands[0]!;
     expect(target.verification_commands).toContainEqual(persistedCommand);
     expect(target.acceptance[0]!.satisfied_by).toContain(persistedCommand.id);
@@ -114,6 +115,89 @@ describe("materializeReplanCandidate", () => {
       out_of_scope: ["Unrelated refactors"],
     });
     expect(discoveredBase).toEqual(frozenBase);
+  });
+
+  it("preserves legacy changed-instruction materialization for immutable historical patches", () => {
+    const proposed = materializeReplanCandidate({
+      basePlan,
+      targetWorkItemId: "BH-005",
+      patch,
+      durableCriteria: [{ ref: "BH-005:AC-1", text: "The target behavior is correct." }],
+      workflowProtocol: "legacy-v2",
+    });
+
+    expect(proposed.work_items[0]!.objective).toBe(patch.revised_objective);
+    expect(proposed.work_items[0]!.change_units[0]!.requirements).toEqual(patch.changed_instructions);
+  });
+
+  it("replaces a same-key cross-cutting impact in version 2 materialization", () => {
+    const target = basePlan.work_items[0]!;
+    const existingImpact = {
+      change_unit_id: target.change_units[0]!.id,
+      category: "runtime" as const,
+      callers: ["src/BH-005.ts"],
+      representative_fixtures: ["tests/BH-005.test.ts"],
+      verification_command_ids: [target.verification_commands[0]!.id],
+    };
+    const replacementImpact = {
+      ...existingImpact,
+      callers: ["src/BH-005.ts", "src/new.ts"],
+    };
+    const proposed = materializeReplanCandidate({
+      basePlan: {
+        ...basePlan,
+        work_items: [{ ...target, cross_cutting_impacts: [existingImpact] }, basePlan.work_items[1]!],
+      },
+      targetWorkItemId: "BH-005",
+      patch: { ...patch, added_cross_cutting_impacts: [replacementImpact] },
+      durableCriteria: [{ ref: "BH-005:AC-1", text: "The target behavior is correct." }],
+      workflowProtocol: "legacy-v2",
+      materializationVersion: 2,
+    });
+
+    expect(proposed.work_items[0]!.cross_cutting_impacts).toEqual([replacementImpact]);
+  });
+
+  it("promotes an existing read-only file contract when version 2 adds a modify unit", () => {
+    const target = basePlan.work_items[0]!;
+    const promotedPath = "src/inspected.ts";
+    const inspectedContract = {
+      path: promotedPath,
+      permission: "read_only" as const,
+      targets: ["inspected dependency"],
+    };
+    const promotedUnit = {
+      id: "BH-005-CH-READ-ONLY-PROMOTION",
+      path: promotedPath,
+      target: "verified write boundary",
+      operation: "modify" as const,
+      requirements: ["Modify the previously inspected dependency."],
+      satisfies: [target.acceptance[0]!.id],
+    };
+    const proposed = materializeReplanCandidate({
+      basePlan: {
+        ...basePlan,
+        work_items: [{
+          ...target,
+          file_contract: [...target.file_contract, inspectedContract],
+          forbidden_changes: target.forbidden_changes.map((forbidden) => forbidden.path === "*"
+            ? { ...forbidden, except: [...forbidden.except, promotedPath] }
+            : forbidden),
+        }, basePlan.work_items[1]!],
+      },
+      targetWorkItemId: "BH-005",
+      patch: { ...patch, added_change_units: [promotedUnit] },
+      durableCriteria: [{ ref: "BH-005:AC-1", text: "The target behavior is correct." }],
+      workflowProtocol: "legacy-v2",
+      materializationVersion: 2,
+    });
+
+    expect(proposed.work_items[0]!.file_contract).toContainEqual({
+      ...inspectedContract,
+      permission: "modify",
+      targets: [promotedUnit.target],
+    });
+    expect(proposed.work_items[0]!.completion_contract.expected_changed_files).toContain(promotedPath);
   });
 
   it("rejects a missing target deterministically", () => {

@@ -565,6 +565,7 @@ export const replanFindingContextSchema = z.object({
 }).strict();
 
 export const replanPatchRecordSchema = z.object({
+  materialization_version: z.literal(2).optional(),
   patch: replanPatchSchema,
   provenance: z.object({
     base_plan_revision: z.number().int().positive(),

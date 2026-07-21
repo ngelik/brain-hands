@@ -9,7 +9,7 @@ export const tokenUsageSchema = z.object({
   cached_input_tokens: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   output_tokens: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   reasoning_output_tokens: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-}).strict();
+}).strip();
 
 export type TokenUsage = z.infer<typeof tokenUsageSchema>;
 

@@ -22,7 +22,7 @@ import {
 } from "../core/review-fix-packet.js";
 import { readManifestV2, readOptionalValidatedArtifact, writeCreateOnceValidated } from "../core/ledger.js";
 import { writeImmutableTextArtifact, writeTextArtifact } from "../core/ledger.js";
-import { executionSpecV2Schema, reviewCycleStateSchema, reviewerActionQueueSchema } from "../core/schema.js";
+import { artifactPathSchema, executionSpecV2Schema, reviewCycleStateSchema, reviewerActionQueueSchema } from "../core/schema.js";
 import { fingerprintFinding } from "./findings.js";
 import { reviewDecisionPath, validatePersistedReviewEffectState } from "./review-cycle.js";
 import { assertPolicyReviewerQueueAuthority } from "./reviewer-actions.js";
@@ -214,19 +214,44 @@ export function compileReviewFixPacket(input: CompileReviewFixPacketInput): Revi
   const criterion = input.work_item.acceptance.find((entry) => entry.id === input.criterion_ref);
   if (!criterion) throw new FixPacketRequiresReplanError(`Unknown approved criterion ${input.criterion_ref}`);
   const successConditionIds = parsedClaim.verification.success_conditions.map(({ id }) => id);
+  const contracts = new Map(input.work_item.file_contract.map((entry) => [entry.path, entry]));
+  const normalizedChangeUnits = parsedClaim.remediation.change_units.map((unit) => {
+    const contract = contracts.get(unit.path);
+    return {
+      ...unit,
+      ...(contract && contract.permission !== "read_only"
+        ? {
+            operation: contract.permission,
+            ...(contract.targets.length === 1 ? { target: contract.targets[0]! } : {}),
+          }
+        : {}),
+      satisfies: [...new Set(unit.satisfies.flatMap((id) =>
+        id === input.criterion_ref ? successConditionIds : [id]))],
+    };
+  });
+  const normalizedRequiredEvidence = parsedClaim.verification.required_evidence.map((evidence) => ({
+    ...evidence,
+    output_path: artifactPathSchema.safeParse(evidence.output_path).success
+      ? evidence.output_path
+      : `verification/review-fix/${evidence.id.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`,
+  }));
   const claim = verifierRemediationClaimV1Schema.parse({
     ...parsedClaim,
     remediation: {
       ...parsedClaim.remediation,
-      change_units: parsedClaim.remediation.change_units.map((unit) => ({
-        ...unit,
-        satisfies: [...new Set(unit.satisfies.flatMap((id) =>
-          id === input.criterion_ref ? successConditionIds : [id]))],
-      })),
+      change_units: normalizedChangeUnits,
+    },
+    verification: {
+      ...parsedClaim.verification,
+      required_evidence: normalizedRequiredEvidence,
+    },
+    completion_contract: {
+      ...parsedClaim.completion_contract,
+      required_change_unit_ids: normalizedChangeUnits.map((unit) => unit.id),
+      expected_changed_files: [...new Set(normalizedChangeUnits.map((unit) => unit.path))],
     },
   });
 
-  const contracts = new Map(input.work_item.file_contract.map((entry) => [entry.path, entry]));
   for (const path of claim.remediation.allowed_files) {
     const contract = contracts.get(path);
     if (!contract || contract.permission === "read_only") {

@@ -174,7 +174,12 @@ async function assertBoundGitIdentity(input: {
   if (expectedWorktree !== suppliedWorktree) throw new Error("Supplied worktree does not match the persisted identity");
 
   const snapshot = await input.getSnapshot(input.worktreePath);
-  if (snapshot.branch !== manifest.branch_name || !snapshot.isLinkedWorktree || snapshot.status.trim() !== "") {
+  const executionHasStarted = manifest.current_work_item_id !== null;
+  if (
+    snapshot.branch !== manifest.branch_name
+    || !snapshot.isLinkedWorktree
+    || (!executionHasStarted && snapshot.status.trim() !== "")
+  ) {
     throw new Error("Bound worktree branch or clean linked-worktree state is invalid");
   }
   const head = await input.getHead(input.worktreePath);

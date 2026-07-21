@@ -411,6 +411,48 @@ describe("diagnostic recovery authorization", () => {
     });
   });
 
+  it("keeps a historical diagnostic valid after the same scope makes new progress", async () => {
+    const scopeId = "work-item:historical";
+    const { ledger } = await createDiagnosticStop(scopeId);
+    const authorization = await authorizeDiagnosticResume({
+      runDir: ledger.runDir,
+      actor: "operator@example.test",
+      note: "Restored the historical scope",
+    });
+    const consumption = await claimAuthorizedRecoveryAttempt({
+      runDir: ledger.runDir,
+      authorization,
+    });
+    await recordRecoveryObservation(recordInput(
+      ledger.runDir,
+      observation({
+        runId: ledger.runId,
+        attemptId: consumption.effect_attempt_id,
+        scopeId,
+        progress: sha("progress-b"),
+      }),
+    ));
+    const manifest = await reconcileRecoveryJournal(ledger.runDir);
+    const planSha256 = sha("approved-plan-1");
+    await updateManifestV2(ledger.runDir, {
+      current_revision: 1,
+      approved_revision: 1,
+      current_plan_revision: 1,
+      approved_plan_revision: 1,
+      plan_revisions: {
+        ...manifest.plan_revisions,
+        "1": { revision: 1, path: "plans/revision-1.md", sha256: planSha256 },
+      },
+    });
+
+    await expect(reconcileRecoveryJournal(ledger.runDir)).resolves.toMatchObject({
+      recovery: {
+        active_scope: scopeId,
+        scopes: { [scopeId]: { diagnostic_path: null } },
+      },
+    });
+  });
+
   it("authorizes the validated global-chain diagnostic stop without resetting progress", async () => {
     const { ledger, stopped } = await createDiagnosticStop();
     const before = stopped.manifest;

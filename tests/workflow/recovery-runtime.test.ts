@@ -29,12 +29,14 @@ import type {
   VerifierReview,
 } from "../../src/core/types.js";
 import { verificationEvidencePath } from "../../src/core/types.js";
+import { recoveryProgressSubjectV1Schema } from "../../src/core/schema.js";
 import {
   authorizeDiagnosticResume,
   diagnosticRecoveryAuthorizationPath,
   diagnosticRecoveryArtifactV1Schema,
   diagnosticRecoveryConsumptionPath,
   reconcileRecoveryJournal,
+  recoveryDecisionArtifactV1Schema,
 } from "../../src/workflow/recovery-ledger.js";
 import {
   buildRecoveryProgressSubject,
@@ -1324,6 +1326,59 @@ describe("recovery runtime adapter", () => {
       ownedEvidenceRefs: ownedEvidenceRefs(paths),
     });
     expect(recorded.recovery_decision.sequence).toBe(stopped.recovery_decision.sequence + 1);
+  });
+
+  it("closes a consumed authorization with its original subject before gating the next operation", async () => {
+    const { runDir, manifest } = await setup();
+    const { paths, progress } = await progressInput(runDir, manifest);
+    await recordOperationalStop({ runDir, progress, paths });
+    await authorizeDiagnosticResume({
+      runDir,
+      actor: "operator",
+      note: "Retry this exact operation once",
+    });
+    const exact = {
+      runDir,
+      scopeId: "work-item:item-1",
+      operation: "work-item-fix",
+      requestedEffect: "fix" as const,
+      requestedEffectReason: "fix_budget_available",
+      findingIds: [findingId],
+      classification: {
+        failure_class: "operational_blocker" as const,
+        blocker_code: "network_failure",
+      },
+      progress,
+    };
+    expect((await gateOperationalRecoveryAttempt(exact)).mode).toBe("authorized_attempt");
+    await transitionRun(runDir, "verifying");
+    await transitionRun(runDir, "verifier_review");
+    const changedSubject = recoveryProgressSubjectV1Schema.parse({
+      ...progress.subject,
+      candidate_commit: "d".repeat(40),
+    });
+    const next = await gateOperationalRecoveryAttempt({
+      ...exact,
+      operation: "verifier-invocation",
+      progress: {
+        subject: changedSubject,
+        sha256: progressSubjectSha256(changedSubject),
+      },
+    });
+
+    expect(next.mode).toBe("ordinary");
+    const reconciled = await readManifestV2(runDir);
+    const headPath = reconciled.recovery.scopes[exact.scopeId]!.head_decision_path!;
+    const head = recoveryDecisionArtifactV1Schema.parse(JSON.parse(await readFile(join(runDir, headPath), "utf8")));
+    expect(head.observation).toMatchObject({
+      stage: "fixing",
+      operation: "work-item-fix",
+      failure_class: "operational_blocker",
+      blocker_code: "network_failure",
+      finding_ids: [findingId],
+    });
+    expect(head.requested_effect).toBe("fix");
+    expect(head.requested_effect_reason).toBe("fix_budget_available");
   });
 
   it.each(["authorization", "consumption"] as const)(

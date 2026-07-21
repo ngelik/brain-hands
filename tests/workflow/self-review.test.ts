@@ -152,6 +152,50 @@ describe("runHandsSelfReview", () => {
     expect(result.reportPath).toBe("self-review/item-1/attempt-2/pass-1.json");
   });
 
+  it("omits binary patch payloads and bounds oversized text diffs before invocation", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-bounded-diff-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
+    const codex = new RecordingHands();
+    const binaryPayload = "A".repeat(1_200_000);
+    const textPayload = `+${"x".repeat(700_000)}`;
+
+    await runHandsSelfReview({
+      runDir: ledger.runDir,
+      worktreePath: join(root, "worktree"),
+      workItem,
+      intake: { ...intake, repo_root: root },
+      codex,
+      parentAttempt: 2,
+      mutationKind: "normal_fix",
+      pass: 1,
+      implementation,
+      currentDiff: [
+        "diff --git a/public/planet.webp b/public/planet.webp",
+        "new file mode 100644",
+        "GIT binary patch",
+        "literal 1200000",
+        binaryPayload,
+        "diff --git a/src/example.ts b/src/example.ts",
+        "--- a/src/example.ts",
+        "+++ b/src/example.ts",
+        "@@ -0,0 +1 @@",
+        textPayload,
+      ].join("\n"),
+      verification,
+      activeAction: action,
+      completedActions: [],
+      priorPassReports: [],
+    });
+
+    const prompt = codex.calls[0]!.prompt;
+    expect(prompt.length).toBeLessThan(600_000);
+    expect(prompt).toContain("Binary patch payload omitted from the model prompt (1200000 bytes)");
+    expect(prompt).toContain("Diff content compacted to stay within the model input limit");
+    expect(prompt).toContain("public/planet.webp");
+    expect(prompt).toContain("src/example.ts");
+    expect(prompt).not.toContain(binaryPayload);
+  });
+
   it("writes distinct prompt, schema, response, and immutable report artifacts", async () => {
     const { ledger, result } = await invoke();
     const promptPath = join(ledger.runDir, "prompts/hands-self-review-item-1-attempt-2-pass-1.md");

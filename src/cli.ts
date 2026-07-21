@@ -81,7 +81,7 @@ import {
   selectDiscoveryApproach,
 } from "./core/discovery-ledger.js";
 import { runDiscoveryTurn } from "./workflow/discovery.js";
-import { openResourceBudget } from "./workflow/resource-budget.js";
+import { extendResourceBudget, openResourceBudget, readEffectiveResourceBudgetPolicy } from "./workflow/resource-budget.js";
 import type { ResourceBudgetPort } from "./core/resource-budget.js";
 import { assertCurrentControllerMatches, captureControllerProvenance, captureVisibleController } from "./core/controller-provenance.js";
 import { currentExecutionAuthority } from "./core/execution-context.js";
@@ -2509,6 +2509,92 @@ export function buildCli(): Command {
       const status = await readOperatorStatus(runDir);
       console.log(options.json
         ? JSON.stringify({ reconciliation, status }, null, 2)
+        : renderRunStatus(status));
+    });
+
+  program.command("reconcile-budget-model-usage")
+    .description("Record measured token usage for an uncertain completed model invocation")
+    .requiredOption("--run <runDir>", "Run directory")
+    .requiredOption("--claim <claimId>", "Uncertain model-invocation claim ID")
+    .requiredOption("--actor <actor>", "Operator recording the reconciliation")
+    .requiredOption("--reason <reason>", "Reason the evidence proves the measured token usage")
+    .requiredOption("--evidence <path...>", "Owned run evidence paths containing the measured usage")
+    .requiredOption("--input-tokens <number>", "Measured input token charge", (value) => parseNonnegativeInteger(value, "--input-tokens"))
+    .requiredOption("--cached-input-tokens <number>", "Measured cached input token count", (value) => parseNonnegativeInteger(value, "--cached-input-tokens"))
+    .requiredOption("--output-tokens <number>", "Measured output token charge", (value) => parseNonnegativeInteger(value, "--output-tokens"))
+    .requiredOption("--reasoning-output-tokens <number>", "Measured reasoning output token count", (value) => parseNonnegativeInteger(value, "--reasoning-output-tokens"))
+    .option("--json", "Print machine-readable output", false)
+    .action(async (options: {
+      run: string; claim: string; actor: string; reason: string; evidence: string[];
+      inputTokens: number; cachedInputTokens: number; outputTokens: number;
+      reasoningOutputTokens: number; json: boolean;
+    }) => {
+      const runDir = await resolveRunDirectory(options.run);
+      const reconciliation = await reconcileResourceBudgetModelInvocation({
+        runDir,
+        claimId: options.claim,
+        actor: options.actor,
+        reason: options.reason,
+        evidenceRefs: options.evidence,
+        tokenUsage: {
+          input_tokens: options.inputTokens,
+          cached_input_tokens: options.cachedInputTokens,
+          output_tokens: options.outputTokens,
+          reasoning_output_tokens: options.reasoningOutputTokens,
+        },
+      });
+      const status = await readOperatorStatus(runDir);
+      console.log(options.json
+        ? JSON.stringify({ reconciliation, status }, null, 2)
+        : renderRunStatus(status));
+    });
+
+  program.command("extend-resource-budget")
+    .description("Append an operator-approved resource budget extension to a bounded run")
+    .requiredOption("--run <runDir>", "Run directory")
+    .requiredOption("--actor <actor>", "Operator recording the extension")
+    .requiredOption("--reason <reason>", "Reason the extension is necessary")
+    .requiredOption("--evidence <path...>", "Owned run evidence supporting the extension")
+    .option("--max-model-invocations <number>", "New cumulative model invocation limit", (value) => parsePositiveInteger(value, "--max-model-invocations"))
+    .option("--max-workflow-attempts <number>", "New cumulative workflow attempt limit", (value) => parsePositiveInteger(value, "--max-workflow-attempts"))
+    .option("--max-total-tokens <number>", "New cumulative token limit", (value) => parsePositiveInteger(value, "--max-total-tokens"))
+    .option("--max-active-elapsed-ms <number>", "New cumulative active elapsed-time limit", (value) => parsePositiveInteger(value, "--max-active-elapsed-ms"))
+    .option("--max-external-effects <number>", "New cumulative external effect limit", (value) => parsePositiveInteger(value, "--max-external-effects"))
+    .option("--json", "Print machine-readable output", false)
+    .action(async (options: {
+      run: string; actor: string; reason: string; evidence: string[];
+      maxModelInvocations?: number; maxWorkflowAttempts?: number; maxTotalTokens?: number;
+      maxActiveElapsedMs?: number; maxExternalEffects?: number; json: boolean;
+    }) => {
+      const runDir = await resolveRunDirectory(options.run);
+      const current = await readEffectiveResourceBudgetPolicy(runDir);
+      const requestedLimits = [
+        options.maxModelInvocations,
+        options.maxWorkflowAttempts,
+        options.maxTotalTokens,
+        options.maxActiveElapsedMs,
+        options.maxExternalEffects,
+      ];
+      if (requestedLimits.every((value) => value === undefined)) {
+        throw new Error("Budget extension requires at least one new cumulative limit");
+      }
+      const extension = await extendResourceBudget({
+        runDir,
+        actor: options.actor,
+        reason: options.reason,
+        evidenceRefs: options.evidence,
+        policy: {
+          ...current,
+          ...(options.maxModelInvocations === undefined ? {} : { max_model_invocations: options.maxModelInvocations }),
+          ...(options.maxWorkflowAttempts === undefined ? {} : { max_workflow_attempts: options.maxWorkflowAttempts }),
+          ...(options.maxTotalTokens === undefined ? {} : { max_total_tokens: options.maxTotalTokens }),
+          ...(options.maxActiveElapsedMs === undefined ? {} : { max_active_elapsed_ms: options.maxActiveElapsedMs }),
+          ...(options.maxExternalEffects === undefined ? {} : { max_external_effects: options.maxExternalEffects }),
+        },
+      });
+      const status = await readOperatorStatus(runDir);
+      console.log(options.json
+        ? JSON.stringify({ extension, status }, null, 2)
         : renderRunStatus(status));
     });
 

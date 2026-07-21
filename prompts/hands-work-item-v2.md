@@ -10,6 +10,11 @@ Run approved verification commands in listed order.
 Stop after the first failed or timed-out command.
 Caller and fixture paths are compatibility evidence, not edit authorization.
 If any ambiguity_policy.stop_when condition occurs, stop without guessing and report it in remaining_risks.
+When an approved browser test writes `BRAIN_HANDS_BROWSER_EVIDENCE_REPORT`, use the normalized schema
+exactly: aggregate and report `status` are `passed`, `failed`, or `skipped`; `horizontal_overflow` is a
+boolean; and optional `pixel_check` contains non-negative integer `sampled_pixels`, `non_blank_pixels`,
+and `unique_colors`. Use the plan's exact check names, screenshot paths, and selector strings. Populate
+observations only from the real browser run.
 
 ## Controller-owned immutable context
 

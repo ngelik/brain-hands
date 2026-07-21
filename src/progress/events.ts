@@ -107,6 +107,16 @@ type Descriptor = {
 };
 const fixed = (label: string) => (_intent: ProgressIntent): string => label;
 const elapsed = (intent: ProgressIntent): string => intent.operation?.duration_ms === undefined ? "" : ` - ${(intent.operation.duration_ms / 1000).toFixed(1)}s`;
+const attemptLabel = (intent: ProgressIntent): string => {
+  const attempt = intent.workItem!.attempt;
+  if (attempt < 1_000_000) return `attempt ${attempt}`;
+  const review = Math.floor(attempt / 1_000_000);
+  const action = Math.floor((attempt % 1_000_000) / 100);
+  const actionAttempt = attempt % 100;
+  return action > 0 && actionAttempt > 0
+    ? `review ${review}, action ${action}, attempt ${actionAttempt}`
+    : `attempt ${attempt}`;
+};
 const heartbeatPhase = (intent: ProgressIntent): Phase => ({
   brain: "planning", hands: "model_invocation", verifier: "model_invocation", reflection: "reflection",
   verification: "verification", runtime: "starting", github: "delivery",
@@ -135,7 +145,7 @@ const CATALOG: Record<ProgressCode, Descriptor> = {
   plan_validated: { phase: "planning", status: "completed", label: fixed("Structured plan validated") },
   plan_ready: { phase: "awaiting_approval", status: "completed", label: (i) => `Plan revision ${i.revision} ready for approval` },
   work_item_implementation: { phase: "implementation", status: "started", label: (i) => `Work item ${i.workItem!.index} of ${i.workItem!.total} - implementation attempt ${i.workItem!.attempt}` },
-  work_item_fix: { phase: "fixing", status: "started", label: (i) => `Work item ${i.workItem!.index} of ${i.workItem!.total} - fix attempt ${i.workItem!.attempt}` },
+  work_item_fix: { phase: "fixing", status: "started", label: (i) => `Work item ${i.workItem!.index} of ${i.workItem!.total} - fix ${attemptLabel(i)}` },
   hands_started: { phase: "model_invocation", status: "started", label: (i) => `Hands started - ${safeModelLabel(i.model ?? "")}/${i.reasoningEffort ?? "medium"}` },
   hands_working: { phase: "implementation", status: "in_progress", label: fixed("Working through implementation") },
   hands_checking: { phase: "implementation", status: "in_progress", label: fixed("Running implementation checks") },
@@ -144,8 +154,8 @@ const CATALOG: Record<ProgressCode, Descriptor> = {
   hands_turn_completed: { phase: "implementation", status: "completed", label: fixed("Hands turn completed") },
   validating_hands: { phase: "implementation", status: "in_progress", label: fixed("Validating Hands result") },
   hands_validated: { phase: "implementation", status: "completed", label: fixed("Hands result validated") },
-  implementation_recorded: { phase: "implementation", status: "completed", label: (i) => `Implementation attempt ${i.workItem!.attempt} recorded` },
-  verification_started: { phase: "verification", status: "started", label: (i) => `Verification started - attempt ${i.workItem!.attempt}` },
+  implementation_recorded: { phase: "implementation", status: "completed", label: (i) => `Implementation ${attemptLabel(i)} recorded` },
+  verification_started: { phase: "verification", status: "started", label: (i) => `Verification started - ${attemptLabel(i)}` },
   verification_command_started: { phase: "verification", status: "in_progress", label: (i) => `Verification ${i.operation!.index} of ${i.operation!.total} - running ${safeToolLabel(i.operation!.safe_tool ?? "")}` },
   verification_command_passed: { phase: "verification", status: "completed", label: (i) => `Verification ${i.operation!.index} of ${i.operation!.total} - passed${elapsed(i)}` },
   verification_command_failed: { phase: "verification", status: "failed", label: (i) => `Verification ${i.operation!.index} of ${i.operation!.total} - failed${elapsed(i)}` },
@@ -366,7 +376,18 @@ export const safeProgressEventSchema = safeProgressEventStructuralSchema.superRe
   const legacyCompletedPhase = code === "worker_completed" && event.phase === "starting";
   if (event.phase !== expectedPhase && !legacyCompletedPhase) context.addIssue({ code: "custom", path: ["phase"], message: "Phase does not match safe progress catalog" });
   if (event.status !== descriptor.status) context.addIssue({ code: "custom", path: ["status"], message: "Status does not match safe progress catalog" });
-  if (event.safe_label !== descriptor.label(intent)) context.addIssue({ code: "custom", path: ["safe_label"], message: "Label does not match safe progress catalog" });
+  const legacyNamespacedLabel = intent.workItem !== undefined && intent.workItem.attempt >= 1_000_000
+    ? code === "work_item_fix"
+      ? `Work item ${intent.workItem.index} of ${intent.workItem.total} - fix attempt ${intent.workItem.attempt}`
+      : code === "implementation_recorded"
+        ? `Implementation attempt ${intent.workItem.attempt} recorded`
+        : code === "verification_started"
+          ? `Verification started - attempt ${intent.workItem.attempt}`
+          : null
+    : null;
+  if (event.safe_label !== descriptor.label(intent) && event.safe_label !== legacyNamespacedLabel) {
+    context.addIssue({ code: "custom", path: ["safe_label"], message: "Label does not match safe progress catalog" });
+  }
 });
 
 export function canonicalProgressEventKey(event: SafeProgressEvent): string {
