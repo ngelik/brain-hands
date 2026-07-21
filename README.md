@@ -4,177 +4,127 @@
 [![npm](https://img.shields.io/npm/v/%40ngelik%2Fbrain-hands)](https://www.npmjs.com/package/@ngelik/brain-hands)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+**Brain Hands is the project.** It is an open-source CLI and Codex plugin for
+software work that needs a clear plan, explicit approval, controlled edits, and
+independent verification.
+
+**Orbitarium is the live demo.** It is a separate Solar System app built to
+pressure-test Brain Hands on a real, visual project. The animation below is a
+Chrome capture of that app running—not the main product.
+
 ![Orbitarium planets orbiting in a live browser simulation](docs/assets/orbitarium-brain-hands-demo.gif)
-
-## Tested on a real project: Orbitarium
-
-[Orbitarium](https://github.com/ngelik/solar-20260520) is a browser-only,
-interactive Solar System built as an end-to-end real-world test of Brain Hands
-in GitHub mode. The run used Brain Hands for discovery, separate brief and plan
-approvals, issue decomposition, implementation, focused fixes, browser evidence,
-independent verification, and recovery.
-
-The test also exercised the tool the way it is meant to be used: failures found
-while building Orbitarium produced focused Brain Hands controller fixes and
-regression tests before project work continued. The public test repository
-currently contains the [Brain Hands-generated execution
-trail](https://github.com/ngelik/solar-20260520/issues); the complete Orbitarium
-code will be pushed after its final verification. The Codex build task is
-`019f8045-f48a-7f02-8042-47786810fa93`.
-
-Brain Hands is a structured way to use Codex for changes where proving the
-work matters as much as writing the code. A strong **Brain** explores and
-plans, **Hands** implements only what you approved, and an independent
-**Verifier** checks the result.
-
-The `brain-hands` CLI keeps the workflow honest. It records decisions and test
-evidence on disk, pauses at explicit approval points, and can safely resume an
-interrupted run. You can work entirely locally or use GitHub issues and one
-pull request. Brain Hands never merges or deploys automatically.
-
-## Built with Codex and GPT-5.6
-
-I used Codex throughout the project: to explore the workflow design, turn rough
-ideas into explicit contracts and file-level plans, implement changes, write
-focused regression tests, review diffs, and verify the release surface. GPT-5.6
-handled the judgment-heavy work, including architecture and safety reviews,
-debugging failed planning and recovery paths, and checking that the final code
-matched the approved intent.
-
-Codex accelerated the parts that normally require repeated repository-wide
-tracing. It followed state across the CLI, controller, ledger, prompts, GitHub
-projection, and tests; helped reproduce failures; and turned each confirmed
-failure into a focused fix and regression check. I kept the product and
-engineering decisions: separate discovery and plan approvals, write access only
-for Hands, an independent read-only Verifier, controller-enforced limits on
-nested agents and retries, a durable local ledger as the source of truth, and no
-automatic merge or deployment.
-
-The result was not a one-prompt generation. It was an iterative collaboration:
-Codex proposed and challenged approaches, I chose the boundaries and tradeoffs,
-and the repository's tests and release checks decided whether each change was
-actually ready.
-
-> Brain Hands is under active pre-1.0 development. Breaking changes may occur,
-> with migration guidance provided in release notes.
 
 ## Why Brain Hands?
 
-- **Plan before editing.** Brain first understands the repository and turns
-  your request into a concrete plan.
-- **You approve the important decisions.** The discovery brief and execution
-  plan have separate, explicit approval gates.
-- **Planning, implementation, and verification stay separate.** Each role has
-  a narrow responsibility and the controller runs them sequentially.
-- **Runs survive interruptions.** State, approvals, attempts, and evidence are
-  written to a durable local ledger.
-- **Verification produces evidence.** A result is not considered ready merely
-  because the implementation model says it is finished.
-- **GitHub is optional.** Use an isolated local worktree and review package, or
-  project the same run into GitHub issues and a pull request.
+Codex is excellent at direct coding tasks. Larger changes become harder when a
+single agent is expected to understand the problem, edit the code, and approve
+its own result. Brain Hands separates those responsibilities:
+
+- **Brain** explores the problem and proposes the plan.
+- **You** approve the discovery brief and execution plan.
+- **Hands** implements only the approved work.
+- **Verifier** checks the result independently.
+- **The controller** records decisions and evidence so interrupted runs can
+  resume safely.
+
+Brain Hands can run locally in an isolated worktree or coordinate GitHub issues
+and one pull request. It never merges or deploys automatically.
+
+> Brain Hands is under active pre-1.0 development. Breaking changes may occur,
+> with migration guidance provided in release notes.
 
 ## How it works
 
 ```mermaid
 flowchart TD
-    A["Your request"] --> B["Brain discovery<br/>Sol · high · read-only"]
+    A["Your task"] --> B["Brain explores and plans"]
     B --> C{"Approve the brief?"}
     C -- "Revise" --> B
-    C -- "Approve" --> D["Brain planning<br/>Sol · high · read-only"]
-    D --> E{"Approve the plan?"}
-    E -- "Stop" --> I["No implementation"]
-    E -- "Approve" --> F["Hands implementation<br/>Luna · high · workspace-write"]
-    F --> S["Hands self-review<br/>medium · 1 pass by default"]
-    S --> G["Verifier<br/>Sol · high · read-only"]
-    G -- "Focused fix" --> F
-    G -- "Verified" --> T["Verified outcome or pull request ready"]
-    T --> H{"Reflection enabled?"}
-    H -- "Yes" --> R["Brain reflection<br/>medium · single terminal pass"]
-    H -- "No" --> J["Human delivery decision"]
-    R --> J
+    C -- "Approve" --> D{"Approve the plan?"}
+    D -- "Stop" --> X["No implementation"]
+    D -- "Approve" --> E["Hands implements"]
+    E --> F["Hands self-review"]
+    F --> G["Verifier checks evidence"]
+    G -- "Fix needed" --> E
+    G -- "Verified" --> H["Ready for your decision"]
 ```
 
-In plain terms: Brain asks questions and proposes the work; nothing is
-implemented until you approve both the brief and the plan. Hands makes the
-change and performs one bounded self-review pass by default. Verifier then
-checks the evidence independently and either accepts it or sends a focused fix
-back to Hands. Optional reflection happens once after a terminal outcome and
-never reopens implementation.
+Nothing is implemented until you approve both the brief and the plan. Hands
+then works within that boundary, and Verifier either accepts the evidence or
+sends back a focused fix.
 
-## Three roles, one bounded controller
+## Three roles, one controller
 
-| Role or phase | Repository default | Responsibility | Cost and speed benefit |
-| --- | --- | --- | --- |
-| **Brain** | `gpt-5.6-sol`, high reasoning, read-only | Discover the real problem, compare approaches, and produce the approved plan | Uses deeper reasoning before writes begin, reducing expensive wrong-direction implementation |
-| **Hands** | `gpt-5.6-luna`, high reasoning, workspace-write | Implement one approved work item at a time and apply focused fixes | Routes the repeated write-heavy work through the efficient implementation profile instead of using the flagship profile for every call |
-| **Verifier** | `gpt-5.6-sol`, high reasoning, read-only | Run the approved checks and judge evidence independently | Concentrates deeper reasoning at the quality boundary; Verifier cannot hide a finding by editing its own review target |
-| **Hands self-review** | Hands model, medium reasoning, 1 pass by default | Inspect the current diff and fix only in-scope defects before Verifier | Adds one bounded early check instead of an open-ended review swarm |
-| **Reflection** | Brain model, medium reasoning, optional single pass | Explain what worked, what failed, and what to improve after the run ends | Costs nothing when disabled and one bounded synthesis call when enabled |
+| Role or phase | Default | What it does |
+| --- | --- | --- |
+| **Brain** | `gpt-5.6-sol`, high reasoning, read-only | Understands the problem and prepares the plan |
+| **Hands** | `gpt-5.6-luna`, high reasoning, workspace-write | Implements approved work and focused fixes |
+| **Verifier** | `gpt-5.6-sol`, high reasoning, read-only | Reviews the result and its evidence independently |
+| **Hands self-review** | Hands model, medium reasoning, 1 pass by default | Catches local mistakes before Verifier runs |
+| **Reflection** | Brain model, medium reasoning, optional single pass | Summarizes lessons after the run ends |
 
-The exact models and reasoning levels are configurable and are shown before a
-run starts. The architecture is the invariant: the controller invokes roles
-sequentially, only Hands receives write access, and nested subagents and fan-out
-are disabled inside every role and phase.
+The models are configurable. The safety boundary is not: only Hands receives
+write access, and the controller runs roles sequentially. It disables
+nested subagents and fan-out inside the workflow.
 
 ```mermaid
-flowchart TD
-    C["Controller: sequential, bounded calls"] --> A["Nested subagents and fan-out disabled"]
-    C --> M["Role-specific models and reasoning"]
-    C --> S["1 self-review pass by default"]
-    C --> R["Optional single-pass reflection"]
-    A --> A1["Avoid parallel token multiplication"]
-    M --> M1["Use deeper reasoning at decisions and verification"]
-    M --> M2["Use the efficient profile for repeated implementation"]
-    S --> S1["Catch local defects before another review cycle"]
-    R --> R1["0 reflection calls when off; 1 when on"]
-    A1 --> O["Bounded usage and less avoidable rework"]
-    M1 --> O
-    M2 --> O
-    S1 --> O
-    R1 --> O
+flowchart LR
+    C["Bounded controller"] --> M["Role-specific models"]
+    C --> N["No nested agent fan-out"]
+    C --> Q["Bounded review and reflection"]
+    M --> O["Controlled usage"]
+    N --> O
+    Q --> O
 ```
 
 This is a cost-control strategy, not a fixed savings guarantee. Brain Hands
 usually makes more calls and can take longer than a one-shot Codex task because
-it adds approvals and independent verification. Compared with using the
-strongest profile for every step or allowing nested-agent fan-out, it keeps
-call amplification bounded and can save time and credits by preventing rework.
-Actual usage depends on task size, retries, research, reflection, and the
-selected profiles. [Codex documentation on subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
-notes that each subagent performs its own model and tool work and therefore
-uses more tokens than a comparable single-agent run.
+it adds approvals and independent verification. Its goal is to limit avoidable
+rework and uncontrolled call multiplication. Actual usage depends on the task,
+models, retries, research, and reflection. The [Codex documentation on
+subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents) explains
+why each additional agent also adds model and tool work.
+
+## Live proof: Orbitarium
+
+[Orbitarium](https://github.com/ngelik/solar-20260520) is an interactive,
+browser-only Solar System. It was built as an end-to-end Brain Hands test in
+GitHub mode, covering discovery, approvals, issue breakdown, implementation,
+focused repairs, browser evidence, recovery, and independent review.
+
+The test also improved Brain Hands itself. Problems exposed while building the
+demo led to focused controller fixes and regression tests before the run
+continued. See the [public execution
+trail](https://github.com/ngelik/solar-20260520/issues). The complete demo code
+will be pushed after final verification. Codex task:
+`019f8045-f48a-7f02-8042-47786810fa93`.
+
+## Local or GitHub
 
 ```mermaid
-flowchart TD
-    A["Brain Hands run"] --> B["Durable local ledger"]
-    B --> C["Local mode"]
-    B --> D["GitHub mode"]
-    C --> E["Isolated worktree and local review package"]
-    D --> F["GitHub issues and one pull request"]
-    E --> G["Human reviews and decides what ships"]
-    F --> G
+flowchart LR
+    A["Brain Hands run"] --> L["Durable local ledger"]
+    L --> B["Local: isolated worktree"]
+    L --> C["GitHub: issues and one PR"]
+    B --> D["You decide what ships"]
+    C --> D
 ```
 
-Both modes use the local ledger as the source of truth. GitHub is a delivery
-and collaboration surface, not a replacement for the recorded approvals and
-verification evidence.
+The local ledger remains the source of truth in both modes. GitHub is an
+optional collaboration and delivery surface.
 
-## Which workflow fits?
+## When should I use it?
 
-| Choose | When it fits best | Workflow style |
-| --- | --- | --- |
-| **Vanilla Codex** | Direct, flexible collaboration for ordinary coding, review, and debugging | You guide the agent through prompts, Plan mode, `AGENTS.md`, skills, tests, and review as needed |
-| **Superpowers** | A composable software-development methodology across coding agents | Skills guide brainstorming, planning, TDD, debugging, review, and agent-driven execution |
-| **Brain Hands** | Changes that need durable state, exact approval boundaries, independent verification, and safe recovery | A controller enforces sequential Brain, Hands, and Verifier phases and records the evidence |
+| Choose | Best for |
+| --- | --- |
+| **Vanilla Codex** | Direct coding, review, and debugging where conversation is enough |
+| **Superpowers** | A broad set of composable software-development practices |
+| **Brain Hands** | Work that needs durable state, exact approvals, independent verification, and safe recovery |
 
-These approaches are complementary. Use vanilla Codex when a direct
-conversation is enough. Use Superpowers when you want a broad, composable
-skills methodology. Use Brain Hands when you want one deterministic workflow
-with controller-enforced checkpoints and an auditable run history.
+These approaches are complementary. Brain Hands is deliberately heavier than a
+normal Codex task; use it when the extra control and evidence are worth it.
 
 ## Quickstart
-
-### 1. Install the stable CLI
 
 Brain Hands requires Node.js 20 or newer.
 
@@ -183,9 +133,7 @@ npm install -g @ngelik/brain-hands
 brain-hands --version
 ```
 
-### 2. Install the Codex plugin
-
-Pin the marketplace to the release tag that matches the CLI version:
+Install the matching Codex plugin release:
 
 ```bash
 codex plugin marketplace add ngelik/brain-hands --ref vMAJOR.MINOR.PATCH --json
@@ -193,36 +141,38 @@ codex plugin add brain-hands@brain-hands --json
 codex plugin list --json
 ```
 
-Start a fresh Codex task after installing or updating the plugin so Codex loads
-the new skill instructions.
-
-### 3. Start your first task
-
-In a Codex task, ask:
+Start a fresh Codex task and ask:
 
 ```text
 Use $brain-hands to add input validation to this project.
 ```
 
-On first use, the skill checks for `.brain-hands/config.yaml`, asks permission
-to initialize the repository locally, and shows the complete effective
-configuration before asking only for choices you have not supplied.
-
-For direct CLI use, initialize and inspect the configuration yourself:
+For direct CLI use:
 
 ```bash
 brain-hands init --repo .
 brain-hands preview --repo .
 ```
 
+## Built with Codex and GPT-5.6
+
+I used Codex throughout Brain Hands to explore the design, turn ideas into
+explicit contracts, implement changes, reproduce failures, write regression
+tests, review diffs, and verify releases. GPT-5.6 handled the judgment-heavy
+planning, architecture, debugging, and review work.
+
+The collaboration was iterative, not a one-prompt generation. Codex proposed
+and challenged approaches; I chose the product boundaries and safety tradeoffs;
+the repository's tests and release checks decided whether each change was ready.
+
 ## Learn more
 
-- [Complete user guide](https://github.com/ngelik/brain-hands/blob/main/docs/USER-GUIDE.md) — configuration, commands, artifacts, approvals, recovery, and verification
-- [Workflow design](agentic-codex-workflow.md) — the runtime architecture and execution contract
-- [Contributing](CONTRIBUTING.md) — development and contribution expectations
-- [Release guide](https://github.com/ngelik/brain-hands/blob/main/docs/RELEASING.md) — release verification and publishing
-- [Support](SUPPORT.md) — usage help
-- [Security](SECURITY.md) — private vulnerability reporting
+- [Complete user guide](https://github.com/ngelik/brain-hands/blob/main/docs/USER-GUIDE.md) — setup, configuration, commands, approvals, recovery, and verification
+- [Workflow design](agentic-codex-workflow.md) — runtime architecture and contracts
+- [Contributing](CONTRIBUTING.md)
+- [Release guide](https://github.com/ngelik/brain-hands/blob/main/docs/RELEASING.md)
+- [Support](SUPPORT.md)
+- [Security](SECURITY.md)
 
 ## License
 
