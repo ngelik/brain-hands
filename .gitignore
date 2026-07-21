@@ -11,6 +11,7 @@ coverage/
 # Local workflow/runtime output
 .brain-hands/
 .superpowers/
+/docs/superpowers/
 reports/
 logs/
 *.log
