@@ -109,7 +109,7 @@ describe("npm publish workflow", () => {
     }
   });
 
-  it("runs one canonical funnel, inspects its frozen package, and validates immutable tag context", async () => {
+  it("runs one bounded release gate, inspects its package, and validates immutable tag context", async () => {
     const { workflow } = await loadWorkflow();
     const validate = workflow.jobs?.validate;
     expect(validate?.["timeout-minutes"]).toBeGreaterThanOrEqual(180);
@@ -117,7 +117,7 @@ describe("npm publish workflow", () => {
     expect(validate?.steps?.filter((step) => step.run).map(({ name, run }) => ({ name, run }))).toEqual([
       { name: "Verify the trusted-publishing toolchain", run: "node scripts/check-release-toolchain.mjs" },
       { name: "Install dependencies", run: "npm ci --ignore-scripts" },
-      { name: "Layered verification funnel", run: "npm run verify:funnel" },
+      { name: "Bounded release verification", run: "npm run verify:ci" },
       { name: "Validate immutable release context", run: immutableContextRun },
       { name: "Inspect the package artifact", run: "npm pack --dry-run --json --ignore-scripts" },
     ]);
@@ -125,7 +125,7 @@ describe("npm publish workflow", () => {
     for (const required of [
       "node scripts/check-release-toolchain.mjs",
       "npm ci --ignore-scripts",
-      "npm run verify:funnel",
+      "npm run verify:ci",
       "npm pack --dry-run --json --ignore-scripts",
       "npm run validate-release -- --json",
       "git cat-file -t",
@@ -141,10 +141,10 @@ describe("npm publish workflow", () => {
 
     const commands = executableCommands(validate);
     const funnels = commands.filter(({ command }) =>
-      commandStartsWith(command, ["npm", "run", "verify:funnel"]),
+      commandStartsWith(command, ["npm", "run", "verify:ci"]),
     );
     expect(funnels).toHaveLength(1);
-    expect(funnels[0]?.step.name).toBe("Layered verification funnel");
+    expect(funnels[0]?.step.name).toBe("Bounded release verification");
     for (const duplicateGate of [
       ["npm", "test"],
       ["npm", "run", "test"],

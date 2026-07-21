@@ -74,7 +74,7 @@ describe("CI workflow", () => {
     expect(workflow.jobs?.quality?.permissions).toEqual({ contents: "read" });
   });
 
-  it("pins GitHub actions and runs the canonical verification funnel once", async () => {
+  it("pins GitHub actions and runs the bounded CI verification once", async () => {
     const workflow = await loadWorkflow();
     const quality = workflow.jobs?.quality;
     expect(quality?.name).toBe("quality");
@@ -92,7 +92,7 @@ describe("CI workflow", () => {
     expect(steps.filter((step) => step.run).map(({ name, run }) => ({ name, run }))).toEqual([
       { name: "Verify the release toolchain", run: "node scripts/check-release-toolchain.mjs" },
       { name: "Install dependencies", run: "npm ci --ignore-scripts" },
-      { name: "Layered verification funnel", run: "npm run verify:funnel" },
+      { name: "Bounded CI verification", run: "npm run verify:ci" },
       { name: "Inspect the package artifact", run: "npm pack --dry-run --json --ignore-scripts" },
       { name: "Check patch whitespace", run: "git diff --check" },
     ]);
@@ -103,7 +103,7 @@ describe("CI workflow", () => {
     for (const command of [
       ["node", "scripts/check-release-toolchain.mjs"],
       ["npm", "ci", "--ignore-scripts"],
-      ["npm", "run", "verify:funnel"],
+      ["npm", "run", "verify:ci"],
       ["npm", "pack", "--dry-run", "--json", "--ignore-scripts"],
       ["git", "diff", "--check"],
     ]) {
@@ -111,10 +111,10 @@ describe("CI workflow", () => {
     }
 
     const funnelEntries = commandEntries.filter(({ command }) =>
-      commandStartsWith(command, ["npm", "run", "verify:funnel"]),
+      commandStartsWith(command, ["npm", "run", "verify:ci"]),
     );
     expect(funnelEntries).toHaveLength(1);
-    expect(funnelEntries[0]?.step.name).toBe("Layered verification funnel");
+    expect(funnelEntries[0]?.step.name).toBe("Bounded CI verification");
     for (const duplicateGate of [
       ["npm", "test"],
       ["npm", "run", "test"],

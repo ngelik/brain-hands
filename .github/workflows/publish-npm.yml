@@ -40,8 +40,8 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Layered verification funnel
-        run: npm run verify:funnel
+      - name: Bounded release verification
+        run: npm run verify:ci
 
       - name: Validate immutable release context
         shell: bash

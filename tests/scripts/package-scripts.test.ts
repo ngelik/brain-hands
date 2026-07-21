@@ -11,9 +11,11 @@ const requiredScripts = {
   test: "npm run verify:funnel",
   "test:static-contract": "vitest run tests/core/schema.test.ts tests/core/execution-spec.test.ts tests/core/testing-funnel.test.ts tests/prompts/renderer.test.ts tests/workflow/replan.test.ts",
   "test:cross-cutting": "vitest run tests/workflow/runtime-local.test.ts tests/workflow/runtime-github.test.ts tests/workflow/preflight.test.ts tests/workflow/status.test.ts tests/core/ledger.test.ts tests/core/discovery-ledger.test.ts tests/core/run-configuration.test.ts tests/core/controller-provenance.test.ts tests/verification/runner.test.ts",
+  "test:ci": "vitest run tests/core/schema.test.ts tests/core/execution-spec.test.ts tests/core/testing-funnel.test.ts tests/prompts/renderer.test.ts tests/workflow/replan.test.ts tests/workflow/fix-packet-resolution.test.ts tests/workflow/recovery-runtime.test.ts tests/workflow/review-normalizer.test.ts tests/workflow/role-context.test.ts tests/verification/runner.test.ts tests/cli-smoke.test.ts tests/browser/network-pattern.test.ts",
   "test:built-cli": "vitest run tests/workflow/e2e-dry-run.test.ts tests/workflow/canonical-session-built-cli.test.ts",
   "test:all:no-build": "vitest run",
   "verify:funnel": "node scripts/verify-repository.mjs",
+  "verify:ci": "npm run typecheck && npm run build && npm run validate-release && npm run test:ci",
   "verify:focused": "node scripts/verify-repository.mjs --focused",
 } as const;
 
@@ -28,6 +30,7 @@ describe("package verification scripts", () => {
     expect(scripts.test).toBe(requiredScripts.test);
     expect(scripts["verify:funnel"]).toBe(requiredScripts["verify:funnel"]);
     expect(scripts["verify:focused"]).toBe(requiredScripts["verify:focused"]);
+    expect(scripts["verify:ci"]).toBe(requiredScripts["verify:ci"]);
   });
 
   it("defines the exact non-overlapping verification layers", async () => {
@@ -35,6 +38,7 @@ describe("package verification scripts", () => {
 
     expect(scripts["test:static-contract"]).toBe(requiredScripts["test:static-contract"]);
     expect(scripts["test:cross-cutting"]).toBe(requiredScripts["test:cross-cutting"]);
+    expect(scripts["test:ci"]).toBe(requiredScripts["test:ci"]);
     expect(scripts["test:built-cli"]).toBe(requiredScripts["test:built-cli"]);
     expect(scripts["test:all:no-build"]).toBe(requiredScripts["test:all:no-build"]);
   });
@@ -46,8 +50,10 @@ describe("package verification scripts", () => {
       "test",
       "verify:funnel",
       "verify:focused",
+      "verify:ci",
       "test:static-contract",
       "test:cross-cutting",
+      "test:ci",
       "test:built-cli",
       "test:all:no-build",
     ];
