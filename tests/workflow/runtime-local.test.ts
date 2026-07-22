@@ -4184,6 +4184,7 @@ describe("runLocalWorkflow", () => {
       review_cycle_path: expect.any(String),
       review_effect_id: expect.any(String),
     });
+    expect(manifest.work_item_progress.first?.queue_path).toBeUndefined();
     expect(manifest.convergence_reports?.first).toMatchObject({ recommended_action: "create_replan" });
   });
 

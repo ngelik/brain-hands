@@ -6890,7 +6890,11 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         status: "blocked",
         attempts: reference.attempts,
         blocker,
-        queue_state: "blocked",
+        queue_state: undefined,
+        queue_path: undefined,
+        active_action_id: null,
+        active_action_attempt: 0,
+        completed_action_ids: [],
         review_revision: reviewRevision,
         review_path: reference.review_path,
         verification_path: reference.verification_path,
@@ -6968,6 +6972,33 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       manifest = await updateManifestV2(input.runDir, { delivery_state: "blocked", last_blocker: blocker });
       return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
     };
+    if (
+      policyEnabled
+      && manifest.stage === "replanning"
+      && typeof progress?.review_cycle_path === "string"
+      && typeof progress.review_effect_id === "string"
+      && typeof progress.queue_path === "string"
+    ) {
+      const cycle = reviewCycleStateSchema.parse(await readRunArtifact<unknown>(
+        input.runDir,
+        progress.review_cycle_path,
+      ));
+      if (
+        cycle.work_item_id === item.id
+        && cycle.effect_id === progress.review_effect_id
+        && cycle.decision.action === "create_replan"
+      ) {
+        manifest = await setProgress(input.runDir, item.id, {
+          ...progress,
+          queue_state: undefined,
+          queue_path: undefined,
+          active_action_id: null,
+          active_action_attempt: 0,
+          completed_action_ids: [],
+        });
+        progress = manifest.work_item_progress[item.id];
+      }
+    }
     if (
       policyEnabled
       && (manifest.stage === "verifier_review" || manifest.stage === "replanning")
