@@ -144,6 +144,7 @@ export interface BuildVerifierContextInput {
   changedFiles: string[];
   diff: string;
   evidenceIndexRef: ArtifactRefV1 | null;
+  resume?: number;
 }
 
 export interface BuildReflectionContextInput {
@@ -699,11 +700,14 @@ export function verifierContextPath(
   workItemId: string,
   phase: VerifierContextV1["phase"],
   attempt: number,
+  resume = 1,
 ): string {
   positiveInteger(attempt, "Verifier attempt");
+  positiveInteger(resume, "Verifier context resume");
   const parsedPhase = verifierContextV1Schema.shape.phase.parse(phase);
   if (workItemId.length === 0) throw new Error("Verifier work-item ID must not be empty");
-  return `contexts/verifier/${artifactSegment(workItemId)}/${parsedPhase}/attempt-${attempt}.json`;
+  const suffix = resume === 1 ? "" : `-resume-${resume}`;
+  return `contexts/verifier/${artifactSegment(workItemId)}/${parsedPhase}/attempt-${attempt}${suffix}.json`;
 }
 
 export const reflectionContextPath = "contexts/reflection/final.json";
@@ -855,7 +859,7 @@ async function buildVerifierContextLocked(input: BuildVerifierContextInput): Pro
   );
   return writeImmutableValidatedJson(
     input.runDir,
-    verifierContextPath(input.workItemId, input.phase, input.attempt),
+    verifierContextPath(input.workItemId, input.phase, input.attempt, input.resume),
     verifierContextV1Schema,
     context,
   );
@@ -913,7 +917,7 @@ export function buildReflectionContext(input: BuildReflectionContextInput): Prom
 }
 
 const handsPathPattern = /^contexts\/hands\/[A-Za-z0-9_-]+\/plan-[1-9]\d*\/attempt-[1-9]\d*\/(?:initial|primary_fix|fix_packet|quality_recovery)\.json$/;
-const verifierPathPattern = /^contexts\/verifier\/[A-Za-z0-9_-]+\/(?:work_item|final_integrated|post_pr)\/attempt-[1-9]\d*\.json$/;
+const verifierPathPattern = /^contexts\/verifier\/[A-Za-z0-9_-]+\/(?:work_item|final_integrated|post_pr)\/attempt-[1-9]\d*(?:-resume-[2-9]\d*)?\.json$/;
 
 function pathWorkItemId(path: string): string {
   const segment = path.split("/")[2]!;
@@ -986,11 +990,14 @@ export async function validateHandsInvocationContext(
   };
 }
 
-function verifierPathCoordinates(path: string): { phase: VerifierContextV1["phase"]; attempt: number } {
+function verifierPathCoordinates(path: string): { phase: VerifierContextV1["phase"]; attempt: number; resume: number } {
   const segments = path.split("/");
+  const match = segments[4]!.match(/^attempt-(\d+)(?:-resume-(\d+))?\.json$/);
+  if (!match) throw new Error("Verifier role-context path coordinates are invalid");
   return {
     phase: verifierContextV1Schema.shape.phase.parse(segments[3]),
-    attempt: Number(segments[4]!.slice(8, -5)),
+    attempt: Number(match[1]),
+    resume: match[2] ? Number(match[2]) : 1,
   };
 }
 
@@ -1002,7 +1009,7 @@ export function verifierContextReferenceCoordinates(
   if (!verifierPathPattern.test(reference.path)) throw new Error("Role-context path does not match verifier");
   const coordinates = { workItemId: pathWorkItemId(reference.path), ...verifierPathCoordinates(reference.path) };
   positiveInteger(coordinates.attempt, "Verifier attempt");
-  if (reference.path !== verifierContextPath(coordinates.workItemId, coordinates.phase, coordinates.attempt)) {
+  if (reference.path !== verifierContextPath(coordinates.workItemId, coordinates.phase, coordinates.attempt, coordinates.resume)) {
     throw new Error("Verifier role-context path is not canonical");
   }
   if (expected) {

@@ -1202,6 +1202,19 @@ describe("bounded role contexts", () => {
     expect(context.command_evidence).toHaveLength(1);
     expect(context.artifact_checks).toHaveLength(1);
     expect(context.browser_evidence).toHaveLength(1);
+    const resumedRef = await buildVerifierContext({
+      runDir: run,
+      workItemId: "BH-001",
+      phase: "work_item",
+      attempt: 1,
+      resume: 2,
+      acceptanceContract: [{ id: "BH-001:AC-1" }],
+      changedFiles: ["src/BH-001.ts"],
+      diff: "",
+      evidenceIndexRef: null,
+    });
+    expect(resumedRef.path).toBe("contexts/verifier/QkgtMDAx/work_item/attempt-1-resume-2.json");
+    await expect(loadRoleContext(run, resumedRef, "verifier")).resolves.toMatchObject({ role: "verifier" });
 
     const wrongTypeRun = await runDir();
     const wrongTypeVerificationRef = await setVerificationAuthority(wrongTypeRun, "BH-001", 1, {

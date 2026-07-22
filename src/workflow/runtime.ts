@@ -4015,34 +4015,45 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       ...snapshot,
       patch: boundedVerifierDiff(snapshot.patch),
     };
-    const path = verifierContextPath(item.id, phase, attempt);
-    let contextRef: ArtifactRefV1;
-    try {
-      contextRef = await artifactReference(input.runDir, path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const current = await readManifestV2(input.runDir);
-      const evidenceIndexRef = phase === "work_item"
-        ? null
-        : (() => {
-            if (
-              current.final_verifier_index_path !== verifierEvidenceIndexPath(phase, attempt)
-              || typeof current.final_verifier_index_sha256 !== "string"
-            ) throw new Error(`${phase} Verifier context requires its current immutable evidence index`);
-            return { path: current.final_verifier_index_path, sha256: current.final_verifier_index_sha256 };
-          })();
-      contextRef = await buildVerifierContext({
-        runDir: input.runDir,
-        workItemId: item.id,
-        phase,
-        attempt,
-        acceptanceContract: item.acceptance,
-        changedFiles: boundedSnapshot.changed_files,
-        diff: boundedSnapshot.patch,
-        evidenceIndexRef,
-      });
+    const current = await readManifestV2(input.runDir);
+    const evidenceIndexRef = phase === "work_item"
+      ? null
+      : (() => {
+          if (
+            current.final_verifier_index_path !== verifierEvidenceIndexPath(phase, attempt)
+            || typeof current.final_verifier_index_sha256 !== "string"
+          ) throw new Error(`${phase} Verifier context requires its current immutable evidence index`);
+          return { path: current.final_verifier_index_path, sha256: current.final_verifier_index_sha256 };
+        })();
+    let contextRef: ArtifactRefV1 | null = null;
+    let context: import("../core/context-contracts.js").VerifierContextV1 | null = null;
+    for (let resume = 1; resume <= 100; resume += 1) {
+      const path = verifierContextPath(item.id, phase, attempt, resume);
+      try {
+        contextRef = await artifactReference(input.runDir, path);
+        context = await loadRoleContext(input.runDir, contextRef, "verifier");
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (errorMessage(error) === "Verifier active findings are not current finding authority") continue;
+          throw error;
+        }
+        contextRef = await buildVerifierContext({
+          runDir: input.runDir,
+          workItemId: item.id,
+          phase,
+          attempt,
+          acceptanceContract: item.acceptance,
+          changedFiles: boundedSnapshot.changed_files,
+          diff: boundedSnapshot.patch,
+          evidenceIndexRef,
+          resume,
+        });
+        context = await loadRoleContext(input.runDir, contextRef, "verifier");
+        break;
+      }
     }
-    const context = await loadRoleContext(input.runDir, contextRef, "verifier");
+    if (!contextRef || !context) throw new Error(`Verifier context resume limit reached for ${item.id} attempt ${attempt}`);
     const scopeAuthority = await loadVerifierScopeAuthority({
       runDir: input.runDir,
       workItemId: item.id,
