@@ -3,11 +3,12 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CodexAdapter, CodexInvokeInput } from "../../src/adapters/codex.js";
+import { MAX_HANDS_PROMPT_BYTES, type CodexAdapter, type CodexInvokeInput } from "../../src/adapters/codex.js";
 import { approvePlanRevision, createRunLedgerV2, readManifestV2, recordPlan, updateManifestV2, writeCreateOnceValidated } from "../../src/core/ledger.js";
 import { artifactRefFromBytes, canonicalJsonBytes, handsContextV1Schema } from "../../src/core/context-contracts.js";
-import { hashReviewFixPacket, type FixPacketResultV1, type ReviewFixPacketV1, type VerifierRemediationClaimV1 } from "../../src/core/review-fix-packet.js";
+import { hashReviewFixPacket, reviewFixPacketV1Schema, type FixPacketResultV1, type ReviewFixPacketV1, type VerifierRemediationClaimV1 } from "../../src/core/review-fix-packet.js";
 import { fixPacketResultV1Schema } from "../../src/core/review-fix-packet.js";
+import type { ResourceBudgetPort } from "../../src/core/resource-budget.js";
 import type { ResolvedRunIntake } from "../../src/core/types.js";
 import { runHandsFixPacket } from "../../src/workflow/worker.js";
 import { correctVerifierRemediationClaim, persistFixAttemptSupplement, persistReviewFixPacket, reviewFixPacketIdentity, reviewFixPacketRoot } from "../../src/workflow/fix-packets.js";
@@ -288,6 +289,47 @@ describe("runHandsFixPacket", () => {
     expect(prompt).not.toContain("R1-A2");
     expect(JSON.parse(await readFile(join(ledger.runDir, `${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-invocation-claim.json`), "utf8")))
       .toMatchObject({ profile_kind: "primary", model: "hands", reasoning_effort: "medium" });
+  });
+
+  it("rejects a schema-valid oversized fix-packet prompt before claims, artifacts, budget, or Codex", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-fix-worker-oversized-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const hugePacket = structuredClone(packet);
+    hugePacket.remediation.change_units[0]!.requirements = [
+      `Make behavior right: ${"x".repeat(MAX_HANDS_PROMPT_BYTES)}`,
+    ];
+    expect(reviewFixPacketV1Schema.safeParse(hugePacket).success).toBe(true);
+    const codex = new RecordingHands();
+    let budgetClaims = 0;
+    const budget: ResourceBudgetPort = {
+      usage: async () => ({
+        model_invocations: 0, workflow_attempts: 0, total_tokens: 0, cached_input_tokens: 0,
+        reasoning_output_tokens: 0, active_elapsed_ms: 0, external_effects: 0,
+        token_accounting: "known", uncertain_model_claim_ids: [], token_overshoot: 0,
+      }),
+      claim: async () => { budgetClaims += 1; throw new Error("must not claim budget"); },
+      complete: async () => { throw new Error("must not complete budget"); },
+      runWorkflowAttempt: async (_key, action) => action(),
+      remainingActiveElapsedMs: async () => 1_000,
+    };
+
+    await expect(runHandsFixPacket({
+      runDir: ledger.runDir, worktreePath: root, workItem: item, packet: hugePacket, actionAttempt: 1,
+      intake: { ...intake, repo_root: root }, codex, budget,
+      relevantSourceContext: [], evidenceContext: [], completedDependencies: [], currentDiff: "", supplement: null,
+    })).rejects.toThrow(`Hands fix-packet prompt exceeds ${MAX_HANDS_PROMPT_BYTES} bytes`);
+
+    expect(codex.calls).toHaveLength(0);
+    expect(budgetClaims).toBe(0);
+    for (const relativePath of [
+      "prompts/hands-fix-packet-R1-A1-attempt-1.md",
+      "schemas/hands-fix-packet-R1-A1-attempt-1.json",
+      `${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-invocation-claim.json`,
+      `${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-result.json`,
+    ]) {
+      await expect(readFile(join(ledger.runDir, relativePath), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("renders a bounded fix as one context package without broad source or evidence fields", async () => {

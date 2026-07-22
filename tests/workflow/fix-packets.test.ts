@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CodexAdapter } from "../../src/adapters/codex.js";
+import { MAX_CODEX_PROMPT_BYTES, type CodexAdapter } from "../../src/adapters/codex.js";
 import type { VerifierRemediationClaimV1 } from "../../src/core/review-fix-packet.js";
 import { executionSpec } from "../fixtures/execution-spec.js";
 import { assertFixPacketChangedFiles, assertFixPacketCorrectionAvailable, assertRecoveredFixPacketCommitEvidence, classifyFixPacketCompilationFailure, compileReviewFixPacket, correctVerifierRemediationClaim, FixPacketRequiresReplanError, loadReviewFixPacket, persistFixAttemptSupplement, persistReviewFixPacket, reviewFixPacketCorrectionAuthority, reviewFixPacketRoot } from "../../src/workflow/fix-packets.js";
@@ -275,6 +275,40 @@ describe("fix packets", () => {
     expect(correctionPrompt).toContain("exact writable paths, operations, and target labels");
     expect(correctionPrompt).toContain("`remediation.change_units[].satisfies`");
     expect(correctionPrompt).toContain("reference the required-evidence `id`");
+  });
+
+  it("rejects an oversized correction prompt before artifacts, claim, response, or Codex", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-packet-oversized-correction-"));
+    const workItem = executionSpec("item-1");
+    const claim = validClaimFor(workItem);
+    let calls = 0;
+    const codex: CodexAdapter = { invoke: async () => {
+      calls += 1;
+      throw new Error("must not invoke Codex");
+    } };
+    const input = {
+      runDir: root, worktreePath: root, actionId: "R1-A1", reviewRevision: 1,
+      approvedPlanSha256: "a".repeat(64), claim,
+      validationErrors: [`Invalid contract: ${"x".repeat(MAX_CODEX_PROMPT_BYTES)}`],
+      workItem, verifierProfile: { model: "verifier", reasoning_effort: "high" as const }, codex,
+    };
+    const authority = reviewFixPacketCorrectionAuthority(input);
+
+    await expect(correctVerifierRemediationClaim(input))
+      .rejects.toThrow(`Verifier fix-packet correction prompt exceeds ${MAX_CODEX_PROMPT_BYTES} bytes`);
+
+    expect(calls).toBe(0);
+    for (const relativePath of [
+      authority.requestPath,
+      `${authority.root}/prompt.md`,
+      `${authority.root}/schema.json`,
+      authority.claimPath,
+      authority.responsePath,
+      authority.completionPath,
+    ]) {
+      await expect(readFile(join(root, relativePath), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("does not reuse R1-A1 correction authority across work items", async () => {
