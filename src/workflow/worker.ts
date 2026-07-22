@@ -144,17 +144,31 @@ const persistedFixPacketInvocationClaimSchema = z.union([
 ]);
 
 function fixPacketResultOutputSchema(
-  packetId: string,
+  packet: ReviewFixPacketV1,
   packetSha256: string,
   actionAttempt: number,
 ) {
+  const commandAttemptSchema = fixPacketResultV1OutputSchema.properties.commands_attempted.items;
   return {
     ...fixPacketResultV1OutputSchema,
     properties: {
       ...fixPacketResultV1OutputSchema.properties,
-      packet_id: { type: "string", enum: [packetId] },
+      packet_id: { type: "string", enum: [packet.provenance.packet_id] },
       packet_sha256: { type: "string", enum: [packetSha256] },
       action_attempt: { type: "integer", enum: [actionAttempt] },
+      commands_attempted: {
+        type: "array",
+        items: {
+          anyOf: packet.verification.commands.map((command) => ({
+            ...commandAttemptSchema,
+            properties: {
+              ...commandAttemptSchema.properties,
+              command_id: { type: "string", enum: [command.id] },
+              argv: { type: "array", const: command.argv },
+            },
+          })),
+        },
+      },
     },
   } as const;
 }
@@ -539,7 +553,7 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
     : baseArtifactName;
   await writeTextArtifact(input.runDir, `prompts/${artifactName}.md`, prompt);
   const outputSchema = fixPacketResultOutputSchema(
-    packet.provenance.packet_id,
+    packet,
     packetSha256,
     input.actionAttempt,
   );

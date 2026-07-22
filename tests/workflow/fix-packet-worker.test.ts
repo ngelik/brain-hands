@@ -258,12 +258,24 @@ describe("runHandsFixPacket", () => {
     expect(output.profile).toEqual({ kind: "primary", model: "hands", reasoning_effort: "medium" });
     expect(output.reportPath).toBe(`${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-result.json`);
     expect(codex.calls[0]).toMatchObject({ role: "hands", sandbox: "workspace-write", outputSchema: expect.anything() });
-    const outputSchema = codex.calls[0]!.outputSchema as { properties: Record<string, unknown> };
+    const outputSchema = codex.calls[0]!.outputSchema as {
+      properties: Record<string, unknown> & {
+        commands_attempted: { items: { anyOf: Array<{ properties: Record<string, unknown> }> } };
+      };
+    };
     expect(outputSchema.properties).toMatchObject({
       packet_id: { enum: ["R1-A1"] },
       packet_sha256: { enum: [hashReviewFixPacket(packet)] },
       action_attempt: { enum: [1] },
     });
+    expect(outputSchema.properties.commands_attempted.items.anyOf).toEqual([
+      expect.objectContaining({
+        properties: expect.objectContaining({
+          command_id: { type: "string", enum: ["CMD-1"] },
+          argv: { type: "array", const: item.verification_commands[0]!.argv },
+        }),
+      }),
+    ]);
     const prompt = await readFile(join(ledger.runDir, "prompts/hands-fix-packet-R1-A1-attempt-1.md"), "utf8");
     expect(prompt).toContain('"packet_id": "R1-A1"');
     expect(prompt).toContain("`action_attempt`: 1");
