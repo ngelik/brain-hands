@@ -4178,7 +4178,13 @@ describe("runLocalWorkflow", () => {
     const manifest = await readManifestV2(setupResult.runDir);
     expect(manifest.stage).toBe("replanning");
     expect(manifest.review_accounting?.fix_cycles_used).toBe(0);
-    expect(manifest.work_item_progress.first).toMatchObject({ status: "blocked", queue_state: "blocked" });
+    expect(manifest.work_item_progress.first).toMatchObject({
+      status: "blocked",
+      queue_state: "blocked",
+      review_cycle_path: expect.any(String),
+      review_effect_id: expect.any(String),
+    });
+    expect(manifest.convergence_reports?.first).toMatchObject({ recommended_action: "create_replan" });
   });
 
   it("runs deterministic verification after the mutation and each changed self-review before Verifier", async () => {

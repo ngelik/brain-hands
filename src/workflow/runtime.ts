@@ -3692,6 +3692,41 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
   if (!resumableStages.has(manifest.stage)) {
     throw new Error(`Local runtime cannot resume from stage ${manifest.stage}`);
   }
+  const loadZeroMutationEffectCycle = async (
+    workItemId: string,
+    progress: WorkItemProgress | undefined,
+  ): Promise<ReviewCycleState | null> => {
+    if (
+      !progress
+      || typeof progress.review_revision !== "number"
+      || typeof progress.queue_path !== "string"
+    ) return null;
+    let cycle: ReviewCycleState;
+    try {
+      cycle = reviewCycleStateSchema.parse(await readRunArtifact<unknown>(
+        input.runDir,
+        reviewDecisionPath(workItemId, progress.review_revision),
+      ));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    if (
+      cycle.work_item_id !== workItemId
+      || cycle.review_revision !== progress.review_revision
+      || !isReviewEffectAction(cycle.decision.action)
+    ) return null;
+    const completed = await loadCompletedReviewEffect({
+      run_dir: input.runDir,
+      cycle,
+      owner: `runtime:work-item:${workItemId}`,
+    });
+    if (!completed) return null;
+    const result = parseFixEffectResult(completed.effect_result);
+    return result.kind === "still_blocking" && result.successful_hands_fixes === 0
+      ? cycle
+      : null;
+  };
   if (manifest.stage === "replanning" || manifest.stage === "awaiting_plan_approval") {
     const workItemId = manifest.current_work_item_id;
     const progress = workItemId ? manifest.work_item_progress[workItemId] : undefined;
@@ -3699,13 +3734,17 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     const pendingTarget = manifest.stage === "awaiting_plan_approval"
       ? resolvePendingReplanTarget(manifest)
       : null;
+    const zeroMutationCycle = manifest.stage === "replanning"
+      ? await loadZeroMutationEffectCycle(workItemId ?? "", progress)
+      : null;
     const hasReplanProvenance = Boolean(
       workItemId
       && progress
-      && typeof progress.review_cycle_path === "string"
-      && typeof progress.review_effect_id === "string"
-      && typeof progress.review_revision === "number"
-      && convergence?.recommended_action === "create_replan"
+      && ((typeof progress.review_cycle_path === "string"
+        && typeof progress.review_effect_id === "string"
+        && typeof progress.review_revision === "number"
+        && convergence?.recommended_action === "create_replan")
+        || zeroMutationCycle !== null)
       && (manifest.stage !== "awaiting_plan_approval" || pendingTarget !== null),
     );
     if (!hasReplanProvenance) {
@@ -6829,6 +6868,119 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     }
     const policyCriteria = policyEnabled ? workItemPolicyCriteria(approvedCriteria, item.id)! : null;
     const policyEffectOwner = `runtime:work-item:${item.id}`;
+    const prepareZeroMutationReplan = async (
+      sourceCycle: ReviewCycleState,
+      blocker: string,
+    ): Promise<LocalWorkflowResult> => {
+      const current = await readManifestV2(input.runDir);
+      const policy = current.review_policy_snapshot;
+      const accounting = current.review_accounting;
+      if (!policy || !accounting) throw new Error(`Zero-mutation replan requires policy accounting: ${item.id}`);
+      const sourceFindings = await loadFindingRevisionRecords(
+        input.runDir,
+        item.id,
+        sourceCycle.review_revision,
+        sourceCycle.finding_ids,
+      );
+      const reviewRevision = accounting.review_revision + 1;
+      const reference = sourceCycle.work_item_progress_reference;
+      if (!reference) throw new Error(`Zero-mutation replan lacks work-item evidence provenance: ${item.id}`);
+      manifest = await setProgress(input.runDir, item.id, {
+        ...(current.work_item_progress[item.id] ?? progress ?? { status: "blocked", attempts: reference.attempts }),
+        status: "blocked",
+        attempts: reference.attempts,
+        blocker,
+        queue_state: "blocked",
+        review_revision: reviewRevision,
+        review_path: reference.review_path,
+        verification_path: reference.verification_path,
+        review_cycle_path: undefined,
+        review_effect_id: undefined,
+      }, [reference.review_path, reference.verification_path]);
+      const findings: EngineFinding[] = [];
+      for (const finding of sourceFindings) {
+        findings.push(await recordFindingRevision(input.runDir, {
+          work_item_id: finding.work_item_id,
+          source: finding.source,
+          severity: finding.severity,
+          disposition: "requires_replan",
+          criterion_ref: finding.criterion_ref,
+          normalized_location: finding.normalized_location,
+          problem_class: finding.problem_class,
+          problem: finding.problem,
+          required_fix: finding.required_fix,
+          evidence_refs: finding.evidence_refs,
+          review_revision: reviewRevision,
+        }));
+      }
+      const cycle = await beginReviewCycle({
+        run_dir: input.runDir,
+        work_item_id: item.id,
+        phase: "work_item",
+        review_revision: reviewRevision,
+        policy_hash: hashReviewPolicy(policy),
+        finding_ids: [...new Set(findings.map((finding) => finding.finding_id))].sort(),
+        accounting_before: accounting,
+        work_item_progress_reference: reference,
+        evaluate: () => evaluateReviewPolicy({
+          policy,
+          findings,
+          accounting,
+          phase: "work_item",
+          operational_blocker: null,
+          replan_patch_pending: false,
+          authorization: null,
+          quality_recovery: qualityRecoveryEligibilitySnapshot(current, item.id),
+        }),
+      });
+      if (cycle.decision.action !== "create_replan") {
+        throw new Error(`Zero-mutation policy recovery did not create a replan decision: ${item.id}`);
+      }
+      const afterCycle = await readManifestV2(input.runDir);
+      await writeConvergenceReport({
+        run_dir: input.runDir,
+        cycle,
+        policy,
+        accounting: afterCycle.review_accounting!,
+        finding_index: afterCycle.finding_index ?? {},
+        findings,
+        release_guards: afterCycle.release_guards ?? [],
+        authorization: null,
+      });
+      manifest = await setProgress(input.runDir, item.id, {
+        ...(afterCycle.work_item_progress[item.id] ?? progress ?? { status: "blocked", attempts: reference.attempts }),
+        status: "blocked",
+        attempts: reference.attempts,
+        blocker,
+        queue_state: "blocked",
+        review_revision: cycle.review_revision,
+        review_path: reference.review_path,
+        verification_path: reference.verification_path,
+        review_cycle_path: cycle.decision_path,
+        review_effect_id: cycle.effect_id,
+      }, [reference.review_path, reference.verification_path, cycle.decision_path]);
+      if (manifest.stage !== "replanning") {
+        manifest = await transitionRun(input.runDir, "replanning", {
+          actor: "runtime",
+          payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
+        });
+      }
+      manifest = await updateManifestV2(input.runDir, { delivery_state: "blocked", last_blocker: blocker });
+      return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+    };
+    if (
+      policyEnabled
+      && (manifest.stage === "verifier_review" || manifest.stage === "replanning")
+      && (progress?.queue_state === "complete" || progress?.queue_state === "blocked")
+    ) {
+      const zeroMutationCycle = await loadZeroMutationEffectCycle(item.id, progress);
+      if (zeroMutationCycle) {
+        return prepareZeroMutationReplan(
+          zeroMutationCycle,
+          `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`,
+        );
+      }
+    }
     let recoveredBoundedCompletionMarker: string | null | undefined;
     if (
       !policyEnabled
@@ -6946,25 +7098,10 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       if (completedEffect) {
         const result = parseFixEffectResult(completedEffect.effect_result);
         if (result.kind === "still_blocking" && result.successful_hands_fixes === 0) {
-          const blocker = `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
-          manifest = await transitionRun(input.runDir, "replanning", {
-            actor: "runtime",
-            payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
-          });
-          manifest = await updateManifestV2(input.runDir, {
-            delivery_state: "blocked",
-            last_blocker: blocker,
-            work_item_progress: {
-              ...manifest.work_item_progress,
-              [item.id]: {
-                ...(manifest.work_item_progress[item.id] ?? {}),
-                status: "blocked",
-                blocker,
-                queue_state: "blocked",
-              },
-            },
-          });
-          return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+          return prepareZeroMutationReplan(
+            cycle,
+            `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`,
+          );
         }
       }
     }
@@ -6999,25 +7136,10 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
         }
         if (result.kind === "still_blocking" && result.successful_hands_fixes === 0) {
-          const blocker = `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
-          manifest = await transitionRun(input.runDir, "replanning", {
-            actor: "runtime",
-            payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
-          });
-          manifest = await updateManifestV2(input.runDir, {
-            delivery_state: "blocked",
-            last_blocker: blocker,
-            work_item_progress: {
-              ...manifest.work_item_progress,
-              [item.id]: {
-                ...(manifest.work_item_progress[item.id] ?? {}),
-                status: "blocked",
-                blocker,
-                queue_state: "blocked",
-              },
-            },
-          });
-          return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+          return prepareZeroMutationReplan(
+            cycle,
+            `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`,
+          );
         }
         if (result.evidence_paths.some((path) => path.includes("..") || path.startsWith("/"))) {
           throw new Error(`Completed ordered fix effect evidence path escapes its run: ${item.id}`);
@@ -7152,24 +7274,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         const blocker = queueResult.kind === "replan_required"
           ? `Fix packet requires replanning for work item ${item.id}: ${queueResult.blocker}`
           : `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
-        manifest = await transitionRun(input.runDir, "replanning", {
-          actor: "runtime",
-          payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
-        });
-        manifest = await updateManifestV2(input.runDir, {
-          delivery_state: "blocked",
-          last_blocker: blocker,
-          work_item_progress: {
-            ...manifest.work_item_progress,
-            [item.id]: {
-              ...(manifest.work_item_progress[item.id] ?? {}),
-              status: "blocked",
-              blocker,
-              queue_state: "blocked",
-            },
-          },
-        });
-        return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+        return prepareZeroMutationReplan(cycle, blocker);
       }
       await recordAuthorizedRuntimeSuccess(
         orderedRecoveryOperation,
@@ -8434,24 +8539,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
                 const blocker = queueResult.kind === "replan_required"
                   ? `Fix packet requires replanning for work item ${item.id}: ${queueResult.blocker}`
                   : `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
-                manifest = await transitionRun(input.runDir, "replanning", {
-                  actor: "runtime",
-                  payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
-                });
-                manifest = await updateManifestV2(input.runDir, {
-                  delivery_state: "blocked",
-                  last_blocker: blocker,
-                  work_item_progress: {
-                    ...manifest.work_item_progress,
-                    [item.id]: {
-                      ...(manifest.work_item_progress[item.id] ?? {}),
-                      status: "blocked",
-                      blocker,
-                      queue_state: "blocked",
-                    },
-                  },
-                });
-                return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+                return prepareZeroMutationReplan(cycle, blocker);
               }
               if (queueResult.kind === "operationally_blocked") {
                 const blocker = queueResult.blocker.message;
