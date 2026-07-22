@@ -15,6 +15,7 @@ import {
   requiresPinnedRuntimeAuthority,
   updateReviewAccounting,
   updateManifestV2,
+  verifyPersistedPlanApprovalSubject,
 } from "../../src/core/ledger.js";
 import { generatedReplanPatchSchema, replanPatchSchema } from "../../src/core/schema.js";
 import {
@@ -1833,6 +1834,7 @@ describe("approvePreparedReplanRevision", () => {
     expect(manifest).toMatchObject({ stage: "replanning", pending_plan_approval: null });
     expect(manifest.plan_revisions["2"]?.origin).toBe("replan");
     expect(manifest.review_accounting?.review_revision).toBe(2);
+    await expect(verifyPersistedPlanApprovalSubject(input.run_dir, manifest, 2)).resolves.not.toBeNull();
     const progress = manifest.work_item_progress["BH-005"]!;
     expect(progress.replan_patch_path).toBeUndefined();
     const cycle = JSON.parse(await readFile(join(input.run_dir, progress.review_cycle_path!), "utf8"));

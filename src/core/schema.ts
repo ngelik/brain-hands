@@ -2246,6 +2246,7 @@ export const runManifestV2Schema = z.object({
         }
         if (revisionNumber >= startRevision && state !== "complete") {
           issue(["plan_revisions", key], "Every revision from the exact approval start requires complete exact metadata");
+          issue(["approval_protocol_version"], "Approval protocol version 1 requires complete exact revision metadata");
         }
       }
       if (startRevision > 1) {

@@ -3810,7 +3810,7 @@ export async function commitClaimedInitialPlan(input: {
       const persisted = (await readOwnedEvidenceFile(transaction.runDir, relativePath, "plans/")).toString("utf8");
       if (persisted !== candidate.plan_text) throw new Error("Claimed Brain plan bytes do not match the committed revision");
       if (approvalRequest !== null) {
-        const pointer = approvalPointerForRevision(manifest, 1);
+        const pointer = await approvalPointerForRevision(transaction.runDir, manifest, 1);
         if (pointer === null) {
           throw new Error("Claimed Brain plan approval request metadata is missing");
         }
@@ -4363,10 +4363,39 @@ async function verifyDiscoveryPrerequisite(
   validateDiscoveryCoverage(discovered, brief);
 }
 
-function approvalPointerForRevision(
+async function hasExactPlanRejection(
+  runDir: string,
   manifest: RunManifestV2Ledger,
   revision: number,
-): PendingPlanApprovalV1 | null {
+  pointer: PendingPlanApprovalV1,
+): Promise<boolean> {
+  const path = `approvals/plan/revision-${revision}-rejection.json`;
+  let bytes: Buffer;
+  try {
+    bytes = await readOwnedEvidenceFile(runDir, path, "approvals/");
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+  const rejection = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+  return rejection.schema_version === 1
+    && rejection.run_id === manifest.run_id
+    && rejection.rejected_revision === revision
+    && rejection.base_revision === pointer.base_revision
+    && rejection.request_path === pointer.request_path
+    && rejection.request_sha256 === pointer.request_sha256
+    && rejection.approval_subject_sha256 === pointer.approval_subject_sha256
+    && typeof rejection.actor === "string"
+    && rejection.actor.trim() !== ""
+    && typeof rejection.reason === "string"
+    && rejection.reason.trim() !== "";
+}
+
+async function approvalPointerForRevision(
+  runDir: string,
+  manifest: RunManifestV2Ledger,
+  revision: number,
+): Promise<PendingPlanApprovalV1 | null> {
   const recorded = manifest.plan_revisions[String(revision)];
   if (!recorded) throw new Error(`Plan revision ${revision} is not recorded`);
   const metadata = [
@@ -4410,7 +4439,9 @@ function approvalPointerForRevision(
     throw new Error("Pending plan approval does not match the requested revision metadata");
   }
   if ((manifest.pending_plan_approval === null
-    || manifest.pending_plan_approval.proposed_revision !== revision) && !alreadyApproved) {
+    || manifest.pending_plan_approval.proposed_revision !== revision)
+    && !alreadyApproved
+    && !(await hasExactPlanRejection(runDir, manifest, revision, pointer))) {
     throw new Error("Pinned plan approval pending pointer is missing before promotion");
   }
   return pointer;
@@ -4460,7 +4491,7 @@ export async function verifyPersistedPlanApprovalSubject(
     };
   } = {},
 ): Promise<VerifiedPlanApproval | null> {
-  const pointer = approvalPointerForRevision(manifest, revision);
+  const pointer = await approvalPointerForRevision(runDir, manifest, revision);
   if (pointer === null) {
     if (isHistoricalApprovalPrefixRevision(manifest, revision)) {
       throw new Error("Pinned run plan approval metadata is missing");
@@ -4528,7 +4559,7 @@ export async function verifyHistoricalApprovedRuntimeSubject(
   if (manifest.approved_revision === null || revision > manifest.approved_revision) {
     throw new Error("Historical approval prefix revision is not an approved runtime base");
   }
-  if (approvalPointerForRevision(manifest, revision) !== null) {
+  if (await approvalPointerForRevision(runDir, manifest, revision) !== null) {
     throw new Error("Historical approval prefix revision unexpectedly contains exact approval metadata");
   }
   const snapshot = await readVerifiedPlanSnapshot(runDir, manifest, revision, true);
