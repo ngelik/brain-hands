@@ -3674,6 +3674,12 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       : manifest.review_policy_snapshot !== undefined
         ? "normal_fix"
         : attempt > maxHandsFixAttempts + 1 ? "quality_recovery" : "normal_fix";
+  const implementationAttempt = (progress: WorkItemProgress | undefined): number => {
+    const match = typeof progress?.implementation_path === "string"
+      ? progress.implementation_path.match(/\/attempt-(\d+)\.json$/)
+      : null;
+    return match ? Number(match[1]) : Math.max(1, progress?.attempts ?? 1);
+  };
   const expectedTerminalMutationKind = (): HandsSelfReviewReport["mutation_kind"] => "normal_fix";
   const terminalFixLimitBlocker = (scope: string, fixesUsed: number): string =>
     `${scope} reached the configured limit of ${maxHandsFixAttempts} actual Hands ${maxHandsFixAttempts === 1 ? "fix" : "fixes"} (${fixesUsed} used)`;
@@ -6885,15 +6891,10 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       const reviewRevision = accounting.review_revision + 1;
       const reference = sourceCycle.work_item_progress_reference;
       if (!reference) throw new Error(`Zero-mutation replan lacks work-item evidence provenance: ${item.id}`);
-      const currentImplementationPath = current.work_item_progress[item.id]?.implementation_path;
-      const mutationAttemptMatch = typeof currentImplementationPath === "string"
-        ? currentImplementationPath.match(/\/attempt-(\d+)\.json$/)
-        : null;
-      const mutationAttempt = mutationAttemptMatch ? Number(mutationAttemptMatch[1]) : reference.attempts;
       manifest = await setProgress(input.runDir, item.id, {
         ...(current.work_item_progress[item.id] ?? progress ?? { status: "blocked", attempts: reference.attempts }),
         status: "blocked",
-        attempts: mutationAttempt,
+        attempts: reference.attempts,
         blocker,
         queue_state: undefined,
         queue_path: undefined,
@@ -6992,12 +6993,11 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         && cycle.effect_id === progress.review_effect_id
         && cycle.decision.action === "create_replan"
       ) {
-        const mutationAttemptMatch = typeof progress.implementation_path === "string"
-          ? progress.implementation_path.match(/\/attempt-(\d+)\.json$/)
-          : null;
+        const reference = cycle.work_item_progress_reference;
+        if (!reference) throw new Error(`Create-replan cycle lacks work-item progress provenance: ${item.id}`);
         manifest = await setProgress(input.runDir, item.id, {
           ...progress,
-          attempts: mutationAttemptMatch ? Number(mutationAttemptMatch[1]) : progress.attempts,
+          attempts: reference.attempts,
           queue_state: undefined,
           queue_path: undefined,
           active_action_id: null,
@@ -7812,8 +7812,9 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     }
 
     if (["verifier_review", "replanning", "awaiting_plan_approval"].includes(resumeStage)) {
+      const mutationParentAttempt = implementationAttempt(progress);
       const validatedGate = qualityGatePolicy && progress?.queue_state !== "complete" && !retryOperationalVerifierReview
-        ? await validatePersistedMutationQualityGate({ workItem: item, parentAttempt: Math.max(1, progress?.attempts ?? 1), expectedMutationKind: expectedMutationKind(Math.max(1, progress?.attempts ?? 1)), activeAction: null })
+        ? await validatePersistedMutationQualityGate({ workItem: item, parentAttempt: mutationParentAttempt, expectedMutationKind: expectedMutationKind(mutationParentAttempt), activeAction: null })
         : undefined;
       const persistedEvidence = validatedGate
         ? validatedGate.finalVerification
