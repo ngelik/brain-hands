@@ -116,7 +116,10 @@ function boundedSourceDiff(patch: string, role: "Hands" | "Verifier"): string {
 }
 
 export function boundedHandsDiff(patch: string): string {
-  return boundedSourceDiff(patch, "Hands");
+  const bounded = boundedSourceDiff(patch, "Hands");
+  return Buffer.byteLength(bounded, "utf8") <= CONTEXT_LIMITS_V1.hands_diff_bytes
+    ? bounded
+    : compactRoleDiff(patch);
 }
 
 export function boundedVerifierDiff(patch: string): string {
@@ -476,14 +479,37 @@ function assertRequiredContextFits<T>(value: T, schema: z.ZodType<T>, totalLimit
   throw new Error(`${label} required context exceeds ${totalLimit} UTF-8 bytes`);
 }
 
+function utf8Prefix(value: string, maxBytes: number): string {
+  let bytes = 0;
+  let result = "";
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
+function utf8Suffix(value: string, maxBytes: number): string {
+  let bytes = 0;
+  const characters: string[] = [];
+  for (const character of Array.from(value).reverse()) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    characters.push(character);
+    bytes += characterBytes;
+  }
+  return characters.reverse().join("");
+}
+
 function compactTextTail(value: string, maxBytes: number, label: string): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  let tail = value.slice(-maxBytes);
-  while (Buffer.byteLength(tail, "utf8") > maxBytes) tail = tail.slice(1);
-  return [
-    `[Earlier ${label} summarized: ${Buffer.byteLength(value, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(value).digest("hex")}]`,
-    tail,
-  ].join("\n");
+  const marker = `[Earlier ${label} summarized: ${Buffer.byteLength(value, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(value).digest("hex")}]`;
+  const retainedBytes = maxBytes - Buffer.byteLength(marker, "utf8") - Buffer.byteLength("\n\n", "utf8");
+  const prefix = utf8Prefix(value, Math.floor(retainedBytes / 3));
+  const suffix = utf8Suffix(value, retainedBytes - Buffer.byteLength(prefix, "utf8"));
+  return [prefix, marker, suffix].join("\n");
 }
 
 function compactTextEdges(value: string, maxBytes: number, label: string): string {

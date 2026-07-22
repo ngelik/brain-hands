@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -52,6 +53,7 @@ import {
   buildHandsContext,
   buildReflectionContext,
   buildVerifierContext,
+  compactHandsWorkItem,
   loadRoleContext,
 } from "../../src/workflow/role-context.js";
 import { integratedWorkItem } from "../../src/workflow/integrated-work-item.js";
@@ -609,10 +611,13 @@ describe("bounded role contexts", () => {
     await expect(buildHandsContext(handsInput(run, {
       diff: exactMultibyteDiff,
     }))).resolves.toMatchObject({ path: expect.stringContaining("contexts/hands/") });
-    await expect(buildHandsContext(handsInput(run, {
+    const overflowRef = await buildHandsContext(handsInput(run, {
       attempt: 2,
       diff: `${exactMultibyteDiff}a`,
-    }))).rejects.toThrow("Hands diff exceeds 32768 UTF-8 bytes");
+    }));
+    const overflow = await loadRoleContext(run, overflowRef, "hands");
+    expect(overflow.diff).toContain("Source diff summarized to preserve bounded role context.");
+    expect(Buffer.byteLength(overflow.diff, "utf8")).toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_diff_bytes);
 
     const empty = handsContextV1Schema.parse({
       schema_version: 1,
@@ -644,6 +649,23 @@ describe("bounded role contexts", () => {
       .toContain("Earlier approved objective history summarized");
     expect(canonicalJsonBytes(handsContextV1Schema, overContext).byteLength)
       .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
+  });
+
+  it("projects oversized Hands objectives as byte-safe head and suffix context", () => {
+    const objective = [
+      "ORIGINAL-INTENT: preserve the initial migration constraint.",
+      "中😀".repeat(3_000),
+      "LATEST-INTENT: preserve the final rollout constraint.",
+    ].join("\n");
+    const compacted = compactHandsWorkItem(item("BH-001", [], objective)).objective;
+
+    expect(compacted).toContain("ORIGINAL-INTENT: preserve the initial migration constraint.");
+    expect(compacted).toContain("LATEST-INTENT: preserve the final rollout constraint.");
+    expect(compacted).toContain(
+      `[Earlier approved objective history summarized: ${Buffer.byteLength(objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(objective).digest("hex")}]`,
+    );
+    expect(compacted).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(2 * 1024);
   });
 
   it("summarizes an oversized generated lockfile section while preserving adjacent source patches", () => {
@@ -714,6 +736,17 @@ describe("bounded role contexts", () => {
     expect(bounded).toContain("Source patch section summarized for bounded Hands context.");
     expect(bounded).toContain("Path: src/styles.css");
     expect(bounded).not.toContain("x".repeat(100));
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_diff_bytes);
+  });
+
+  it("digest-compacts an oversized unstructured Hands diff", () => {
+    const patch = "中😀".repeat(CONTEXT_LIMITS_V1.hands_diff_bytes);
+    const bounded = boundedHandsDiff(patch);
+
+    expect(bounded).toContain("Source diff summarized to preserve bounded role context.");
+    expect(bounded).toContain(`Git patch bytes: ${Buffer.byteLength(patch, "utf8")}`);
+    expect(bounded).toContain(`Git patch sha256: ${createHash("sha256").update(patch).digest("hex")}`);
+    expect(bounded).not.toContain("中😀".repeat(100));
     expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_diff_bytes);
   });
 
