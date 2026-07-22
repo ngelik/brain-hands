@@ -765,6 +765,69 @@ describe("ledger", () => {
     expect((await readManifestV2(ledger.runDir)).stage).toBe("replanning");
   });
 
+  it("scopes malformed replan-contract retries to the immutable review evidence", async () => {
+    repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-ledger-replan-contract-review-scope-"));
+    const ledger = await createRunLedgerV2({ repoRoot, originalRequest: "Retry a later malformed Verifier review once" });
+    const firstReviewPath = "reviews/feature/attempt-3.json";
+    const firstVerificationPath = "verification/feature/attempt-3/evidence.json";
+    await updateManifestV2(ledger.runDir, {
+      stage: "replanning",
+      current_work_item_id: "feature",
+      work_item_progress: {
+        feature: {
+          status: "blocked",
+          attempts: 3,
+          review_path: firstReviewPath,
+          verification_path: firstVerificationPath,
+          review_revision: 7,
+          review_cycle_path: "reviews/decisions/feature/revision-7.json",
+          review_effect_id: `review-effect:${"a".repeat(64)}`,
+        },
+      },
+    });
+    const firstBlocker = "invalid_verifier_contract: first malformed command linkage";
+    await retryVerifierReviewAfterInvalidReplanContract(ledger.runDir, {
+      workItemId: "feature",
+      blocker: firstBlocker,
+    });
+    await transitionRun(ledger.runDir, "replanning", { actor: "test" });
+    const secondReviewPath = "reviews/feature/attempt-4.json";
+    const secondVerificationPath = "verification/feature/attempt-4/evidence.json";
+    await updateManifestV2(ledger.runDir, {
+      current_work_item_id: "feature",
+      work_item_progress: {
+        feature: {
+          status: "blocked",
+          attempts: 4,
+          review_path: secondReviewPath,
+          verification_path: secondVerificationPath,
+          review_revision: 8,
+          review_cycle_path: "reviews/decisions/feature/revision-8.json",
+          review_effect_id: `review-effect:${"b".repeat(64)}`,
+          replan_contract_retry_used: true,
+        },
+      },
+    });
+    const secondBlocker = "invalid_verifier_contract: later malformed command linkage";
+
+    const retried = await retryVerifierReviewAfterInvalidReplanContract(ledger.runDir, {
+      workItemId: "feature",
+      blocker: secondBlocker,
+    });
+
+    expect(retried).toMatchObject({ stage: "verifier_review", last_blocker: secondBlocker });
+    expect(retried.work_item_progress.feature).toMatchObject({
+      review_path: secondReviewPath,
+      verification_path: secondVerificationPath,
+      replan_contract_retry_used: true,
+    });
+    const events = (await readFile(join(ledger.runDir, "events.jsonl"), "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type: string });
+    expect(events.filter((event) => event.type === "invalid_replan_contract_retry")).toHaveLength(2);
+  });
+
   it("tracks controller-output correction independently from linkage retry", async () => {
     repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-ledger-controller-output-retry-"));
     const ledger = await createRunLedgerV2({ repoRoot, originalRequest: "Correct controller-owned output" });

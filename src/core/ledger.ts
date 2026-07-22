@@ -3225,7 +3225,23 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
     const retryField = input.retryKind === "controller_output"
       ? "controller_output_contract_retry_used"
       : "replan_contract_retry_used";
-    if (manifest.stage === "verifier_review" && progress?.[retryField] === true) {
+    const reviewPath = progress?.review_path;
+    const verificationPath = progress?.verification_path;
+    const eventId = typeof reviewPath === "string" && typeof verificationPath === "string"
+      ? `invalid-replan-contract-retry:${createHash("sha256")
+        .update(`${manifest.run_id}\0${input.workItemId}\0${input.retryKind ?? "linkage"}\0${reviewPath}\0${verificationPath}`)
+        .digest("hex")}`
+      : null;
+    const eventBytes = await readOwnedRunFile(transaction.runDir, "events.jsonl");
+    const retryEvents = eventBytes.toString("utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => runEventSchema.parse(JSON.parse(line)) as RunEventRecord)
+      .filter((event) => event.type === "invalid_replan_contract_retry"
+        && event.payload.work_item_id === input.workItemId);
+    const exactRetryUsed = eventId !== null && retryEvents.some((event) => event.event_id === eventId);
+    const unscopedLegacyRetryUsed = progress?.[retryField] === true && retryEvents.length === 0;
+    if (manifest.stage === "verifier_review" && exactRetryUsed) {
       if (
         manifest.current_work_item_id !== input.workItemId
         || progress.blocker !== input.blocker
@@ -3241,7 +3257,7 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
     if (manifest.current_work_item_id !== input.workItemId || !progress) {
       throw new Error("Invalid Verifier-contract retry work-item identity");
     }
-    if (progress[retryField] === true) {
+    if (exactRetryUsed || unscopedLegacyRetryUsed) {
       throw new Error(`Verifier-contract retry already used for work item ${input.workItemId}`);
     }
     if (
@@ -3275,11 +3291,8 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
     delete nextProgress.completed_action_ids;
     delete nextProgress.focused_review_path;
 
-    const eventId = `invalid-replan-contract-retry:${createHash("sha256")
-      .update(`${manifest.run_id}\0${input.workItemId}\0${input.retryKind ?? "linkage"}\0${progress.review_path}\0${progress.verification_path}`)
-      .digest("hex")}`;
     await appendRunEventOnceLocked(transaction, {
-      eventId,
+      eventId: eventId!,
       actor: "runtime",
       stage: "verifier_review",
       type: "invalid_replan_contract_retry",
