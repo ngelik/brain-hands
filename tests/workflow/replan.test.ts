@@ -421,6 +421,18 @@ describe("createReplanPatch", () => {
     })).toEqual([]);
     expect(replanOutputScopeDiagnostics({ baseTarget, proposedTarget: baseTarget, review, findingRecords }))
       .toContain(`Generated artifact output ${artifactPath} is outside proposed expected_artifacts scope`);
+    const browserPath = "artifacts/screenshots/approved-elsewhere.png";
+    const browserReview = structuredClone(review);
+    browserReview.findings[0]!.remediation!.verification.required_evidence[0] = {
+      id: "EVID-1", kind: "browser", source_id: "CMD-1", output_path: browserPath,
+    };
+    expect(replanOutputScopeDiagnostics({
+      baseTarget,
+      proposedTarget: baseTarget,
+      review: browserReview,
+      findingRecords,
+      approvedBrowserOutputs: [browserPath],
+    })).toEqual([]);
     expect(replanOutputScopeDiagnostics({
       baseTarget,
       proposedTarget: { ...baseTarget, expected_artifacts: [...baseTarget.expected_artifacts, "artifacts/unrelated.json"] },

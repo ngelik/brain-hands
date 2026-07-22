@@ -220,12 +220,20 @@ export function replanOutputScopeDiagnostics(input: {
   proposedTarget: WorkItem;
   review: VerifierReview;
   findingRecords: readonly ReplanFindingContext[];
+  approvedArtifactOutputs?: readonly string[];
+  approvedBrowserOutputs?: readonly string[];
 }): string[] {
   const unresolved = new Set(input.findingRecords.map((finding) =>
     `${finding.problem}\0${finding.required_fix ?? ""}`));
   const approvedArgv = new Set(input.proposedTarget.verification_commands.map((command) => canonical(command.argv)));
-  const artifactScope = new Set(input.proposedTarget.expected_artifacts);
-  const browserScope = new Set(input.proposedTarget.browser_checks.map((check) => check.screenshot_artifact));
+  const artifactScope = new Set([
+    ...input.proposedTarget.expected_artifacts,
+    ...(input.approvedArtifactOutputs ?? []),
+  ]);
+  const browserScope = new Set([
+    ...input.proposedTarget.browser_checks.map((check) => check.screenshot_artifact),
+    ...(input.approvedBrowserOutputs ?? []),
+  ]);
   const requiredArtifacts = new Set<string>();
   const diagnostics: string[] = [];
   for (const finding of input.review.findings) {
@@ -2137,6 +2145,9 @@ export async function prepareReplanApprovalBoundary(
       proposedTarget,
       review,
       findingRecords: record.provenance.finding_records,
+      approvedArtifactOutputs: proposed.work_items.flatMap((item) => item.expected_artifacts),
+      approvedBrowserOutputs: proposed.work_items.flatMap((item) =>
+        item.browser_checks.map((check) => check.screenshot_artifact)),
     });
     if (outputDiagnostics.length > 0) throw new InvalidReplanCandidateError(outputDiagnostics);
   } catch (error) {

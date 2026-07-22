@@ -5317,6 +5317,9 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       review_revision: reviewRevision, criterion_ref: criterion.id, severity: action.severity,
       problem_class: action.problem_class!, approved_plan_sha256: approvedSha, worktree_path: input.worktreePath,
       packet_identity: current.workflow_protocol === "bounded-context-v1" ? "scoped" : "legacy",
+      approved_artifact_outputs: input.plan.work_items.flatMap((candidate) => candidate.expected_artifacts),
+      approved_browser_outputs: input.plan.work_items.flatMap((candidate) =>
+        candidate.browser_checks.map((check) => check.screenshot_artifact)),
     });
     let packet: ReviewFixPacketV1;
     try {

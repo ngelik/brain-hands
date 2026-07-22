@@ -67,6 +67,8 @@ export interface CompileReviewFixPacketInput {
   approved_plan_sha256: string;
   worktree_path?: string;
   packet_identity?: "legacy" | "scoped";
+  approved_artifact_outputs?: readonly string[];
+  approved_browser_outputs?: readonly string[];
 }
 
 export interface PersistedReviewFixPacket {
@@ -237,8 +239,14 @@ export function compileReviewFixPacket(input: CompileReviewFixPacketInput): Revi
       : `verification/review-fix/${evidence.id.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`,
   }));
   const packetCommandIds = new Set(parsedClaim.verification.commands.map((command) => command.id));
-  const approvedArtifacts = new Set(input.work_item.expected_artifacts);
-  const approvedBrowserOutputs = new Set(input.work_item.browser_checks.map((check) => check.screenshot_artifact));
+  const approvedArtifacts = new Set([
+    ...input.work_item.expected_artifacts,
+    ...(input.approved_artifact_outputs ?? []),
+  ]);
+  const approvedBrowserOutputs = new Set([
+    ...input.work_item.browser_checks.map((check) => check.screenshot_artifact),
+    ...(input.approved_browser_outputs ?? []),
+  ]);
   const allowedGeneratedEvidenceFiles = normalizedRequiredEvidence.flatMap((evidence) => {
     if (evidence.kind !== "artifact" && evidence.kind !== "browser") return [];
     if (!packetCommandIds.has(evidence.source_id)) {

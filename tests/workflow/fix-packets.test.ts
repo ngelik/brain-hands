@@ -73,10 +73,22 @@ describe("fix packets", () => {
     unknown.verification.required_evidence[1]!.source_id = "UNKNOWN";
     expect(() => compile(unknown)).toThrow(/unknown command/);
     const outOfScope = structuredClone(linked);
-    outOfScope.verification.required_evidence[1]!.output_path = "artifacts/other.json";
+    outOfScope.verification.required_evidence.find((evidence) => evidence.kind === "browser")!.output_path = "artifacts/other.json";
     expect(() => compile(outOfScope)).toThrow(FixPacketRequiresReplanError);
+    expect(() => compileReviewFixPacket({
+      claim: outOfScope,
+      work_item: workItem,
+      finding_id: "finding:scope",
+      action_id: "R1-A1",
+      review_revision: 1,
+      criterion_ref: workItem.acceptance[0]!.id,
+      severity: "medium",
+      problem_class: "verification",
+      approved_plan_sha256: "a".repeat(64),
+      approved_browser_outputs: ["artifacts/other.json"],
+    })).not.toThrow();
     const controllerOwned = structuredClone(linked);
-    controllerOwned.verification.required_evidence[1]!.output_path = "verification/issue-1/attempt-2/rerun-browser.txt";
+    controllerOwned.verification.required_evidence.find((evidence) => evidence.kind === "browser")!.output_path = "verification/issue-1/attempt-2/rerun-browser.txt";
     expect(() => compile(controllerOwned)).toThrow(/controller-owned verification namespace/);
     try {
       compile(controllerOwned);
