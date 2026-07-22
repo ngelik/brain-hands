@@ -6,6 +6,7 @@ import type { CodexAdapter, CodexInvokeInput } from "../../src/adapters/codex.js
 import type { ResourceBudgetPort } from "../../src/core/resource-budget.js";
 import { approvePlanRevision, createRunLedgerV2, recordPlan, updateManifestV2 } from "../../src/core/ledger.js";
 import { artifactRefFromBytes, canonicalJsonBytes, handsContextV1Schema } from "../../src/core/context-contracts.js";
+import { verifierFindingSchema } from "../../src/core/schema.js";
 import type { ImplementationResult, ResolvedRunIntake, WorkItem } from "../../src/core/types.js";
 import { ImplementationResultMismatchError, runHandsWorkItem } from "../../src/workflow/worker.js";
 import { buildHandsContext, loadRoleContext, type HandsAttemptKind } from "../../src/workflow/role-context.js";
@@ -109,10 +110,22 @@ async function persistedContext(
 }
 
 describe("runHandsWorkItem", () => {
+  const oversizedOrdinaryFinding = verifierFindingSchema.parse({
+    severity: "medium",
+    file: "src/example.ts",
+    line: null,
+    acceptance_criterion: "The ordinary prompt remains bounded.",
+    problem_class: "correctness",
+    problem: "x".repeat(128 * 1024),
+    required_fix: "Keep the prompt bounded.",
+    evidence_refs: ["verification/evidence.json"],
+    re_verification: [],
+  });
+
   it.each([
-    ["ordinary", 1, "initial" as const],
-    ["quality recovery", 2, "quality_recovery" as const],
-  ])("rejects an oversized %s Hands prompt before artifacts, Codex, or budget interaction", async (_label, attempt, attemptKind) => {
+    ["ordinary", 1, "initial" as const, { findings: [oversizedOrdinaryFinding] }],
+    ["quality recovery", 2, "quality_recovery" as const, { diagnosticContext: "x".repeat(128 * 1024) }],
+  ])("rejects an oversized %s Hands prompt before artifacts, Codex, or budget interaction", async (_label, attempt, attemptKind, promptInput) => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-worker-oversized-prompt-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
     const codex = new RecordingHands();
@@ -135,7 +148,7 @@ describe("runHandsWorkItem", () => {
       budget,
       attempt,
       attemptKind,
-      diagnosticContext: "x".repeat(128 * 1024),
+      ...promptInput,
     })).rejects.toThrow(/Hands prompt exceeds 131072 bytes/);
 
     expect(codex.calls).toHaveLength(0);
