@@ -238,6 +238,34 @@ export function requiredReplanArtifactOutputs(input: {
   return outputs;
 }
 
+function materializeRequiredReplanArtifacts(input: {
+  plan: ReturnType<typeof materializeReplanCandidate>;
+  targetWorkItemId: string;
+  review: VerifierReview;
+  findingRecords: readonly ReplanFindingContext[];
+}): ReturnType<typeof materializeReplanCandidate> {
+  const target = input.plan.work_items.find((item) => item.id === input.targetWorkItemId);
+  if (!target) throw new Error("Replan artifact materialization target is absent");
+  const required = requiredReplanArtifactOutputs({
+    proposedTarget: target,
+    review: input.review,
+    findingRecords: input.findingRecords,
+  });
+  if (required.every((path) => target.expected_artifacts.includes(path))) return input.plan;
+  return {
+    ...input.plan,
+    work_items: input.plan.work_items.map((item) => item.id === target.id
+      ? {
+          ...item,
+          expected_artifacts: [
+            ...item.expected_artifacts,
+            ...required.filter((path) => !item.expected_artifacts.includes(path)),
+          ],
+        }
+      : item),
+  };
+}
+
 export function replanOutputScopeDiagnostics(input: {
   baseTarget: WorkItem;
   proposedTarget: WorkItem;
@@ -2155,34 +2183,21 @@ export async function prepareReplanApprovalBoundary(
       validateDiscoveryCoverage(proposed as DiscoveredBrainPlan, verified.brief);
     }
     const baseTarget = basePlan.work_items.find((item) => item.id === input.targetWorkItemId)!;
-    const reviewPath = decision.work_item_progress_reference?.review_path;
+    const reviewPath = decision?.work_item_progress_reference?.review_path;
     if (!reviewPath) throw new Error("Replan candidate validation is missing its exact review evidence");
     const review = persistedVerifierReviewSchema.parse(JSON.parse((await readOwnedEvidenceFile(
       input.runDir,
       reviewPath,
       "reviews/",
     )).toString("utf8")));
-    let proposedTarget = proposed.work_items.find((item) => item.id === input.targetWorkItemId)!;
-    const requiredArtifactOutputs = requiredReplanArtifactOutputs({
-      proposedTarget,
+    proposed = materializeRequiredReplanArtifacts({
+      plan: proposed,
+      targetWorkItemId: input.targetWorkItemId,
       review,
       findingRecords: record.provenance.finding_records,
     });
-    if (requiredArtifactOutputs.some((path) => !proposedTarget.expected_artifacts.includes(path))) {
-      proposed = parseExecutionPlan({
-        ...proposed,
-        work_items: proposed.work_items.map((item) => item.id === proposedTarget.id
-          ? {
-              ...item,
-              expected_artifacts: [
-                ...item.expected_artifacts,
-                ...requiredArtifactOutputs.filter((path) => !item.expected_artifacts.includes(path)),
-              ],
-            }
-          : item),
-      }, { mode: manifest.mode, repoRoot: manifest.repo_root }, manifest.workflow_protocol);
-      proposedTarget = proposed.work_items.find((item) => item.id === input.targetWorkItemId)!;
-    }
+    proposed = parseExecutionPlan(proposed, { mode: manifest.mode, repoRoot: manifest.repo_root }, manifest.workflow_protocol);
+    const proposedTarget = proposed.work_items.find((item) => item.id === input.targetWorkItemId)!;
     const outputDiagnostics = replanOutputScopeDiagnostics({
       baseTarget,
       proposedTarget,
@@ -2590,7 +2605,7 @@ export async function approvePreparedReplanRevision(
       throw new Error("Prepared replan revision criterion metadata does not match the immutable patch");
     }
     const verifiedBase = await loadVerifiedPlanBundle(runDir, manifest, baseRevision);
-    const reconstructed = materializeReplanCandidate({
+    let reconstructed = materializeReplanCandidate({
       basePlan: verifiedBase.plan,
       targetWorkItemId: workItemId,
       patch: record.patch,
@@ -2598,9 +2613,39 @@ export async function approvePreparedReplanRevision(
       workflowProtocol: manifest.workflow_protocol,
       materializationVersion: record.materialization_version ?? 1,
     });
-    const reconstructedSha256 = createHash("sha256")
+    let reconstructedSha256 = createHash("sha256")
       .update(serializePersistedPlan(reconstructed, manifest.workflow_protocol), "utf8")
       .digest("hex");
+    if (reconstructedSha256 !== proposedRecord.sha256) {
+      const replayHistory = Array.isArray(progress.approved_replan_history)
+        ? progress.approved_replan_history.find((entry) => entry.target_work_item_id === workItemId
+          && entry.plan_revision === planRevision
+          && entry.replan_patch_path === patchPath)
+        : undefined;
+      const reviewPath = decision?.work_item_progress_reference?.review_path
+        ?? (typeof approvedHistory?.review_path === "string" ? approvedHistory.review_path : undefined)
+        ?? replayHistory?.review_path;
+      if (!reviewPath) throw new Error("Replan approval is missing its exact review evidence");
+      const review = persistedVerifierReviewSchema.parse(JSON.parse((await readOwnedEvidenceFile(
+        runDir,
+        reviewPath,
+        "reviews/",
+      )).toString("utf8")));
+      reconstructed = materializeRequiredReplanArtifacts({
+        plan: reconstructed,
+        targetWorkItemId: workItemId,
+        review,
+        findingRecords: record.provenance.finding_records,
+      });
+      reconstructed = parseExecutionPlan(
+        reconstructed,
+        { mode: manifest.mode, repoRoot: manifest.repo_root },
+        manifest.workflow_protocol,
+      );
+      reconstructedSha256 = createHash("sha256")
+        .update(serializePersistedPlan(reconstructed, manifest.workflow_protocol), "utf8")
+        .digest("hex");
+    }
     if (reconstructedSha256 !== proposedRecord.sha256) {
       throw new Error("Replan approval immutable patch does not reconstruct the approved plan");
     }
