@@ -3425,7 +3425,7 @@ function invalidVerifierContractReplanBlocker(error: unknown): string | null {
 function controllerOwnedOutputReplanBlocker(error: unknown): string | null {
   if (!(error instanceof InvalidReplanCandidateError) || error.diagnostics.length === 0) return null;
   return error.diagnostics.every((diagnostic) =>
-    /^Generated (?:artifact|browser) output verification\/.+ is outside proposed .+ scope$/.test(diagnostic))
+    /^Generated (?:artifact|browser) output .+ is outside proposed (?:expected_artifacts|browser-check) scope$/.test(diagnostic))
     ? `invalid_verifier_contract: ${error.diagnostics.join(" | ")}`
     : null;
 }
@@ -3596,7 +3596,7 @@ function persistedInvalidVerifierContractReplanBlocker(
     return { blocker: `invalid_verifier_contract: ${diagnostics.join(" | ")}`, retryKind: "linkage" };
   }
   if (diagnostics.every((diagnostic) =>
-    /^Generated (?:artifact|browser) output verification\/.+ is outside proposed .+ scope$/.test(diagnostic))) {
+    /^Generated (?:artifact|browser) output .+ is outside proposed (?:expected_artifacts|browser-check) scope$/.test(diagnostic))) {
     return { blocker: `invalid_verifier_contract: ${diagnostics.join(" | ")}`, retryKind: "controller_output" };
   }
   return null;

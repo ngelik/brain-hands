@@ -2486,7 +2486,18 @@ describe("runLocalWorkflow", () => {
     expect(events.at(-1)?.safe_label).toBe("Worker session completed");
   });
 
-  it("re-enters Verifier once when a persisted replan blocker proves malformed command linkage", async () => {
+  it.each([
+    {
+      label: "malformed command linkage",
+      blocker: "Replan preparation blocked: Generated artifact output artifacts/report.json references unknown command report",
+      retryField: "replan_contract_retry_used" as const,
+    },
+    {
+      label: "an out-of-scope browser output",
+      blocker: "Replan preparation blocked: Generated browser output artifacts/report.json is outside proposed browser-check scope",
+      retryField: "controller_output_contract_retry_used" as const,
+    },
+  ])("re-enters Verifier once when a persisted replan blocker proves $label", async ({ blocker, retryField }) => {
     const setupResult = await setup(); root = setupResult.root;
     const workItem = item("first");
     const runtimePlan = { ...plan, work_items: [workItem] };
@@ -2511,11 +2522,10 @@ describe("runLocalWorkflow", () => {
         verification_path: "verification/first/attempt-0/evidence.json",
       },
     });
-    const malformedBlocker = "Replan preparation blocked: Generated artifact output artifacts/report.json references unknown command report";
     await updateManifestV2(setupResult.runDir, {
       current_work_item_id: "first",
       delivery_state: "blocked",
-      last_blocker: malformedBlocker,
+      last_blocker: blocker,
       work_item_progress: {
         first: {
           status: "blocked",
@@ -2559,7 +2569,7 @@ describe("runLocalWorkflow", () => {
     expect(result.status, result.blocker).toBe("local_ready");
     expect(verifierCalls).toBe(2);
     const manifest = await readManifestV2(setupResult.runDir);
-    expect(manifest.work_item_progress.first?.replan_contract_retry_used).toBe(true);
+    expect(manifest.work_item_progress.first?.[retryField]).toBe(true);
     expect(manifest.work_item_progress.first?.review_path).not.toBe(oldReviewPath);
     expect(await readFile(join(setupResult.runDir, "events.jsonl"), "utf8"))
       .toContain('"type":"invalid_replan_contract_retry"');
