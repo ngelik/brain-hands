@@ -37,6 +37,7 @@ import {
   writeImmutableTextArtifact,
   writeImmutableValidatedJson,
   readReferencedJson,
+  retryVerifierReviewAfterInvalidReplanContract,
 } from "../../src/core/ledger.js";
 import * as sessionStore from "../../src/progress/session-store.js";
 import { sessionStateSchema } from "../../src/progress/session-events.js";
@@ -685,6 +686,83 @@ describe("ledger", () => {
       ...input,
       payload: { exact: false },
     })).rejects.toThrow(/event.*conflict|conflicting.*event/i);
+  });
+
+  it("routes one malformed replan contract back to the same immutable Verifier evidence", async () => {
+    repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-ledger-replan-contract-retry-"));
+    const ledger = await createRunLedgerV2({ repoRoot, originalRequest: "Retry malformed Verifier evidence" });
+    const reviewPath = "reviews/feature/attempt-3.json";
+    const verificationPath = "verification/feature/attempt-3/evidence.json";
+    await updateManifestV2(ledger.runDir, {
+      stage: "replanning",
+      current_work_item_id: "feature",
+      delivery_state: "blocked",
+      last_blocker: "Replan preparation blocked",
+      work_item_progress: {
+        feature: {
+          status: "blocked",
+          attempts: 3,
+          review_path: reviewPath,
+          verification_path: verificationPath,
+          review_revision: 7,
+          review_cycle_path: "reviews/decisions/feature/revision-7.json",
+          review_effect_id: `review-effect:${"a".repeat(64)}`,
+          replan_patch_path: "replans/feature-base-1-review-7.json",
+          replan_target_work_item_id: "feature",
+          queue_state: "complete",
+          queue_path: "reviews/action-queues/feature/revision-7.json",
+          completed_action_ids: ["replan"],
+        },
+      },
+    });
+    const blocker = "invalid_verifier_contract: Generated artifact output report.json references unknown command report";
+
+    const retried = await retryVerifierReviewAfterInvalidReplanContract(ledger.runDir, {
+      workItemId: "feature",
+      blocker,
+    });
+
+    expect(retried).toMatchObject({ stage: "verifier_review", last_blocker: blocker });
+    expect(retried.work_item_progress.feature).toMatchObject({
+      status: "blocked",
+      attempts: 3,
+      review_path: reviewPath,
+      verification_path: verificationPath,
+      blocker,
+      blocker_code: "operational_blocker",
+      replan_contract_retry_used: true,
+    });
+    expect(retried.work_item_progress.feature).not.toHaveProperty("review_revision");
+    expect(retried.work_item_progress.feature).not.toHaveProperty("review_cycle_path");
+    expect(retried.work_item_progress.feature).not.toHaveProperty("review_effect_id");
+    expect(retried.work_item_progress.feature).not.toHaveProperty("replan_patch_path");
+    expect(retried.work_item_progress.feature).not.toHaveProperty("queue_path");
+    expect((await readFile(join(ledger.runDir, "events.jsonl"), "utf8")))
+      .toContain('"type":"invalid_replan_contract_retry"');
+  });
+
+  it("rejects a second malformed replan-contract retry", async () => {
+    repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-ledger-replan-contract-loop-"));
+    const ledger = await createRunLedgerV2({ repoRoot, originalRequest: "Stop malformed Verifier retry loops" });
+    await updateManifestV2(ledger.runDir, {
+      stage: "replanning",
+      current_work_item_id: "feature",
+      work_item_progress: {
+        feature: {
+          status: "blocked",
+          attempts: 3,
+          review_path: "reviews/feature/attempt-3.json",
+          verification_path: "verification/feature/attempt-3/evidence.json",
+          replan_contract_retry_used: true,
+        },
+      },
+    });
+
+    await expect(retryVerifierReviewAfterInvalidReplanContract(ledger.runDir, {
+      workItemId: "feature",
+      blocker: "invalid_verifier_contract: repeated malformed command linkage",
+    })).rejects.toThrow(/already used/);
+    expect((await readManifestV2(ledger.runDir)).stage).toBe("replanning");
   });
 
   it("requires canonical event framing before deterministic appends", async () => {

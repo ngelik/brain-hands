@@ -1331,6 +1331,7 @@ export interface WorkItemProgress {
   recovery_state?: RecoveryState;
   last_attempt_path?: string;
   blocker_code?: HandsBlockerCode;
+  replan_contract_retry_used?: boolean;
   review_revision?: number;
   review_cycle_path?: string;
   review_effect_id?: string;

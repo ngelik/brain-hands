@@ -3215,6 +3215,83 @@ export async function transitionRun(
     transitionRunInTransaction(transaction, to, options, payload));
 }
 
+export async function retryVerifierReviewAfterInvalidReplanContract(
+  runDir: string,
+  input: { workItemId: string; blocker: string },
+): Promise<RunManifestV2Ledger> {
+  return withRunLedgerCompoundTransaction(runDir, async (transaction) => {
+    const manifest = await transaction.readManifestV2();
+    const progress = manifest.work_item_progress[input.workItemId];
+    if (manifest.stage === "verifier_review" && progress?.replan_contract_retry_used === true) {
+      if (
+        manifest.current_work_item_id !== input.workItemId
+        || progress.blocker !== input.blocker
+        || manifest.last_blocker !== input.blocker
+      ) {
+        throw new Error("Conflicting Verifier-contract retry replay");
+      }
+      return manifest;
+    }
+    if (manifest.stage !== "replanning") {
+      throw new Error(`Invalid Verifier-contract retry stage: ${manifest.stage}`);
+    }
+    if (manifest.current_work_item_id !== input.workItemId || !progress) {
+      throw new Error("Invalid Verifier-contract retry work-item identity");
+    }
+    if (progress.replan_contract_retry_used === true) {
+      throw new Error(`Verifier-contract retry already used for work item ${input.workItemId}`);
+    }
+    if (typeof progress.review_path !== "string" || typeof progress.verification_path !== "string") {
+      throw new Error("Invalid Verifier-contract retry requires immutable review and verification evidence");
+    }
+    if (!input.blocker.startsWith("invalid_verifier_contract:")) {
+      throw new Error("Invalid Verifier-contract retry blocker");
+    }
+
+    const nextProgress = { ...progress };
+    nextProgress.status = "blocked";
+    nextProgress.blocker = input.blocker;
+    nextProgress.blocker_code = "operational_blocker";
+    nextProgress.replan_contract_retry_used = true;
+    delete nextProgress.review_revision;
+    delete nextProgress.review_cycle_path;
+    delete nextProgress.review_effect_id;
+    delete nextProgress.replan_patch_path;
+    delete nextProgress.replan_target_work_item_id;
+    delete nextProgress.replan_source_work_item_id;
+    delete nextProgress.queue_state;
+    delete nextProgress.queue_path;
+    delete nextProgress.active_action_id;
+    delete nextProgress.active_action_attempt;
+    delete nextProgress.completed_action_ids;
+    delete nextProgress.focused_review_path;
+
+    const eventId = `invalid-replan-contract-retry:${createHash("sha256")
+      .update(`${manifest.run_id}\0${input.workItemId}\0${progress.review_path}\0${progress.verification_path}`)
+      .digest("hex")}`;
+    await appendRunEventOnceLocked(transaction, {
+      eventId,
+      actor: "runtime",
+      stage: "verifier_review",
+      type: "invalid_replan_contract_retry",
+      payload: {
+        work_item_id: input.workItemId,
+        review_path: progress.review_path,
+        verification_path: progress.verification_path,
+      },
+    });
+    return transaction.updateManifestV2({
+      stage: "verifier_review",
+      delivery_state: "blocked",
+      last_blocker: input.blocker,
+      work_item_progress: {
+        ...manifest.work_item_progress,
+        [input.workItemId]: nextProgress,
+      },
+    });
+  });
+}
+
 async function transitionRunInTransaction(
   transaction: RunLedgerTransaction,
   to: RunStageV2,

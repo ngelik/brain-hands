@@ -1451,6 +1451,7 @@ const workItemProgressSchema = z.object({
   recovery_state: z.enum(["not_eligible", "eligible", "pending", "in_progress", "approved", "exhausted"]).optional(),
   last_attempt_path: z.string().min(1).optional(),
   blocker_code: z.enum(["operational_blocker", "test_infrastructure_blocker", "backup_profile_unavailable", "primary_usage_limit_no_backup", "ambiguous_hands_invocation", "escalation_exhausted", "action_fix_exhausted", "invalid_reviewer_action_queue", "replan_required"]).optional(),
+  replan_contract_retry_used: z.boolean().optional(),
   review_revision: z.number().int().positive().optional(),
   review_cycle_path: z.string().min(1).optional(),
   review_effect_id: z.string().regex(/^review-effect:[a-f0-9]{64}$/).optional(),

@@ -79,6 +79,7 @@ import {
   releaseExecutionLease,
   setRunCheckoutIdentity,
   markRunCheckoutReady,
+  retryVerifierReviewAfterInvalidReplanContract,
 } from "../core/ledger.js";
 import { requirePersistedPullRequestMapping } from "../core/github-pull-request-mapping.js";
 import type {
@@ -3359,6 +3360,16 @@ function deterministicReplanPreparationBlocker(error: unknown): string | null {
   return null;
 }
 
+function invalidVerifierContractReplanBlocker(error: unknown): string | null {
+  if (!(error instanceof InvalidReplanCandidateError) || error.diagnostics.length === 0) return null;
+  const verifierLinkageDiagnostics = error.diagnostics.every((diagnostic) =>
+    diagnostic.includes("references unknown command")
+    || diagnostic.includes("is not linked to an exact approved verification command"));
+  return verifierLinkageDiagnostics
+    ? `invalid_verifier_contract: ${error.diagnostics.join(" | ")}`
+    : null;
+}
+
 async function persistDeterministicReplanPreparationBlocker(
   runDir: string,
   error: unknown,
@@ -3366,6 +3377,21 @@ async function persistDeterministicReplanPreparationBlocker(
   const blocker = deterministicReplanPreparationBlocker(error);
   if (blocker === null) return null;
   let manifest = await readManifestV2(runDir);
+  const verifierContractBlocker = invalidVerifierContractReplanBlocker(error);
+  const workItemId = manifest.current_work_item_id;
+  const progress = workItemId ? manifest.work_item_progress[workItemId] : undefined;
+  if (
+    verifierContractBlocker !== null
+    && manifest.stage === "replanning"
+    && workItemId !== null
+    && progress?.replan_contract_retry_used !== true
+  ) {
+    manifest = await retryVerifierReviewAfterInvalidReplanContract(runDir, {
+      workItemId,
+      blocker: verifierContractBlocker,
+    });
+    return { manifest, blocker: verifierContractBlocker };
+  }
   if (manifest.stage === "awaiting_plan_approval" || manifest.stage === "verifier_review") {
     manifest = await transitionRun(runDir, "replanning", {
       actor: "runtime",
