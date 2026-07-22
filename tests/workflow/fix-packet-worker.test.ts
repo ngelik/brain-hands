@@ -26,7 +26,12 @@ const packet: ReviewFixPacketV1 = {
   targets: [{ kind: "code", path: "src/item-1.ts", symbol: "item-1 implementation", line_hint: null }],
   remediation: { strategy: "Fix behavior", change_units: [{ id: "FIX-1", path: "src/item-1.ts", target: "item-1 implementation", operation: "modify", requirements: ["Make behavior right."], satisfies: ["SC-1"] }], allowed_files: ["src/item-1.ts"], forbidden_changes: [] },
   verification: { commands: [{ id: "CMD-1", argv: [...item.verification_commands[0]!.argv] }], success_conditions: [{ id: "SC-1", statement: "Behavior is right", satisfied_by: ["CMD-1", "EVID-1"] }], required_evidence: [{ id: "EVID-1", kind: "test_result", source_id: "CMD-1", output_path: "verification/result.json" }] },
-  completion_contract: { required_change_unit_ids: ["FIX-1"], expected_changed_files: ["src/item-1.ts"], allow_additional_files: false },
+  completion_contract: {
+    required_change_unit_ids: ["FIX-1"],
+    expected_changed_files: ["src/item-1.ts"],
+    allowed_generated_evidence_files: [],
+    allow_additional_files: false,
+  },
 };
 const result: FixPacketResultV1 = {
   schema_version: 1, packet_id: "R1-A1", packet_sha256: hashReviewFixPacket(packet), action_attempt: 1, status: "implemented",
