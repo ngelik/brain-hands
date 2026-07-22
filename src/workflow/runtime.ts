@@ -141,8 +141,10 @@ import { browserEvidenceArtifactsMatchIdentity } from "../core/verification-prov
 import {
   runHandsWorkItem,
   runHandsFixPacket,
+  prepareHandsFixPacketPrompt,
   readHandsFixPacketInvocationProfile,
   type HandsFixPacketInput,
+  type PreparedHandsFixPacketPrompt,
   type HandsFixPacketResult,
   type HandsFixPacketInvocationProfile,
   type HandsWorkItemInput,
@@ -5423,6 +5425,79 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
 
   type PersistedHandsProfile = { kind: "primary" | "backup"; model: string; reasoning_effort: ReasoningEffort };
 
+  const buildPacketHandsInput = async (
+    workItem: WorkItem,
+    packet: ReviewFixPacketV1,
+    actionAttempt: number,
+    mutationAttempt: number,
+    completedActions: ReviewerAction[],
+    supplement: FixAttemptSupplementV1 | null,
+  ): Promise<HandsFixPacketInput> => {
+    const packetPaths = new Set(packet.remediation.allowed_files);
+    const packetDiffScope: WorkItem = {
+      ...workItem,
+      file_contract: workItem.file_contract.filter((contract) => packetPaths.has(contract.path)),
+      completion_contract: {
+        ...workItem.completion_contract,
+        expected_changed_files: packet.completion_contract.expected_changed_files,
+      },
+    };
+    const boundedContext = await boundedHandsInvocationContext(workItem, mutationAttempt, "fix_packet", packetDiffScope);
+    const sourceContext = boundedContext ? [] : await Promise.all(packet.remediation.allowed_files.map(async (path) => ({
+      path,
+      content: await readFile(resolve(input.worktreePath, path), "utf8").catch(() => "[file unavailable]"),
+    })));
+    const evidenceContext = boundedContext ? [] : await Promise.all(packet.diagnosis.evidence_refs.map(async (path) => ({
+      path,
+      content: await readFile(resolve(input.runDir, path), "utf8").catch(() => "[evidence unavailable]"),
+    })));
+    return {
+      runDir: input.runDir, worktreePath: input.worktreePath, workItem, packet, actionAttempt,
+      intake: input.intake, codex: input.codex, relevantSourceContext: sourceContext, evidenceContext,
+      completedDependencies: boundedContext ? [] : completedActions.map((action) => ({ action_id: action.action_id, required_fix: action.required_fix })),
+      currentDiff: boundedContext ? "" : await currentDiff(workItem), supplement,
+      ...(boundedContext ? { contextAttempt: mutationAttempt } : {}),
+      ...(boundedContext ?? {}),
+      budget,
+    };
+  };
+
+  type PreparedPacketHandsInvocation = {
+    input: HandsFixPacketInput;
+    prompt: PreparedHandsFixPacketPrompt;
+  };
+
+  const preparePacketHandsInvocation = async (
+    workItem: WorkItem,
+    packet: ReviewFixPacketV1,
+    actionAttempt: number,
+    mutationAttempt: number,
+    completedActions: ReviewerAction[],
+    supplement: FixAttemptSupplementV1 | null,
+    recoverStartedInvocation: boolean,
+  ): Promise<PreparedPacketHandsInvocation | null> => {
+    const packetResultPath = `${reviewFixPacketRoot(packet.provenance.packet_id)}/attempts/${actionAttempt}/hands-result.json`;
+    const existing = await readOptionalValidatedArtifact(input.runDir, packetResultPath, fixPacketResultV1Schema);
+    if (existing && !(recoverStartedInvocation && existing.status === "operationally_blocked")) return null;
+    if (existing?.status === "operationally_blocked" && recoverStartedInvocation) {
+      const recovered = await readOptionalValidatedArtifact(
+        input.runDir,
+        `${reviewFixPacketRoot(packet.provenance.packet_id)}/attempts/${actionAttempt}/hands-result-recovery.json`,
+        fixPacketResultV1Schema,
+      );
+      if (recovered) return null;
+    }
+    const packetInput = await buildPacketHandsInput(
+      workItem,
+      packet,
+      actionAttempt,
+      mutationAttempt,
+      completedActions,
+      supplement,
+    );
+    return { input: packetInput, prompt: await prepareHandsFixPacketPrompt(packetInput) };
+  };
+
   const invokePacketHands = async (
     workItem: WorkItem,
     packet: ReviewFixPacketV1,
@@ -5432,6 +5507,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     supplement: FixAttemptSupplementV1 | null,
     claimedProfile?: PersistedHandsProfile,
     recoverStartedInvocation = false,
+    preparedInvocation?: PreparedPacketHandsInvocation | null,
   ): Promise<HandsWorkItemResult & { invocationProfile: HandsFixPacketInvocationProfile }> => {
     const itemIndex = orderedWorkItems.findIndex((candidate) => candidate.id === workItem.id) + 1;
     await input.progress?.emit({
@@ -5450,37 +5526,22 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     let invocation = {} as never;
     let invocationProfile: HandsFixPacketInvocationProfile;
     if (!packetResult) {
-      const packetPaths = new Set(packet.remediation.allowed_files);
-      const packetDiffScope: WorkItem = {
-        ...workItem,
-        file_contract: workItem.file_contract.filter((contract) => packetPaths.has(contract.path)),
-        completion_contract: {
-          ...workItem.completion_contract,
-          expected_changed_files: packet.completion_contract.expected_changed_files,
-        },
-      };
-      const boundedContext = await boundedHandsInvocationContext(workItem, mutationAttempt, "fix_packet", packetDiffScope);
-      const sourceContext = boundedContext ? [] : await Promise.all(packet.remediation.allowed_files.map(async (path) => ({
-          path,
-          content: await readFile(resolve(input.worktreePath, path), "utf8").catch(() => "[file unavailable]"),
-        })));
-      const evidenceContext = boundedContext ? [] : await Promise.all(packet.diagnosis.evidence_refs.map(async (path) => ({
-          path,
-          content: await readFile(resolve(input.runDir, path), "utf8").catch(() => "[evidence unavailable]"),
-        })));
+      const packetInput = preparedInvocation?.input ?? await buildPacketHandsInput(
+        workItem,
+        packet,
+        actionAttempt,
+        mutationAttempt,
+        completedActions,
+        supplement,
+      );
       const invoked = await handsFixPacket({
-        runDir: input.runDir, worktreePath: input.worktreePath, workItem, packet, actionAttempt,
-        intake: input.intake, codex: input.codex, relevantSourceContext: sourceContext, evidenceContext,
-        completedDependencies: boundedContext ? [] : completedActions.map((action) => ({ action_id: action.action_id, required_fix: action.required_fix })),
-        currentDiff: boundedContext ? "" : await currentDiff(workItem), supplement,
-        ...(boundedContext ? { contextAttempt: mutationAttempt } : {}),
-        ...(boundedContext ?? {}),
+        ...packetInput,
         ...(claimedProfile ? {
           profile: { model: claimedProfile.model, reasoning_effort: claimedProfile.reasoning_effort },
           profileKind: claimedProfile.kind,
         } : {}),
         recoverStartedInvocation,
-        budget,
+        ...(preparedInvocation ? { preparedPrompt: preparedInvocation.prompt } : {}),
       });
       packetResult = invoked.result;
       invocation = invoked.invocation as never;
@@ -6185,6 +6246,20 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             }
           }
         } else {
+          const handsItem = manifest.workflow_protocol === "bounded-context-v1"
+            ? queueInput.workItem
+            : scopedItem;
+          const preparedPacketInvocation = packetState && policyEffect
+            ? await preparePacketHandsInvocation(
+                handsItem,
+                packetState.packet,
+                activeAttempt,
+                mutationAttempt,
+                completed,
+                packetSupplement,
+                queueInput.recoverStartedPacketInvocation ?? false,
+              )
+            : null;
           if (policyEffect) {
             if (latestProgress?.fix_reservation_id && latestProgress.fix_reservation_id !== actionMutationId) {
               throw new Error(`Persisted fix reservation does not match ${activeAction.action_id} attempt ${activeAttempt}`);
@@ -6205,9 +6280,6 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
               fix_reservation_id: actionMutationId,
             });
           }
-          const handsItem = manifest.workflow_protocol === "bounded-context-v1"
-            ? queueInput.workItem
-            : scopedItem;
           implementationResult = packetState
             ? policyEffect
               ? await invokeClaimedActionHands({
@@ -6216,6 +6288,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
                   invokeMutation: (profile) => invokePacketHands(
                     handsItem, packetState!.packet, activeAttempt, mutationAttempt,
                     completed, packetSupplement, profile, queueInput.recoverStartedPacketInvocation,
+                    preparedPacketInvocation,
                   ),
                 })
               : await invokePacketHands(handsItem, packetState.packet, activeAttempt, mutationAttempt, completed, packetSupplement)

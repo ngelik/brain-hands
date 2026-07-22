@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CodexInvocationError, type CodexAdapter } from "../../src/adapters/codex.js";
+import { CodexInvocationError, MAX_HANDS_PROMPT_BYTES, type CodexAdapter } from "../../src/adapters/codex.js";
 import { defaultConfig } from "../../src/core/config.js";
 import { initialDiscoveryState } from "../../src/core/discovery.js";
 import { appendRunEventOnce, approvePlanRevision, createRunLedgerV2, readManifestV2, recordPlan, recordTerminalDisposition, transitionRun, updateManifestV2, writeTextArtifact } from "../../src/core/ledger.js";
@@ -1392,6 +1392,77 @@ describe("runLocalWorkflow", () => {
     expect(records.find((record) => record.finding_id === lowId)).toMatchObject({
       finding_id: lowId, severity: "low", disposition: "advisory",
     });
+  });
+
+  it("preflights an oversized policy fix-packet prompt before reservation or invocation claims", async () => {
+    const workItem = item("first");
+    const boundedPlan = { ...plan, work_items: [workItem] };
+    const config = qualityConfig(0);
+    const setupResult = await setupBounded(boundedPlan, true, config.retry_policy.quality_gate); root = setupResult.root;
+    const harness = boundedDependencies();
+    const baseVerifier = harness.dependencies.verifier!;
+    let itemReviews = 0;
+    const codexCalls: unknown[] = [];
+
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: join(setupResult.root, "worktree"),
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: boundedPlan,
+      codex: {
+        invoke: async (input) => {
+          codexCalls.push(input);
+          throw new Error("Codex must not run for an oversized packet prompt");
+        },
+      },
+      config,
+      dependencies: {
+        ...harness.dependencies,
+        verifier: async (input) => {
+          if (input.final || itemReviews++ > 0) return baseVerifier(input);
+          const evidencePath = verifierEvidenceRef(input);
+          const finding = packetFinding(workItem, evidencePath);
+          finding.remediation.diagnosis.observed_behavior = `OVERSIZED-PACKET:${"z".repeat(MAX_HANDS_PROMPT_BYTES)}`;
+          const value: VerifierReview = {
+            ...review("request_changes", input.workItem.id, input.attempt, false),
+            failure_class: "implementation_failure",
+            blocker: null,
+            blocker_code: null,
+            acceptance_coverage: [],
+            evidence_reviewed: [evidencePath],
+            findings: [finding],
+          };
+          return {
+            review: value,
+            reviewPath: await persistReview(input.runDir, `reviews/first/attempt-${input.attempt}.json`, value),
+            invocation: {} as never,
+          };
+        },
+      },
+      deferTerminalDisposition: true,
+    });
+
+    expect(result.status).toBe("human_action_required");
+    expect(result.blocker).toContain(`Hands fix packet prompt exceeds ${MAX_HANDS_PROMPT_BYTES} bytes`);
+    expect(codexCalls).toHaveLength(0);
+    const manifest = await readManifestV2(setupResult.runDir);
+    const progress = manifest.work_item_progress.first!;
+    expect(progress.fix_reservation_id).toBeUndefined();
+    expect(manifest.review_accounting?.fix_cycles_used).toBe(0);
+    await expect(readdir(join(setupResult.runDir, "reviews/accounting/reservations")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readdir(join(setupResult.runDir, "reviews/action-invocations")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(join(setupResult.runDir, "budgets/claims"))).toEqual([]);
+    expect(await readdir(join(setupResult.runDir, "budgets/completions"))).toEqual([]);
+    const packetAttemptRoot = join(
+      setupResult.runDir,
+      progress.fix_packet_path!.replace(/\/packet\.json$/, "/attempts/1"),
+    );
+    for (const name of ["hands-invocation-claim.json", "hands-result.json", "hands-result-recovery.json"]) {
+      await expect(readFile(join(packetAttemptRoot, name), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("preserves packet verification command identity across ordered action-scoped work", async () => {

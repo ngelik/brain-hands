@@ -54,7 +54,9 @@ import {
   buildReflectionContext,
   buildVerifierContext,
   compactHandsWorkItem,
+  handsContextPath,
   loadRoleContext,
+  validateHandsInvocationContext,
 } from "../../src/workflow/role-context.js";
 import { integratedWorkItem } from "../../src/workflow/integrated-work-item.js";
 
@@ -670,6 +672,103 @@ describe("bounded role contexts", () => {
     expect(Buffer.byteLength(suffix, "utf8")).toBeGreaterThan(Buffer.byteLength(prefix, "utf8"));
     expect(compacted).not.toContain("\uFFFD");
     expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(2 * 1024);
+  });
+
+  it("preserves executable acceptance authority when change units collapse", () => {
+    const source = item("BH-001");
+    const changeUnits = Array.from({ length: 180 }, (_, index) => ({
+      ...source.change_units[0]!,
+      id: `BH-001:CH-${String(index + 1).padStart(3, "0")}`,
+      target: `approved target ${index + 1}`,
+    }));
+    const testId = source.tests[0]!.id;
+    const commandId = source.verification_commands[0]!.id;
+    const compacted = compactHandsWorkItem({
+      ...source,
+      change_units: changeUnits,
+      acceptance: [
+        { id: "BH-001:AC-test", statement: "Test-only authority remains executable.", satisfied_by: [testId] },
+        { id: "BH-001:AC-command", statement: "Command-only authority remains executable.", satisfied_by: [commandId] },
+        {
+          id: "BH-001:AC-mixed",
+          statement: "Mixed authority preserves order without duplicate compact references.",
+          satisfied_by: [testId, changeUnits[1]!.id, commandId, changeUnits[0]!.id],
+        },
+      ],
+      completion_contract: {
+        ...source.completion_contract,
+        required_acceptance_ids: ["BH-001:AC-test", "BH-001:AC-command", "BH-001:AC-mixed"],
+      },
+    });
+
+    expect(compacted.change_units).toHaveLength(1);
+    expect(compacted.change_units[0]!.id).toBe("compact-approved-change-units");
+    expect(compacted.acceptance.map((criterion) => criterion.satisfied_by)).toEqual([
+      [testId],
+      [commandId],
+      [testId, "compact-approved-change-units", commandId],
+    ]);
+  });
+
+  it("loads the exact v0.5.1 tail-only Hands projection and rejects mutations", async () => {
+    const objective = [
+      "Original approved intent that legacy compaction omitted.",
+      "x".repeat(CONTEXT_LIMITS_V1.hands_total_bytes),
+      "LEGACY-TAIL: preserve same-run recovery.",
+    ].join("\n");
+    const approved = item("BH-001", [], objective);
+    const currentProjection = compactHandsWorkItem(approved);
+    let legacyTail = objective.slice(-(2 * 1024));
+    while (Buffer.byteLength(legacyTail, "utf8") > 2 * 1024) legacyTail = legacyTail.slice(1);
+    const legacyProjection = executionSpecV2Schema.parse({
+      ...currentProjection,
+      objective: [
+        `[Earlier approved objective history summarized: ${Buffer.byteLength(objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(objective).digest("hex")}]`,
+        legacyTail,
+      ].join("\n"),
+      acceptance: approved.acceptance.map((criterion, index) => ({
+        ...criterion,
+        statement: currentProjection.acceptance[index]!.statement,
+        satisfied_by: criterion.satisfied_by.filter((id) =>
+          currentProjection.change_units.some((unit) => unit.id === id)),
+      })),
+    });
+    const run = await runDir([approved]);
+    const persist = (attempt: number, workItem: WorkItem) => writeImmutableValidatedJson(
+      run,
+      handsContextPath(approved.id, 1, attempt, "initial"),
+      handsContextV1Schema,
+      {
+        schema_version: 1,
+        role: "hands",
+        work_item: workItem,
+        diff: "",
+        active_findings: [],
+        dependency_summaries: [],
+        bounded_evidence: [],
+        omitted_evidence: [],
+      },
+    );
+    const ref = await persist(70, legacyProjection);
+    const context = await loadRoleContext(run, ref, "hands");
+
+    await expect(validateHandsInvocationContext({
+      runDir: run,
+      contextRef: ref,
+      context,
+      workItem: approved,
+      workItemId: approved.id,
+      planRevision: 1,
+      attempt: 70,
+      attemptKind: "initial",
+    })).resolves.toMatchObject({ plan_revision: 1 });
+
+    const mutatedRef = await persist(71, {
+      ...legacyProjection,
+      objective: `${legacyProjection.objective.slice(0, -1)}!`,
+    });
+    await expect(loadRoleContext(run, mutatedRef, "hands"))
+      .rejects.toThrow(/work item does not match the current approved plan/i);
   });
 
   it("summarizes an oversized generated lockfile section while preserving adjacent source patches", () => {

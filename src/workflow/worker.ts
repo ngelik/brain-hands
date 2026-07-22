@@ -1,4 +1,5 @@
 import { assertPromptWithinBytes, MAX_HANDS_PROMPT_BYTES, type CodexAdapter, type CodexInvokeResult } from "../adapters/codex.js";
+import { createHash } from "node:crypto";
 import { implementationResultOutputSchema } from "../core/output-schemas.js";
 import { fixPacketResultV1OutputSchema } from "../core/output-schemas.js";
 import { executionSpecV2Schema, implementationResultSchema } from "../core/schema.js";
@@ -227,6 +228,15 @@ export interface HandsFixPacketInput {
   profileKind?: HandsProfileKind;
   recoverStartedInvocation?: boolean;
   budget?: ResourceBudgetPort;
+  preparedPrompt?: PreparedHandsFixPacketPrompt;
+}
+
+const preparedHandsFixPacketPromptBrand: unique symbol = Symbol("preparedHandsFixPacketPrompt");
+
+export interface PreparedHandsFixPacketPrompt {
+  readonly prompt: string;
+  readonly input_sha256: string;
+  readonly [preparedHandsFixPacketPromptBrand]: true;
 }
 
 export interface HandsFixPacketResult {
@@ -430,7 +440,36 @@ export const executeHandsWorkItem = runHandsWorkItem;
 export const implementWorkItem = runHandsWorkItem;
 export const runHands = runHandsWorkItem;
 
-export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<HandsFixPacketResult> {
+type ValidatedHandsFixPacketPromptInput = {
+  workItem: WorkItem;
+  packet: ReviewFixPacketV1;
+  supplement: FixAttemptSupplementV1 | null;
+  packetSha256: string;
+  boundedContext: Awaited<ReturnType<typeof validatedBoundedContext>>;
+};
+
+function handsFixPacketPromptInputSha256(input: HandsFixPacketInput): string {
+  return createHash("sha256").update(JSON.stringify({
+    run_dir: input.runDir,
+    worktree_path: input.worktreePath,
+    work_item: input.workItem,
+    packet: input.packet,
+    action_attempt: input.actionAttempt,
+    relevant_source_context: input.relevantSourceContext,
+    evidence_context: input.evidenceContext,
+    completed_dependencies: input.completedDependencies,
+    current_diff: input.currentDiff,
+    supplement: input.supplement,
+    context_ref: input.contextRef,
+    context: input.context,
+    context_plan_revision: input.contextPlanRevision,
+    context_attempt: input.contextAttempt,
+  })).digest("hex");
+}
+
+async function validateHandsFixPacketPromptInput(
+  input: HandsFixPacketInput,
+): Promise<ValidatedHandsFixPacketPromptInput> {
   if (!Number.isSafeInteger(input.actionAttempt) || input.actionAttempt < 1) {
     throw new Error("Hands fix packet action attempt must be a positive safe integer");
   }
@@ -484,6 +523,51 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
       throw new Error(`Hands fix packet is not ready for bounded execution: ${readinessErrors.join("; ")}`);
     }
   }
+  return { workItem, packet, supplement, packetSha256, boundedContext };
+}
+
+async function renderHandsFixPacketPrompt(
+  input: HandsFixPacketInput,
+  validated: ValidatedHandsFixPacketPromptInput,
+): Promise<string> {
+  const { workItem, packet, supplement, packetSha256, boundedContext } = validated;
+  const template = boundedContext ? await loadPromptTemplate("hands-fix-packet-v1") : legacyHandsFixPacketTemplate;
+  return boundedContext
+    ? renderTemplate(template, {
+        context_package_json: JSON.stringify({
+          context_ref: boundedContext.context_ref,
+          context: boundedContext.context,
+          fix_packet: packet,
+          fix_packet_sha256: packetSha256,
+          action_attempt: input.actionAttempt,
+          retry_supplement: supplement,
+        }, null, 2),
+      })
+    : renderTemplate(template, {
+        fix_packet_json: JSON.stringify(packet, null, 2), work_item_json: JSON.stringify(workItem, null, 2),
+        source_context_json: JSON.stringify(input.relevantSourceContext, null, 2), evidence_context_json: JSON.stringify(input.evidenceContext, null, 2),
+        completed_dependencies_json: JSON.stringify(input.completedDependencies, null, 2), current_diff: compactModelDiff(input.currentDiff),
+        supplement_json: JSON.stringify(supplement, null, 2), fix_packet_sha256: packetSha256,
+        action_attempt: String(input.actionAttempt),
+      });
+}
+
+export async function prepareHandsFixPacketPrompt(
+  input: HandsFixPacketInput,
+): Promise<PreparedHandsFixPacketPrompt> {
+  const validated = await validateHandsFixPacketPromptInput(input);
+  const prompt = await renderHandsFixPacketPrompt(input, validated);
+  assertPromptWithinBytes(prompt, MAX_HANDS_PROMPT_BYTES, "Hands fix packet prompt");
+  return Object.freeze({
+    [preparedHandsFixPacketPromptBrand]: true as const,
+    prompt,
+    input_sha256: handsFixPacketPromptInputSha256(input),
+  });
+}
+
+export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<HandsFixPacketResult> {
+  const validated = await validateHandsFixPacketPromptInput(input);
+  const { workItem, packet, supplement, packetSha256, boundedContext } = validated;
   const root = `${reviewFixPacketRoot(packet.provenance.packet_id)}/attempts/${input.actionAttempt}`;
   const primaryReportPath = `${root}/hands-result.json`;
   let reportPath = primaryReportPath;
@@ -529,25 +613,14 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
     || existingClaim.reasoning_effort !== profile.reasoning_effort
     || ("profile_kind" in existingClaim && existingClaim.profile_kind !== profileKind)
   )) throw new Error("Authorized Hands fix packet recovery does not match its immutable invocation claim");
-  const template = boundedContext ? await loadPromptTemplate("hands-fix-packet-v1") : legacyHandsFixPacketTemplate;
-  const prompt = boundedContext
-    ? renderTemplate(template, {
-        context_package_json: JSON.stringify({
-          context_ref: boundedContext.context_ref,
-          context: boundedContext.context,
-          fix_packet: packet,
-          fix_packet_sha256: packetSha256,
-          action_attempt: input.actionAttempt,
-          retry_supplement: supplement,
-        }, null, 2),
-      })
-    : renderTemplate(template, {
-        fix_packet_json: JSON.stringify(packet, null, 2), work_item_json: JSON.stringify(workItem, null, 2),
-        source_context_json: JSON.stringify(input.relevantSourceContext, null, 2), evidence_context_json: JSON.stringify(input.evidenceContext, null, 2),
-        completed_dependencies_json: JSON.stringify(input.completedDependencies, null, 2), current_diff: compactModelDiff(input.currentDiff),
-        supplement_json: JSON.stringify(supplement, null, 2), fix_packet_sha256: packetSha256,
-        action_attempt: String(input.actionAttempt),
-      });
+  const preparedPrompt = input.preparedPrompt;
+  if (preparedPrompt !== undefined && (
+    preparedPrompt[preparedHandsFixPacketPromptBrand] !== true
+    || preparedPrompt.input_sha256 !== handsFixPacketPromptInputSha256(input)
+  )) {
+    throw new Error("Prepared Hands fix packet prompt does not match the invocation");
+  }
+  const prompt = preparedPrompt?.prompt ?? await renderHandsFixPacketPrompt(input, validated);
   assertPromptWithinBytes(prompt, MAX_HANDS_PROMPT_BYTES, "Hands fix packet prompt");
   const baseArtifactName = `hands-fix-packet-${artifactId(packet.provenance.packet_id)}-attempt-${input.actionAttempt}`;
   const artifactName = existingClaim

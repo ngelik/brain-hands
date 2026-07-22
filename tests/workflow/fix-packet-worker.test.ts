@@ -9,7 +9,7 @@ import { artifactRefFromBytes, canonicalJsonBytes, handsContextV1Schema } from "
 import { hashReviewFixPacket, type FixPacketResultV1, type ReviewFixPacketV1, type VerifierRemediationClaimV1 } from "../../src/core/review-fix-packet.js";
 import { fixPacketResultV1Schema } from "../../src/core/review-fix-packet.js";
 import type { ResolvedRunIntake } from "../../src/core/types.js";
-import { runHandsFixPacket } from "../../src/workflow/worker.js";
+import { prepareHandsFixPacketPrompt, runHandsFixPacket } from "../../src/workflow/worker.js";
 import { correctVerifierRemediationClaim, persistFixAttemptSupplement, persistReviewFixPacket, reviewFixPacketIdentity, reviewFixPacketRoot } from "../../src/workflow/fix-packets.js";
 import { buildHandsContext, loadRoleContext } from "../../src/workflow/role-context.js";
 import { reviewerActionQueueSchema } from "../../src/core/schema.js";
@@ -338,7 +338,7 @@ describe("runHandsFixPacket", () => {
     const fixture = await boundedFixture(root, "COMPLETE_FIX_DIFF_SENTINEL");
     const codex = new RecordingHands(fixture.boundedResult);
 
-    await runHandsFixPacket({
+    const invocationInput = {
       runDir: fixture.ledger.runDir,
       worktreePath: root,
       workItem: item,
@@ -355,9 +355,13 @@ describe("runHandsFixPacket", () => {
       supplement: null,
       contextRef: fixture.contextRef,
       context: fixture.context,
-    } as Parameters<typeof runHandsFixPacket>[0]);
+    } as Parameters<typeof runHandsFixPacket>[0];
+    const preparedPrompt = await prepareHandsFixPacketPrompt(invocationInput);
+
+    await runHandsFixPacket({ ...invocationInput, preparedPrompt });
 
     const prompt = codex.calls[0]!.prompt;
+    expect(prompt).toBe(preparedPrompt.prompt);
     expect(prompt).toContain(fixture.contextRef.path);
     expect(prompt).toContain(fixture.contextRef.sha256);
     expect(prompt).toContain("COMPLETE_FIX_DIFF_SENTINEL");
