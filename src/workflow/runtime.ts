@@ -1391,6 +1391,22 @@ export function shouldResumeBlockedSelfReviewClaim(
   return fallbackClaimTransfer || exactBlockedClaim;
 }
 
+export function isResumableReviewerActionQualityGate(
+  progress: RunManifestV2["work_item_progress"][string] | undefined,
+  mutationAttempt: number,
+  actionId: string,
+  actionAttempt: number,
+  exactBlockedClaim: boolean,
+): boolean {
+  return progress !== undefined
+    && (progress.mutation_kind === "reviewer_action" || progress.mutation_kind === "quality_recovery")
+    && (progress.attempts === mutationAttempt || exactBlockedClaim)
+    && progress.active_action_id === actionId
+    && progress.active_action_attempt === actionAttempt
+    && typeof progress.implementation_path === "string"
+    && progress.implementation_path.endsWith(`/attempt-${mutationAttempt}.json`);
+}
+
 async function artifactReference(runDir: string, artifactPath: string): Promise<ArtifactRefV1> {
   const path = controllerArtifactRelativePath(runDir, artifactPath);
   return artifactRefFromBytes(path, await readFile(resolve(runDir, path)));
@@ -6054,13 +6070,22 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           }
         }
       }
-      const resumeQualityGate = (latestProgress?.mutation_kind === "reviewer_action"
-          || latestProgress?.mutation_kind === "quality_recovery")
-        && latestProgress.attempts === mutationAttempt
-        && latestProgress.active_action_id === activeAction.action_id
-        && latestProgress.active_action_attempt === activeAttempt
-        && typeof latestProgress.implementation_path === "string"
-        && latestProgress.implementation_path.endsWith(`/attempt-${mutationAttempt}.json`);
+      const resumableActionSelfReviewPass = latestProgress?.self_review_pass;
+      const exactBlockedActionSelfReview = latestProgress?.self_review_state === "invoking"
+        && typeof resumableActionSelfReviewPass === "number"
+        && resumableActionSelfReviewPass > 0
+        && await isExactBlockedSelfReviewClaim(
+          input.runDir,
+          `self-review/${queueArtifactId}/attempt-${mutationAttempt}/pass-${resumableActionSelfReviewPass}.claim.json`,
+          `self-review/${queueArtifactId}/attempt-${mutationAttempt}/pass-${resumableActionSelfReviewPass}.json`,
+        );
+      const resumeQualityGate = isResumableReviewerActionQualityGate(
+        latestProgress,
+        mutationAttempt,
+        activeAction.action_id,
+        activeAttempt,
+        exactBlockedActionSelfReview,
+      );
       if (!policyEffect && !resumeQualityGate && manifest.stage !== "fixing") {
         manifest = await transitionRun(input.runDir, "fixing", {
           actor: "runtime",
