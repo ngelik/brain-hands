@@ -3514,22 +3514,25 @@ function persistedInvalidVerifierContractReplanBlocker(manifest: RunManifestV2):
   return `invalid_verifier_contract: ${diagnostics.join(" | ")}`;
 }
 
+export async function recoverPersistedInvalidVerifierContractReplan(
+  runDir: string,
+): Promise<RunManifestV2> {
+  const manifest = await readManifestV2(runDir);
+  const blocker = persistedInvalidVerifierContractReplanBlocker(manifest);
+  const workItemId = manifest.current_work_item_id;
+  if (
+    blocker === null
+    || workItemId === null
+    || manifest.work_item_progress[workItemId]?.replan_contract_retry_used === true
+  ) return manifest;
+  return retryVerifierReviewAfterInvalidReplanContract(runDir, { workItemId, blocker });
+}
+
 async function preBootstrapApprovalStop(
   input: RunLocalWorkflowInput,
 ): Promise<{ result: LocalWorkflowResult; initial: boolean; concurrentPromotion: boolean } | null> {
   let manifest = await readManifestV2(input.runDir);
-  const persistedVerifierContractBlocker = persistedInvalidVerifierContractReplanBlocker(manifest);
-  const retryWorkItemId = manifest.current_work_item_id;
-  if (
-    persistedVerifierContractBlocker !== null
-    && retryWorkItemId !== null
-    && manifest.work_item_progress[retryWorkItemId]?.replan_contract_retry_used !== true
-  ) {
-    manifest = await retryVerifierReviewAfterInvalidReplanContract(input.runDir, {
-      workItemId: retryWorkItemId,
-      blocker: persistedVerifierContractBlocker,
-    });
-  }
+  manifest = await recoverPersistedInvalidVerifierContractReplan(input.runDir);
   const currentRevision = manifest.current_revision ?? manifest.current_plan_revision;
   const approvedRevision = manifest.approved_revision ?? manifest.approved_plan_revision;
   const initialApprovalPending = manifest.pending_plan_approval?.base_revision === null

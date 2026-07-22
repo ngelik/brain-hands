@@ -65,7 +65,7 @@ import { initializeRepository } from "./workflow/repository-init.js";
 import { planRunV2 } from "./workflow/planner.js";
 import { checkPlanCandidate } from "./workflow/plan-check.js";
 import { loadVerifiedPlanBundle } from "./workflow/verified-plan.js";
-import { acquireRunExecutionScope, loadApprovedRuntimeSnapshot, publishGithubWorkflowStatus, runWorkflow, withRunExecutionLease, type LocalWorkflowResult, type RunExecutionScope, type RunGithubWorkflowInput } from "./workflow/runtime.js";
+import { acquireRunExecutionScope, loadApprovedRuntimeSnapshot, publishGithubWorkflowStatus, recoverPersistedInvalidVerifierContractReplan, runWorkflow, withRunExecutionLease, type LocalWorkflowResult, type RunExecutionScope, type RunGithubWorkflowInput } from "./workflow/runtime.js";
 import { formatRunStatusComment, readOperatorStatus, readRunLog, renderRunStatus, summarizeRun } from "./workflow/status.js";
 import { finalAudit } from "./workflow/orchestrator.js";
 import { packageVersion } from "./core/package-version.js";
@@ -1359,6 +1359,13 @@ async function executeApprovedRunOwned(
       }
       manifest = await updateManifestV2(runDir, { delivery_state: "blocked", last_blocker: blocker });
       preparationBlocker = blocker;
+    }
+  }
+  if (preparationBlocker !== null) {
+    const recovered = await recoverPersistedInvalidVerifierContractReplan(runDir);
+    if (recovered.stage === "verifier_review") {
+      manifest = recovered;
+      preparationBlocker = null;
     }
   }
   if (preparationBlocker !== null) {
