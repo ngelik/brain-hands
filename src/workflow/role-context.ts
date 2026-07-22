@@ -512,6 +512,16 @@ function compactTextTail(value: string, maxBytes: number, label: string): string
   return [prefix, marker, suffix].join("\n");
 }
 
+function compactTextTailV051(value: string, maxBytes: number, label: string): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let tail = value.slice(-maxBytes);
+  while (Buffer.byteLength(tail, "utf8") > maxBytes) tail = tail.slice(1);
+  return [
+    `[Earlier ${label} summarized: ${Buffer.byteLength(value, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(value).digest("hex")}]`,
+    tail,
+  ].join("\n");
+}
+
 function compactTextEdges(value: string, maxBytes: number, label: string): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
   void label;
@@ -548,7 +558,7 @@ function compactChangeUnits(workItem: WorkItem): WorkItem["change_units"] {
   }];
 }
 
-export function compactHandsWorkItem(workItem: WorkItem): WorkItem {
+function compactHandsWorkItemWithObjective(workItem: WorkItem, objective: string): WorkItem {
   const changeUnits = compactChangeUnits(workItem);
   const changeUnitIds = new Set(changeUnits.map((unit) => unit.id));
   const compactedChangeUnitId = changeUnits.length === 1 && changeUnits[0]!.id === "compact-approved-change-units"
@@ -556,7 +566,7 @@ export function compactHandsWorkItem(workItem: WorkItem): WorkItem {
     : null;
   return executionSpecV2Schema.parse({
     ...workItem,
-    objective: compactTextTail(workItem.objective, 2 * 1024, "approved objective history"),
+    objective,
     file_contract: workItem.file_contract.map((entry) => ({
       ...entry,
       targets: compactStringArray(entry.targets, "file-contract targets"),
@@ -595,6 +605,20 @@ export function compactHandsWorkItem(workItem: WorkItem): WorkItem {
   });
 }
 
+export function compactHandsWorkItem(workItem: WorkItem): WorkItem {
+  return compactHandsWorkItemWithObjective(
+    workItem,
+    compactTextTail(workItem.objective, 2 * 1024, "approved objective history"),
+  );
+}
+
+function compactHandsWorkItemV051(workItem: WorkItem): WorkItem {
+  return compactHandsWorkItemWithObjective(
+    workItem,
+    compactTextTailV051(workItem.objective, 2 * 1024, "approved objective history"),
+  );
+}
+
 function compactActiveFinding(finding: JsonValue): JsonValue {
   if (finding === null || Array.isArray(finding) || typeof finding !== "object") return finding;
   const record = finding as Record<string, JsonValue>;
@@ -622,7 +646,9 @@ function compactActiveFindings(findings: JsonValue[]): JsonValue[] {
 }
 
 function matchesFullOrCompactedWorkItem(candidate: unknown, authority: WorkItem): boolean {
-  return equalJson(candidate, authority) || equalJson(candidate, compactHandsWorkItem(authority));
+  return equalJson(candidate, authority)
+    || equalJson(candidate, compactHandsWorkItem(authority))
+    || equalJson(candidate, compactHandsWorkItemV051(authority));
 }
 
 function matchesFullOrCompactedFindings(candidate: unknown, authority: JsonValue[]): boolean {

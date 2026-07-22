@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CodexAdapter, CodexInvokeInput } from "../../src/adapters/codex.js";
+import { MAX_HANDS_PROMPT_BYTES, type CodexAdapter, type CodexInvokeInput } from "../../src/adapters/codex.js";
 import type { ResourceBudgetPort } from "../../src/core/resource-budget.js";
 import { approvePlanRevision, createRunLedgerV2, recordPlan, updateManifestV2 } from "../../src/core/ledger.js";
 import { artifactRefFromBytes, canonicalJsonBytes, handsContextV1Schema } from "../../src/core/context-contracts.js";
@@ -217,6 +217,55 @@ describe("runHandsWorkItem", () => {
       ledger.runDir,
     ]) expect(prompt).not.toContain(leaked);
   });
+
+  it.each(["normal", "recovery"] as const)(
+    "rejects an oversized %s Hands prompt before budget, Codex, or invocation artifacts",
+    async (route) => {
+      root = await mkdtemp(join(tmpdir(), `brain-hands-worker-oversized-${route}-`));
+      const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
+      const codex = new RecordingHands();
+      let budgetClaims = 0;
+      const budget: ResourceBudgetPort = {
+        ...recordingBudget(),
+        claim: async () => { budgetClaims += 1; throw new Error("must not claim budget"); },
+      };
+      const recovery = route === "recovery";
+      const attempt = recovery ? 2 : 1;
+      const artifactName = recovery
+        ? "hands-work-item-item-1-attempt-2-quality_recovery-primary"
+        : "hands-work-item-item-1-attempt-1";
+
+      await expect(runHandsWorkItem({
+        runDir: ledger.runDir,
+        worktreePath: join(root, "worktree"),
+        workItem: recovery ? item : { ...item, objective: "x".repeat(MAX_HANDS_PROMPT_BYTES) },
+        intake: { ...intake, repo_root: root },
+        codex,
+        budget,
+        ...(recovery ? {
+          attempt,
+          attemptKind: "quality_recovery" as const,
+          diagnosticContext: "x".repeat(MAX_HANDS_PROMPT_BYTES),
+        } : {}),
+      })).rejects.toThrow(
+        `${recovery ? "Hands recovery prompt" : "Hands work-item prompt"} exceeds ${MAX_HANDS_PROMPT_BYTES} bytes`,
+      );
+
+      expect(codex.calls).toHaveLength(0);
+      expect(budgetClaims).toBe(0);
+      for (const relativePath of [
+        `prompts/${artifactName}.md`,
+        `schemas/${artifactName}.json`,
+        `responses/${artifactName}.json`,
+        `responses/${artifactName}.stdout.txt`,
+        `responses/${artifactName}.stderr.txt`,
+        `implementation/item-1/attempt-${attempt}.json`,
+      ]) {
+        await expect(readFile(join(ledger.runDir, relativePath), "utf8"))
+          .rejects.toMatchObject({ code: "ENOENT" });
+      }
+    },
+  );
 
   it.each([
     ["wrong work-item path", "contexts/hands/aXRlbS0y/plan-1/attempt-2/primary_fix.json"],

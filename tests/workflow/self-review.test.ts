@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -170,6 +171,22 @@ describe("runHandsSelfReview", () => {
     };
     const binaryPayload = "A".repeat(1_200_000);
     const textPayload = `+${"x".repeat(700_000)}`;
+    const binarySection = [
+      "diff --git a/public/planet.webp b/public/planet.webp",
+      "new file mode 100644",
+      "GIT binary patch",
+      "literal 1200000",
+      binaryPayload,
+      "",
+    ].join("\n");
+    const textSection = [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "--- a/src/example.ts",
+      "+++ b/src/example.ts",
+      "@@ -0,0 +1 @@",
+      textPayload,
+    ].join("\n");
+    const currentDiff = `${binarySection}${textSection}`;
     const completedRequiredFix = `COMPLETED-REQUIRED-FIX:${"r".repeat(80_000)}`;
     const completedActions: ReviewerAction[] = [1, 2].map((order) => ({
       ...action,
@@ -191,18 +208,7 @@ describe("runHandsSelfReview", () => {
       mutationKind: "normal_fix",
       pass: 1,
       implementation,
-      currentDiff: [
-        "diff --git a/public/planet.webp b/public/planet.webp",
-        "new file mode 100644",
-        "GIT binary patch",
-        "literal 1200000",
-        binaryPayload,
-        "diff --git a/src/example.ts b/src/example.ts",
-        "--- a/src/example.ts",
-        "+++ b/src/example.ts",
-        "@@ -0,0 +1 @@",
-        textPayload,
-      ].join("\n"),
+      currentDiff,
       verification,
       activeAction: action,
       completedActions,
@@ -222,6 +228,8 @@ describe("runHandsSelfReview", () => {
     expect(prompt).toContain("Source patch section summarized for bounded Hands context.");
     expect(prompt).toContain("public/planet.webp");
     expect(prompt).toContain("src/example.ts");
+    expect(prompt).toContain(`Git patch section bytes (not file content bytes): ${Buffer.byteLength(binarySection, "utf8")}`);
+    expect(prompt).toContain(`Git patch section sha256 (not file content sha256): ${createHash("sha256").update(binarySection).digest("hex")}`);
     expect(prompt).not.toContain(binaryPayload);
     expect(JSON.parse(activeActionJson)).toEqual(action);
     expect(JSON.parse(completedActionsJson)).toEqual(completedActions.map((completed) => ({

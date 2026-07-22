@@ -159,7 +159,7 @@ export async function runHandsSelfReview(input: HandsSelfReviewInput): Promise<H
   const prompt = renderTemplate(template, {
     work_item_json: JSON.stringify(compactHandsWorkItem(input.workItem), null, 2),
     implementation_json: JSON.stringify(input.implementation, null, 2),
-    current_diff: boundedHandsDiff(compactModelDiff(input.currentDiff)),
+    current_diff: compactModelDiff(boundedHandsDiff(input.currentDiff)),
     verification_json: JSON.stringify(input.verification, null, 2),
     active_action_json: JSON.stringify(input.activeAction, null, 2),
     completed_actions_json: JSON.stringify(completedActions, null, 2),

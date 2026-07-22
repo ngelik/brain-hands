@@ -7,7 +7,9 @@ vi.mock("../../src/core/executor.js", () => ({
   runCommand: vi.fn(),
 }));
 import {
+  MAX_CODEX_PROMPT_BYTES,
   CodexInvocationError,
+  assertPromptWithinBytes,
   disabledCodexAgentFeatureArgs,
   DryRunCodexAdapter,
   SubprocessCodexAdapter,
@@ -294,6 +296,24 @@ describe("classifyCodexFailure", () => {
     ["authentication failed", "other"],
   ] as const)("classifies %s as %s", (stderr, expected) => {
     expect(classifyCodexFailure(commandFailure(stderr))).toBe(expected);
+  });
+});
+
+describe("assertPromptWithinBytes", () => {
+  it("accepts a prompt at the exact UTF-8 byte limit", () => {
+    const prompt = "é".repeat(MAX_CODEX_PROMPT_BYTES / 2);
+
+    expect(Buffer.byteLength(prompt, "utf8")).toBe(MAX_CODEX_PROMPT_BYTES);
+    expect(() => assertPromptWithinBytes(prompt, MAX_CODEX_PROMPT_BYTES, "Codex prompt")).not.toThrow();
+  });
+
+  it("rejects a multibyte prompt whose character count fits but UTF-8 bytes overflow", () => {
+    const prompt = `${"é".repeat(MAX_CODEX_PROMPT_BYTES / 2)}a`;
+
+    expect(prompt.length).toBeLessThanOrEqual(MAX_CODEX_PROMPT_BYTES);
+    expect(Buffer.byteLength(prompt, "utf8")).toBe(MAX_CODEX_PROMPT_BYTES + 1);
+    expect(() => assertPromptWithinBytes(prompt, MAX_CODEX_PROMPT_BYTES, "Codex prompt"))
+      .toThrow(`Codex prompt exceeds ${MAX_CODEX_PROMPT_BYTES} bytes`);
   });
 });
 

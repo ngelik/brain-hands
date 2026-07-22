@@ -672,6 +672,46 @@ describe("bounded role contexts", () => {
     expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(2 * 1024);
   });
 
+  it("loads a persisted v0.5.1 marker-and-tail Hands context for resume", async () => {
+    const objective = [
+      "ORIGINAL-INTENT: preserve the initial migration constraint.",
+      "中😀".repeat(12_000),
+      "LATEST-INTENT: preserve the final rollout constraint.",
+    ].join("\n");
+    const workItem = item("BH-001", [], objective);
+    const run = await runDir([workItem]);
+    const currentRef = await buildHandsContext(handsInput(run, { workItem }));
+    const current = await readReferencedJson(run, currentRef, handsContextV1Schema);
+    const currentWorkItem = executionSpecV2Schema.parse(current.work_item);
+    let legacyTail = objective.slice(-(2 * 1024));
+    while (Buffer.byteLength(legacyTail, "utf8") > 2 * 1024) legacyTail = legacyTail.slice(1);
+    const legacyObjective = [
+      `[Earlier approved objective history summarized: ${Buffer.byteLength(objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(objective).digest("hex")}]`,
+      legacyTail,
+    ].join("\n");
+    const legacyRef = await writeImmutableValidatedJson(
+      run,
+      "contexts/hands/QkgtMDAx/plan-1/attempt-2/primary_fix.json",
+      handsContextV1Schema,
+      { ...current, work_item: { ...currentWorkItem, objective: legacyObjective } },
+    );
+
+    await expect(loadRoleContext(run, legacyRef, "hands")).resolves.toMatchObject({
+      work_item: { objective: legacyObjective },
+    });
+    expect(currentWorkItem.objective).toContain("ORIGINAL-INTENT: preserve the initial migration constraint.");
+    expect(legacyObjective).not.toContain("ORIGINAL-INTENT: preserve the initial migration constraint.");
+
+    const forgedRef = await writeImmutableValidatedJson(
+      run,
+      "contexts/hands/QkgtMDAx/plan-1/attempt-3/primary_fix.json",
+      handsContextV1Schema,
+      { ...current, work_item: { ...currentWorkItem, objective: `${legacyObjective} ` } },
+    );
+    await expect(loadRoleContext(run, forgedRef, "hands"))
+      .rejects.toThrow(/work item does not match the current approved plan/i);
+  });
+
   it("summarizes an oversized generated lockfile section while preserving adjacent source patches", () => {
     const source = [
       "diff --git a/package.json b/package.json",
