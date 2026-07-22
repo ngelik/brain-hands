@@ -3215,6 +3215,13 @@ export async function transitionRun(
     transitionRunInTransaction(transaction, to, options, payload));
 }
 
+export class VerifierContractRetryAlreadyUsedError extends Error {
+  constructor(workItemId: string) {
+    super(`Verifier-contract retry already used for work item ${workItemId}`);
+    this.name = "VerifierContractRetryAlreadyUsedError";
+  }
+}
+
 export async function retryVerifierReviewAfterInvalidReplanContract(
   runDir: string,
   input: { workItemId: string; blocker: string; retryKind?: "linkage" | "controller_output" },
@@ -3258,7 +3265,7 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
       throw new Error("Invalid Verifier-contract retry work-item identity");
     }
     if (exactRetryUsed || unscopedLegacyRetryUsed) {
-      throw new Error(`Verifier-contract retry already used for work item ${input.workItemId}`);
+      throw new VerifierContractRetryAlreadyUsedError(input.workItemId);
     }
     if (
       typeof progress.review_path !== "string"

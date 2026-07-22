@@ -80,6 +80,7 @@ import {
   setRunCheckoutIdentity,
   markRunCheckoutReady,
   retryVerifierReviewAfterInvalidReplanContract,
+  VerifierContractRetryAlreadyUsedError,
 } from "../core/ledger.js";
 import { requirePersistedPullRequestMapping } from "../core/github-pull-request-mapping.js";
 import type {
@@ -3439,31 +3440,36 @@ async function persistDeterministicReplanPreparationBlocker(
   const verifierContractBlocker = invalidVerifierContractReplanBlocker(error);
   const controllerOutputBlocker = controllerOwnedOutputReplanBlocker(error);
   const workItemId = manifest.current_work_item_id;
-  const progress = workItemId ? manifest.work_item_progress[workItemId] : undefined;
   if (
     verifierContractBlocker !== null
     && manifest.stage === "replanning"
     && workItemId !== null
-    && progress?.replan_contract_retry_used !== true
   ) {
-    manifest = await retryVerifierReviewAfterInvalidReplanContract(runDir, {
-      workItemId,
-      blocker: verifierContractBlocker,
-    });
-    return { manifest, blocker: verifierContractBlocker };
+    try {
+      manifest = await retryVerifierReviewAfterInvalidReplanContract(runDir, {
+        workItemId,
+        blocker: verifierContractBlocker,
+      });
+      return { manifest, blocker: verifierContractBlocker };
+    } catch (retryError) {
+      if (!(retryError instanceof VerifierContractRetryAlreadyUsedError)) throw retryError;
+    }
   }
   if (
     controllerOutputBlocker !== null
     && manifest.stage === "replanning"
     && workItemId !== null
-    && progress?.controller_output_contract_retry_used !== true
   ) {
-    manifest = await retryVerifierReviewAfterInvalidReplanContract(runDir, {
-      workItemId,
-      blocker: controllerOutputBlocker,
-      retryKind: "controller_output",
-    });
-    return { manifest, blocker: controllerOutputBlocker };
+    try {
+      manifest = await retryVerifierReviewAfterInvalidReplanContract(runDir, {
+        workItemId,
+        blocker: controllerOutputBlocker,
+        retryKind: "controller_output",
+      });
+      return { manifest, blocker: controllerOutputBlocker };
+    } catch (retryError) {
+      if (!(retryError instanceof VerifierContractRetryAlreadyUsedError)) throw retryError;
+    }
   }
   if (manifest.stage === "awaiting_plan_approval" || manifest.stage === "verifier_review") {
     manifest = await transitionRun(runDir, "replanning", {
@@ -3602,19 +3608,17 @@ export async function recoverPersistedInvalidVerifierContractReplan(
   const manifest = await readManifestV2(runDir);
   const retry = persistedInvalidVerifierContractReplanBlocker(manifest);
   const workItemId = manifest.current_work_item_id;
-  const retryUsed = workItemId === null ? false : retry?.retryKind === "controller_output"
-    ? manifest.work_item_progress[workItemId]?.controller_output_contract_retry_used === true
-    : manifest.work_item_progress[workItemId]?.replan_contract_retry_used === true;
-  if (
-    retry === null
-    || workItemId === null
-    || retryUsed
-  ) return manifest;
-  return retryVerifierReviewAfterInvalidReplanContract(runDir, {
-    workItemId,
-    blocker: retry.blocker,
-    retryKind: retry.retryKind,
-  });
+  if (retry === null || workItemId === null) return manifest;
+  try {
+    return await retryVerifierReviewAfterInvalidReplanContract(runDir, {
+      workItemId,
+      blocker: retry.blocker,
+      retryKind: retry.retryKind,
+    });
+  } catch (error) {
+    if (error instanceof VerifierContractRetryAlreadyUsedError) return manifest;
+    throw error;
+  }
 }
 
 async function preBootstrapApprovalStop(

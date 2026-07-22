@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexInvocationError, type CodexAdapter } from "../../src/adapters/codex.js";
 import { defaultConfig } from "../../src/core/config.js";
 import { initialDiscoveryState } from "../../src/core/discovery.js";
-import { approvePlanRevision, createRunLedgerV2, readManifestV2, recordPlan, recordTerminalDisposition, transitionRun, updateManifestV2, writeTextArtifact } from "../../src/core/ledger.js";
+import { appendRunEventOnce, approvePlanRevision, createRunLedgerV2, readManifestV2, recordPlan, recordTerminalDisposition, transitionRun, updateManifestV2, writeTextArtifact } from "../../src/core/ledger.js";
 import { reviewCycleStateSchema, verificationEvidenceSchema } from "../../src/core/schema.js";
 import { canonicalJsonBytes } from "../../src/core/context-contracts.js";
 import { verificationEvidencePath, verificationIdentityDirectory } from "../../src/core/types.js";
@@ -2500,6 +2500,17 @@ describe("runLocalWorkflow", () => {
     await transitionRun(setupResult.runDir, "verifying", { actor: "test" });
     await transitionRun(setupResult.runDir, "verifier_review", { actor: "test" });
     await transitionRun(setupResult.runDir, "replanning", { actor: "test" });
+    await appendRunEventOnce(setupResult.runDir, {
+      eventId: `historical-invalid-replan-contract-retry:${"c".repeat(64)}`,
+      actor: "runtime",
+      stage: "verifier_review",
+      type: "invalid_replan_contract_retry",
+      payload: {
+        work_item_id: "first",
+        review_path: "reviews/first/attempt-0.json",
+        verification_path: "verification/first/attempt-0/evidence.json",
+      },
+    });
     const malformedBlocker = "Replan preparation blocked: Generated artifact output artifacts/report.json references unknown command report";
     await updateManifestV2(setupResult.runDir, {
       current_work_item_id: "first",
@@ -2515,6 +2526,7 @@ describe("runLocalWorkflow", () => {
           review_revision: 9,
           review_cycle_path: "reviews/decisions/first/revision-9.json",
           review_effect_id: `review-effect:${"a".repeat(64)}`,
+          replan_contract_retry_used: true,
           replan_patch_path: "replans/first-base-1-review-9.json",
           replan_target_work_item_id: "first",
         },
