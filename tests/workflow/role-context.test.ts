@@ -658,12 +658,16 @@ describe("bounded role contexts", () => {
       "LATEST-INTENT: preserve the final rollout constraint.",
     ].join("\n");
     const compacted = compactHandsWorkItem(item("BH-001", [], objective)).objective;
+    const marker = `[Earlier approved objective history summarized: ${Buffer.byteLength(objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(objective).digest("hex")}]`;
+    const markerIndex = compacted.indexOf(marker);
+    expect(markerIndex).toBeGreaterThan(0);
+    const prefix = compacted.slice(0, markerIndex).replace(/\n$/, "");
+    const suffix = compacted.slice(markerIndex + marker.length).replace(/^\n/, "");
 
     expect(compacted).toContain("ORIGINAL-INTENT: preserve the initial migration constraint.");
     expect(compacted).toContain("LATEST-INTENT: preserve the final rollout constraint.");
-    expect(compacted).toContain(
-      `[Earlier approved objective history summarized: ${Buffer.byteLength(objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(objective).digest("hex")}]`,
-    );
+    expect(compacted).toContain(marker);
+    expect(Buffer.byteLength(suffix, "utf8")).toBeGreaterThan(Buffer.byteLength(prefix, "utf8"));
     expect(compacted).not.toContain("\uFFFD");
     expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(2 * 1024);
   });
