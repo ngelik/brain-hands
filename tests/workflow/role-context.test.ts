@@ -859,6 +859,78 @@ describe("bounded role contexts", () => {
       .toContain("Earlier approved objective history summarized");
   });
 
+  it("accepts only verification from the exact current reviewer action", async () => {
+    const run = await runDir();
+    await setVerificationAuthority(run, "BH-001", 100_000_101, {
+      commands: [{ command: "review attempt one" }],
+    });
+    let manifest = await readManifestV2(run);
+    await updateManifestV2(run, {
+      work_item_progress: {
+        ...manifest.work_item_progress,
+        "BH-001": {
+          ...manifest.work_item_progress["BH-001"],
+          attempts: 35,
+          mutation_kind: "reviewer_action",
+          queue_state: "in_progress",
+          review_revision: 100,
+          active_action_id: "R100-A1",
+          active_action_attempt: 2,
+        },
+      },
+    });
+    const accepted = await buildHandsContext(handsInput(run, {
+      attempt: 100_000_102,
+      attemptKind: "fix_packet",
+    }));
+    expect((await loadRoleContext(run, accepted, "hands")).bounded_evidence).toHaveLength(1);
+
+    await setVerificationAuthority(run, "BH-001", 100_000_103, {
+      commands: [{ command: "future action attempt" }],
+    });
+    manifest = await readManifestV2(run);
+    await updateManifestV2(run, {
+      work_item_progress: {
+        ...manifest.work_item_progress,
+        "BH-001": {
+          ...manifest.work_item_progress["BH-001"],
+          attempts: 35,
+          mutation_kind: "reviewer_action",
+          queue_state: "in_progress",
+          review_revision: 100,
+          active_action_id: "R100-A1",
+          active_action_attempt: 2,
+        },
+      },
+    });
+    await expect(loadRoleContext(run, accepted, "hands"))
+      .rejects.toThrow(/current verification authority.*attempt 35/i);
+
+    const unrelated = await runDir();
+    await setVerificationAuthority(unrelated, "BH-001", 99_000_101, {
+      commands: [{ command: "unrelated review" }],
+    });
+    manifest = await readManifestV2(unrelated);
+    await updateManifestV2(unrelated, {
+      work_item_progress: {
+        ...manifest.work_item_progress,
+        "BH-001": {
+          ...manifest.work_item_progress["BH-001"],
+          attempts: 35,
+          mutation_kind: "reviewer_action",
+          queue_state: "in_progress",
+          review_revision: 100,
+          active_action_id: "R100-A1",
+          active_action_attempt: 2,
+        },
+      },
+    });
+    await expect(buildHandsContext(handsInput(unrelated, {
+      attempt: 100_000_102,
+      attemptKind: "fix_packet",
+    }))).rejects.toThrow(/current verification authority.*attempt 35/i);
+  });
+
   it("requires the exact authoritative summary set for declared Hands dependencies", async () => {
     const fixture = await dependencyFixture();
     const input = handsInput(fixture.runDir, {

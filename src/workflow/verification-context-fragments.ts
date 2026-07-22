@@ -94,6 +94,28 @@ function currentProgressVerificationIdentity(manifest: RunManifestV2, workItemId
   return { scope: "local", work_item_id: progressWorkItemId };
 }
 
+function matchesCurrentReviewerActionVerification(
+  progress: RunManifestV2["work_item_progress"][string],
+  evidenceAttempt: number,
+): boolean {
+  if (
+    progress?.mutation_kind !== "reviewer_action"
+    || progress.queue_state !== "in_progress"
+    || typeof progress.review_revision !== "number"
+    || typeof progress.active_action_id !== "string"
+    || typeof progress.active_action_attempt !== "number"
+  ) return false;
+  const action = /^R([1-9][0-9]*)-A([1-9][0-9]*)$/.exec(progress.active_action_id);
+  if (action === null || Number(action[1]) !== progress.review_revision) return false;
+  const actionOrder = Number(action[2]);
+  const baseAttempt = progress.review_revision * 1_000_000 + actionOrder * 100;
+  const actionAttempt = evidenceAttempt - baseAttempt;
+  return Number.isSafeInteger(baseAttempt)
+    && Number.isInteger(actionAttempt)
+    && actionAttempt >= 1
+    && actionAttempt <= progress.active_action_attempt;
+}
+
 export async function currentWorkItemVerificationAuthority(
   runDir: string,
   manifest: RunManifestV2,
@@ -108,7 +130,11 @@ export async function currentWorkItemVerificationAuthority(
   const evidence = await validateVerificationContextSource(runDir, ref, identity);
   const qualityGateIdentity = identity.scope === "local" && identity.work_item_id.startsWith(`${workItemId}:quality-gate:`);
   const authoritativeAttempt = expectedAttempt ?? progress.attempts;
-  if (!qualityGateIdentity && evidence.attempt !== authoritativeAttempt) {
+  if (
+    !qualityGateIdentity
+    && evidence.attempt !== authoritativeAttempt
+    && !matchesCurrentReviewerActionVerification(progress, evidence.attempt)
+  ) {
     throw new Error(`Current verification authority does not match ${workItemId} attempt ${expectedAttempt ?? progress.attempts}`);
   }
   return { ref, identity };
