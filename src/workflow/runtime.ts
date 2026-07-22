@@ -1373,6 +1373,17 @@ export async function isExactBlockedSelfReviewClaim(
   }
 }
 
+export function isResumableSelfReviewQualityState(
+  progress: RunManifestV2["work_item_progress"][string] | undefined,
+  parentAttempt: number,
+  exactBlockedClaim: boolean,
+): boolean {
+  return progress !== undefined
+    && (progress.attempts === parentAttempt || exactBlockedClaim)
+    && progress.self_review_state !== undefined
+    && typeof progress.verification_path === "string";
+}
+
 async function artifactReference(runDir: string, artifactPath: string): Promise<ArtifactRefV1> {
   const path = controllerArtifactRelativePath(runDir, artifactPath);
   return artifactRefFromBytes(path, await readFile(resolve(runDir, path)));
@@ -4989,10 +5000,20 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       return saved;
     };
 
-    const resumableQualityState = progress?.attempts === gateInput.parentAttempt
-      && progress.self_review_state !== undefined
-      && typeof progress.verification_path === "string"
-      && typeof progress.verification_path === "string";
+    const pendingSelfReviewPass = progress?.self_review_pass;
+    const exactBlockedQualityClaim = progress?.self_review_state === "invoking"
+      && typeof pendingSelfReviewPass === "number"
+      && pendingSelfReviewPass > 0
+      && await isExactBlockedSelfReviewClaim(
+        input.runDir,
+        `self-review/${artifactId}/attempt-${gateInput.parentAttempt}/pass-${pendingSelfReviewPass}.claim.json`,
+        `self-review/${artifactId}/attempt-${gateInput.parentAttempt}/pass-${pendingSelfReviewPass}.json`,
+      );
+    const resumableQualityState = isResumableSelfReviewQualityState(
+      progress,
+      gateInput.parentAttempt,
+      exactBlockedQualityClaim,
+    );
     if (resumableQualityState) {
       try {
         verification = await loadQualityEvidence(progress);

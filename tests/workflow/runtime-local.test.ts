@@ -14,7 +14,7 @@ import type { ActionResolutionReview, BrainPlan, HandsSelfReviewReport, Implemen
 import type { VerifyWorkItemInput } from "../../src/workflow/verifier.js";
 import type { RunVerificationInput } from "../../src/verification/runner.js";
 import type { LocalRuntimeDependencies, RunLocalWorkflowInput } from "../../src/workflow/runtime.js";
-import { assertImplementationScope, isExactBlockedSelfReviewClaim, runLocalWorkflow } from "../../src/workflow/runtime.js";
+import { assertImplementationScope, isExactBlockedSelfReviewClaim, isResumableSelfReviewQualityState, runLocalWorkflow } from "../../src/workflow/runtime.js";
 import { actionResolutionReviewPath } from "../../src/workflow/action-verifier.js";
 import { runHandsFixPacket } from "../../src/workflow/worker.js";
 import { approvePreparedReplanRevision } from "../../src/workflow/replan.js";
@@ -4698,6 +4698,15 @@ describe("runLocalWorkflow", () => {
     await expect(isExactBlockedSelfReviewClaim(setupResult.runDir, claimPath, reportPath)).resolves.toBe(true);
     await expect(isExactBlockedSelfReviewClaim(setupResult.runDir, claimPath, "self-review/first/attempt-23/pass-1.json"))
       .rejects.toThrow(/claim is invalid/i);
+    const progress = {
+      status: "blocked" as const,
+      attempts: 23,
+      self_review_pass: 1,
+      self_review_state: "invoking" as const,
+      verification_path: "verification/local/synthetic/attempt-1/evidence.json",
+    };
+    expect(isResumableSelfReviewQualityState(progress, 88000102, true)).toBe(true);
+    expect(isResumableSelfReviewQualityState(progress, 88000102, false)).toBe(false);
   });
 
   it("uses the snapshotted pass count when repo config changes before resume", async () => {
