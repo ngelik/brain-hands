@@ -6982,7 +6982,6 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       && manifest.stage === "replanning"
       && typeof progress?.review_cycle_path === "string"
       && typeof progress.review_effect_id === "string"
-      && typeof progress.queue_path === "string"
     ) {
       const cycle = reviewCycleStateSchema.parse(await readRunArtifact<unknown>(
         input.runDir,
