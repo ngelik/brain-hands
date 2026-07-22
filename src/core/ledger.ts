@@ -3217,12 +3217,15 @@ export async function transitionRun(
 
 export async function retryVerifierReviewAfterInvalidReplanContract(
   runDir: string,
-  input: { workItemId: string; blocker: string },
+  input: { workItemId: string; blocker: string; retryKind?: "linkage" | "controller_output" },
 ): Promise<RunManifestV2Ledger> {
   return withRunLedgerCompoundTransaction(runDir, async (transaction) => {
     const manifest = await transaction.readManifestV2();
     const progress = manifest.work_item_progress[input.workItemId];
-    if (manifest.stage === "verifier_review" && progress?.replan_contract_retry_used === true) {
+    const retryField = input.retryKind === "controller_output"
+      ? "controller_output_contract_retry_used"
+      : "replan_contract_retry_used";
+    if (manifest.stage === "verifier_review" && progress?.[retryField] === true) {
       if (
         manifest.current_work_item_id !== input.workItemId
         || progress.blocker !== input.blocker
@@ -3238,7 +3241,7 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
     if (manifest.current_work_item_id !== input.workItemId || !progress) {
       throw new Error("Invalid Verifier-contract retry work-item identity");
     }
-    if (progress.replan_contract_retry_used === true) {
+    if (progress[retryField] === true) {
       throw new Error(`Verifier-contract retry already used for work item ${input.workItemId}`);
     }
     if (
@@ -3258,7 +3261,7 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
     nextProgress.status = "blocked";
     nextProgress.blocker = input.blocker;
     nextProgress.blocker_code = "operational_blocker";
-    nextProgress.replan_contract_retry_used = true;
+    nextProgress[retryField] = true;
     delete nextProgress.review_revision;
     delete nextProgress.review_cycle_path;
     delete nextProgress.review_effect_id;
@@ -3273,7 +3276,7 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
     delete nextProgress.focused_review_path;
 
     const eventId = `invalid-replan-contract-retry:${createHash("sha256")
-      .update(`${manifest.run_id}\0${input.workItemId}\0${progress.review_path}\0${progress.verification_path}`)
+      .update(`${manifest.run_id}\0${input.workItemId}\0${input.retryKind ?? "linkage"}\0${progress.review_path}\0${progress.verification_path}`)
       .digest("hex")}`;
     await appendRunEventOnceLocked(transaction, {
       eventId,

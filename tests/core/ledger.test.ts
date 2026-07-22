@@ -765,6 +765,39 @@ describe("ledger", () => {
     expect((await readManifestV2(ledger.runDir)).stage).toBe("replanning");
   });
 
+  it("tracks controller-output correction independently from linkage retry", async () => {
+    repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-ledger-controller-output-retry-"));
+    const ledger = await createRunLedgerV2({ repoRoot, originalRequest: "Correct controller-owned output" });
+    await updateManifestV2(ledger.runDir, {
+      stage: "replanning",
+      current_work_item_id: "feature",
+      work_item_progress: {
+        feature: {
+          status: "blocked",
+          attempts: 4,
+          review_path: "reviews/feature/attempt-4.json",
+          verification_path: "verification/feature/attempt-4/evidence.json",
+          review_revision: 8,
+          review_cycle_path: "reviews/decisions/feature/revision-8.json",
+          review_effect_id: `review-effect:${"b".repeat(64)}`,
+          replan_contract_retry_used: true,
+        },
+      },
+    });
+    const blocker = "invalid_verifier_contract: Generated browser output verification/feature/attempt-4/rerun.txt is outside proposed browser-check scope";
+
+    const retried = await retryVerifierReviewAfterInvalidReplanContract(ledger.runDir, {
+      workItemId: "feature",
+      blocker,
+      retryKind: "controller_output",
+    });
+
+    expect(retried.work_item_progress.feature).toMatchObject({
+      replan_contract_retry_used: true,
+      controller_output_contract_retry_used: true,
+    });
+  });
+
   it("requires canonical event framing before deterministic appends", async () => {
     repoRoot = await mkdtemp(join(tmpdir(), "brain-hands-ledger-event-framing-"));
     const ledger = await createRunLedgerV2({ repoRoot, originalRequest: "Validate event framing" });

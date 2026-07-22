@@ -18,6 +18,10 @@ command/evidence ID per condition. For artifact proof, reference the required-ev
 `satisfied_by`, not its `source_id` or the target artifact ID.
 Every `required_evidence[].output_path` and diagnosis evidence reference must be a safe normalized
 repository/run-relative path. Never use `/tmp`, `/private/tmp`, another absolute path, or `..`.
+Generated `artifact` and `browser` evidence must use an output path already declared by the approved
+work item's `expected_artifacts` or `browser_checks[].screenshot_artifact`, respectively. Never use
+the controller-owned `verification/` namespace as a generated output path; controller-captured command
+and browser evidence does not require an invented rerun file.
 
 ## Original remediation
 {{remediation_json}}

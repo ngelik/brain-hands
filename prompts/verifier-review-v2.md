@@ -52,6 +52,10 @@ source patch or ask Hands to infer scope. Do not use vague phrases such as "as n
 appropriate", "if necessary", "properly", or "related changes". Use
 `remediation.verification.commands`; do not emit the legacy `re_verification` field. Do not include
 executable remediation on `replan_required`, `approve`, or `blocked` responses.
+Generated `artifact` and `browser` evidence must use an output path already declared by the approved
+work item's `expected_artifacts` or `browser_checks[].screenshot_artifact`, respectively. Never use
+the controller-owned `verification/` namespace as a generated output path. Command stdout, stderr,
+exit status, and normalized browser evidence are captured by the controller and need no invented rerun file.
 Every `remediation.change_units[].satisfies` entry must reference an ID declared in that remediation's
 `verification.success_conditions`; acceptance-criterion IDs belong only in `acceptance_criterion`.
 

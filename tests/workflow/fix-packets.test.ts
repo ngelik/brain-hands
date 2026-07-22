@@ -75,6 +75,15 @@ describe("fix packets", () => {
     const outOfScope = structuredClone(linked);
     outOfScope.verification.required_evidence[1]!.output_path = "artifacts/other.json";
     expect(() => compile(outOfScope)).toThrow(FixPacketRequiresReplanError);
+    const controllerOwned = structuredClone(linked);
+    controllerOwned.verification.required_evidence[1]!.output_path = "verification/issue-1/attempt-2/rerun-browser.txt";
+    expect(() => compile(controllerOwned)).toThrow(/controller-owned verification namespace/);
+    try {
+      compile(controllerOwned);
+      throw new Error("Expected controller-owned output rejection");
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(FixPacketRequiresReplanError);
+    }
   });
 
   it("maps a verifier-confused acceptance reference to the claim's success-condition IDs", () => {

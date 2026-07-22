@@ -3370,6 +3370,14 @@ function invalidVerifierContractReplanBlocker(error: unknown): string | null {
     : null;
 }
 
+function controllerOwnedOutputReplanBlocker(error: unknown): string | null {
+  if (!(error instanceof InvalidReplanCandidateError) || error.diagnostics.length === 0) return null;
+  return error.diagnostics.every((diagnostic) =>
+    /^Generated (?:artifact|browser) output verification\/.+ is outside proposed .+ scope$/.test(diagnostic))
+    ? `invalid_verifier_contract: ${error.diagnostics.join(" | ")}`
+    : null;
+}
+
 async function persistDeterministicReplanPreparationBlocker(
   runDir: string,
   error: unknown,
@@ -3378,6 +3386,7 @@ async function persistDeterministicReplanPreparationBlocker(
   if (blocker === null) return null;
   let manifest = await readManifestV2(runDir);
   const verifierContractBlocker = invalidVerifierContractReplanBlocker(error);
+  const controllerOutputBlocker = controllerOwnedOutputReplanBlocker(error);
   const workItemId = manifest.current_work_item_id;
   const progress = workItemId ? manifest.work_item_progress[workItemId] : undefined;
   if (
@@ -3391,6 +3400,19 @@ async function persistDeterministicReplanPreparationBlocker(
       blocker: verifierContractBlocker,
     });
     return { manifest, blocker: verifierContractBlocker };
+  }
+  if (
+    controllerOutputBlocker !== null
+    && manifest.stage === "replanning"
+    && workItemId !== null
+    && progress?.controller_output_contract_retry_used !== true
+  ) {
+    manifest = await retryVerifierReviewAfterInvalidReplanContract(runDir, {
+      workItemId,
+      blocker: controllerOutputBlocker,
+      retryKind: "controller_output",
+    });
+    return { manifest, blocker: controllerOutputBlocker };
   }
   if (manifest.stage === "awaiting_plan_approval" || manifest.stage === "verifier_review") {
     manifest = await transitionRun(runDir, "replanning", {
@@ -3504,28 +3526,44 @@ async function reconcileRuntimeReplanApprovalBoundary(
   }
 }
 
-function persistedInvalidVerifierContractReplanBlocker(manifest: RunManifestV2): string | null {
+function persistedInvalidVerifierContractReplanBlocker(
+  manifest: RunManifestV2,
+): { blocker: string; retryKind: "linkage" | "controller_output" } | null {
   const prefix = "Replan preparation blocked: ";
   if (manifest.stage !== "replanning" || !manifest.last_blocker?.startsWith(prefix)) return null;
   const diagnostics = manifest.last_blocker.slice(prefix.length).split(" | ");
-  if (diagnostics.length === 0 || !diagnostics.every((diagnostic) =>
+  if (diagnostics.length === 0) return null;
+  if (diagnostics.every((diagnostic) =>
     diagnostic.includes("references unknown command")
-    || diagnostic.includes("is not linked to an exact approved verification command"))) return null;
-  return `invalid_verifier_contract: ${diagnostics.join(" | ")}`;
+    || diagnostic.includes("is not linked to an exact approved verification command"))) {
+    return { blocker: `invalid_verifier_contract: ${diagnostics.join(" | ")}`, retryKind: "linkage" };
+  }
+  if (diagnostics.every((diagnostic) =>
+    /^Generated (?:artifact|browser) output verification\/.+ is outside proposed .+ scope$/.test(diagnostic))) {
+    return { blocker: `invalid_verifier_contract: ${diagnostics.join(" | ")}`, retryKind: "controller_output" };
+  }
+  return null;
 }
 
 export async function recoverPersistedInvalidVerifierContractReplan(
   runDir: string,
 ): Promise<RunManifestV2> {
   const manifest = await readManifestV2(runDir);
-  const blocker = persistedInvalidVerifierContractReplanBlocker(manifest);
+  const retry = persistedInvalidVerifierContractReplanBlocker(manifest);
   const workItemId = manifest.current_work_item_id;
+  const retryUsed = workItemId === null ? false : retry?.retryKind === "controller_output"
+    ? manifest.work_item_progress[workItemId]?.controller_output_contract_retry_used === true
+    : manifest.work_item_progress[workItemId]?.replan_contract_retry_used === true;
   if (
-    blocker === null
+    retry === null
     || workItemId === null
-    || manifest.work_item_progress[workItemId]?.replan_contract_retry_used === true
+    || retryUsed
   ) return manifest;
-  return retryVerifierReviewAfterInvalidReplanContract(runDir, { workItemId, blocker });
+  return retryVerifierReviewAfterInvalidReplanContract(runDir, {
+    workItemId,
+    blocker: retry.blocker,
+    retryKind: retry.retryKind,
+  });
 }
 
 async function preBootstrapApprovalStop(

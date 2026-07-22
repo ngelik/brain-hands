@@ -246,6 +246,9 @@ export function compileReviewFixPacket(input: CompileReviewFixPacketInput): Revi
     }
     const approved = evidence.kind === "artifact" ? approvedArtifacts : approvedBrowserOutputs;
     if (!approved.has(evidence.output_path)) {
+      if (evidence.output_path.startsWith("verification/")) {
+        throw new Error(`Generated evidence ${evidence.output_path} uses the controller-owned verification namespace`);
+      }
       throw new FixPacketRequiresReplanError(`Generated evidence ${evidence.output_path} is outside approved ${evidence.kind} output scope`);
     }
     return [evidence.output_path];
