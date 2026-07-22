@@ -42,6 +42,7 @@ import {
   InvalidReplanCandidateError,
   NoMaterialReplanError,
   prepareReplanApprovalBoundary,
+  requiredReplanArtifactOutputs,
   replanOutputScopeDiagnostics,
   reconcilePendingReplanApprovalBoundary,
   rejectPreparedReplanRevision,
@@ -439,6 +440,45 @@ describe("createReplanPatch", () => {
       review,
       findingRecords,
     })).toContain("Proposed expected artifact artifacts/unrelated.json is not required by exact unresolved remediation evidence");
+  });
+
+  it("derives only exact command-linked artifact outputs for explicit replan approval", async () => {
+    const proposedTarget = plan.work_items[0]!;
+    const command = proposedTarget.verification_commands[0]!;
+    const findingRecords = [{
+      finding_id: findingId,
+      problem_class: findingRevision.problem_class,
+      criterion_ref: findingRevision.criterion_ref,
+      normalized_location: findingRevision.normalized_location,
+      severity: findingRevision.severity,
+      disposition: findingRevision.disposition,
+      problem: findingRevision.problem,
+      required_fix: findingRevision.required_fix,
+      evidence_refs: findingRevision.evidence_refs,
+    }];
+    const review = {
+      findings: [{
+        problem: findingRevision.problem,
+        required_fix: findingRevision.required_fix,
+        remediation: {
+          verification: {
+            commands: [
+              { id: "CMD-APPROVED", argv: [...command.argv] },
+              { id: "CMD-UNAPPROVED", argv: ["node", "scripts/unapproved.mjs"] },
+            ],
+            required_evidence: [
+              { id: "E-ART", kind: "artifact", source_id: "CMD-APPROVED", output_path: "artifacts/report.json" },
+              { id: "E-BROWSER", kind: "browser", source_id: "CMD-APPROVED", output_path: "artifacts/browser.png" },
+              { id: "E-UNKNOWN", kind: "artifact", source_id: "UNKNOWN", output_path: "artifacts/unknown.json" },
+              { id: "E-UNAPPROVED", kind: "artifact", source_id: "CMD-UNAPPROVED", output_path: "artifacts/unapproved.json" },
+            ],
+          },
+        },
+      }],
+    } as VerifierReview;
+
+    expect(requiredReplanArtifactOutputs({ proposedTarget, review, findingRecords }))
+      .toEqual(["artifacts/report.json"]);
   });
 
   it("keeps the TypeScript, Zod, JSON, and prompt objective contract in parity", async () => {

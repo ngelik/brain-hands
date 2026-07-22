@@ -215,6 +215,29 @@ export class InvalidReplanCandidateError extends Error {
   }
 }
 
+export function requiredReplanArtifactOutputs(input: {
+  proposedTarget: WorkItem;
+  review: VerifierReview;
+  findingRecords: readonly ReplanFindingContext[];
+}): string[] {
+  const unresolved = new Set(input.findingRecords.map((finding) =>
+    `${finding.problem}\0${finding.required_fix ?? ""}`));
+  const approvedArgv = new Set(input.proposedTarget.verification_commands.map((command) => canonical(command.argv)));
+  const outputs: string[] = [];
+  for (const finding of input.review.findings) {
+    if (!unresolved.has(`${finding.problem}\0${finding.required_fix}`) || finding.remediation === undefined) continue;
+    const commands = new Map(finding.remediation.verification.commands.map((command) => [command.id, command.argv]));
+    for (const evidence of finding.remediation.verification.required_evidence) {
+      if (evidence.kind !== "artifact") continue;
+      const argv = commands.get(evidence.source_id);
+      if (argv !== undefined && approvedArgv.has(canonical(argv)) && !outputs.includes(evidence.output_path)) {
+        outputs.push(evidence.output_path);
+      }
+    }
+  }
+  return outputs;
+}
+
 export function replanOutputScopeDiagnostics(input: {
   baseTarget: WorkItem;
   proposedTarget: WorkItem;
@@ -2132,7 +2155,6 @@ export async function prepareReplanApprovalBoundary(
       validateDiscoveryCoverage(proposed as DiscoveredBrainPlan, verified.brief);
     }
     const baseTarget = basePlan.work_items.find((item) => item.id === input.targetWorkItemId)!;
-    const proposedTarget = proposed.work_items.find((item) => item.id === input.targetWorkItemId)!;
     const reviewPath = decision.work_item_progress_reference?.review_path;
     if (!reviewPath) throw new Error("Replan candidate validation is missing its exact review evidence");
     const review = persistedVerifierReviewSchema.parse(JSON.parse((await readOwnedEvidenceFile(
@@ -2140,6 +2162,27 @@ export async function prepareReplanApprovalBoundary(
       reviewPath,
       "reviews/",
     )).toString("utf8")));
+    let proposedTarget = proposed.work_items.find((item) => item.id === input.targetWorkItemId)!;
+    const requiredArtifactOutputs = requiredReplanArtifactOutputs({
+      proposedTarget,
+      review,
+      findingRecords: record.provenance.finding_records,
+    });
+    if (requiredArtifactOutputs.some((path) => !proposedTarget.expected_artifacts.includes(path))) {
+      proposed = parseExecutionPlan({
+        ...proposed,
+        work_items: proposed.work_items.map((item) => item.id === proposedTarget.id
+          ? {
+              ...item,
+              expected_artifacts: [
+                ...item.expected_artifacts,
+                ...requiredArtifactOutputs.filter((path) => !item.expected_artifacts.includes(path)),
+              ],
+            }
+          : item),
+      }, { mode: manifest.mode, repoRoot: manifest.repo_root }, manifest.workflow_protocol);
+      proposedTarget = proposed.work_items.find((item) => item.id === input.targetWorkItemId)!;
+    }
     const outputDiagnostics = replanOutputScopeDiagnostics({
       baseTarget,
       proposedTarget,
