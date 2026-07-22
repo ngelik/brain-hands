@@ -1356,6 +1356,23 @@ async function readRunArtifact<T>(runDir: string, artifactPath: string): Promise
   return JSON.parse(await readFile(candidate, "utf8")) as T;
 }
 
+export async function isExactBlockedSelfReviewClaim(
+  runDir: string,
+  claimPath: string,
+  reportPath: string,
+): Promise<boolean> {
+  try {
+    const claim = await readRunArtifact<Record<string, unknown>>(runDir, claimPath);
+    if (claim.state !== "blocked" || claim.report_path !== reportPath) {
+      throw new HandsSelfReviewQualityGateError(`Persisted Hands self-review claim is invalid: ${claimPath}`);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function artifactReference(runDir: string, artifactPath: string): Promise<ArtifactRefV1> {
   const path = controllerArtifactRelativePath(runDir, artifactPath);
   return artifactRefFromBytes(path, await readFile(resolve(runDir, path)));
@@ -4992,6 +5009,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     for (let pass = 1; pass <= configuredPasses; pass += 1) {
       progress = (await readManifestV2(input.runDir)).work_item_progress[gateInput.workItem.id];
       const reportPath = `self-review/${artifactId}/attempt-${gateInput.parentAttempt}/pass-${pass}.json`;
+      const claimPath = `self-review/${artifactId}/attempt-${gateInput.parentAttempt}/pass-${pass}.claim.json`;
       let report: HandsSelfReviewReport | undefined;
       const sameAttempt = progress?.attempts === gateInput.parentAttempt;
       const passAlreadyStarted = sameAttempt
@@ -5029,6 +5047,8 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       }
 
       if (report === undefined) {
+        const exactBlockedClaim = progress?.self_review_state === "invoking"
+          && await isExactBlockedSelfReviewClaim(input.runDir, claimPath, reportPath);
         manifest = await setProgress(input.runDir, gateInput.workItem.id, {
           status: "in_progress",
           attempts: gateInput.parentAttempt,
@@ -5058,7 +5078,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             resumeBlockedClaim,
             contextPlanRevision: budgetPlanRevision(),
             budget,
-          }), passAlreadyStarted && progress?.self_review_state === "invoking");
+          }), (passAlreadyStarted && progress?.self_review_state === "invoking") || exactBlockedClaim);
           report = handsSelfReviewReportSchema.parse(result.report);
         } catch (error) {
           throw new HandsSelfReviewQualityGateError(`Hands self-review pass ${pass} failed: ${errorMessage(error)}`, { cause: error });

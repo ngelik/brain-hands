@@ -14,7 +14,7 @@ import type { ActionResolutionReview, BrainPlan, HandsSelfReviewReport, Implemen
 import type { VerifyWorkItemInput } from "../../src/workflow/verifier.js";
 import type { RunVerificationInput } from "../../src/verification/runner.js";
 import type { LocalRuntimeDependencies, RunLocalWorkflowInput } from "../../src/workflow/runtime.js";
-import { assertImplementationScope, runLocalWorkflow } from "../../src/workflow/runtime.js";
+import { assertImplementationScope, isExactBlockedSelfReviewClaim, runLocalWorkflow } from "../../src/workflow/runtime.js";
 import { actionResolutionReviewPath } from "../../src/workflow/action-verifier.js";
 import { runHandsFixPacket } from "../../src/workflow/worker.js";
 import { approvePreparedReplanRevision } from "../../src/workflow/replan.js";
@@ -4683,6 +4683,21 @@ describe("runLocalWorkflow", () => {
 
     expect(result.status).toBe("human_action_required");
     expect(resumeBlockedClaim).toBe(true);
+  });
+
+  it("recognizes an exact blocked synthetic self-review claim after the ordinary attempt counter is restored", async () => {
+    const setupResult = await setup(qualityConfig(1).retry_policy.quality_gate); root = setupResult.root;
+    const reportPath = "self-review/first/attempt-88000102/pass-1.json";
+    const claimPath = "self-review/first/attempt-88000102/pass-1.claim.json";
+    await mkdir(join(setupResult.runDir, "self-review/first/attempt-88000102"), { recursive: true });
+    await writeFile(join(setupResult.runDir, claimPath), `${JSON.stringify({
+      report_path: reportPath,
+      state: "blocked",
+    })}\n`);
+
+    await expect(isExactBlockedSelfReviewClaim(setupResult.runDir, claimPath, reportPath)).resolves.toBe(true);
+    await expect(isExactBlockedSelfReviewClaim(setupResult.runDir, claimPath, "self-review/first/attempt-23/pass-1.json"))
+      .rejects.toThrow(/claim is invalid/i);
   });
 
   it("uses the snapshotted pass count when repo config changes before resume", async () => {
