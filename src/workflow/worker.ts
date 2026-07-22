@@ -1,4 +1,4 @@
-import type { CodexAdapter, CodexInvokeResult } from "../adapters/codex.js";
+import { assertPromptWithinBytes, MAX_HANDS_PROMPT_BYTES, type CodexAdapter, type CodexInvokeResult } from "../adapters/codex.js";
 import { implementationResultOutputSchema } from "../core/output-schemas.js";
 import { fixPacketResultV1OutputSchema } from "../core/output-schemas.js";
 import { executionSpecV2Schema, implementationResultSchema } from "../core/schema.js";
@@ -359,6 +359,7 @@ export async function runHandsWorkItem(input: HandsWorkItemInput): Promise<Hands
         findings_json: JSON.stringify(input.findings ?? [], null, 2),
         diagnostic_context: input.diagnosticContext ?? "No recovery context supplied.",
       });
+  assertPromptWithinBytes(prompt, MAX_HANDS_PROMPT_BYTES, "Hands prompt");
   const id = artifactId(input.workItem.id);
   const workItemCoordinate = {
     index: input.workItemIndex ?? 1,
@@ -547,6 +548,7 @@ export async function runHandsFixPacket(input: HandsFixPacketInput): Promise<Han
         supplement_json: JSON.stringify(supplement, null, 2), fix_packet_sha256: packetSha256,
         action_attempt: String(input.actionAttempt),
       });
+  assertPromptWithinBytes(prompt, MAX_HANDS_PROMPT_BYTES, "Hands fix packet prompt");
   const baseArtifactName = `hands-fix-packet-${artifactId(packet.provenance.packet_id)}-attempt-${input.actionAttempt}`;
   const artifactName = existingClaim
     ? await invocationArtifactName(input.runDir, baseArtifactName)

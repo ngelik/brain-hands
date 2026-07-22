@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CodexAdapter } from "../../src/adapters/codex.js";
+import type { ResourceBudgetPort } from "../../src/core/resource-budget.js";
 import type { VerifierRemediationClaimV1 } from "../../src/core/review-fix-packet.js";
 import { executionSpec } from "../fixtures/execution-spec.js";
 import { assertFixPacketChangedFiles, assertFixPacketCorrectionAvailable, assertRecoveredFixPacketCommitEvidence, classifyFixPacketCompilationFailure, compileReviewFixPacket, correctVerifierRemediationClaim, FixPacketRequiresReplanError, loadReviewFixPacket, persistFixAttemptSupplement, persistReviewFixPacket, reviewFixPacketCorrectionAuthority, reviewFixPacketRoot } from "../../src/workflow/fix-packets.js";
@@ -23,6 +24,45 @@ function validClaimFor(workItem: ReturnType<typeof executionSpec>): VerifierReme
 }
 
 describe("fix packets", () => {
+  it("rejects an oversized Verifier correction prompt before artifacts, Codex, or budget interaction", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-correction-oversized-prompt-"));
+    const workItem = executionSpec("item-1");
+    const claim = validClaimFor(workItem);
+    claim.diagnosis.observed_behavior = "x".repeat(1024 * 1024);
+    const codexCalls: unknown[] = [];
+    const budgetInteractions: string[] = [];
+    const budget: ResourceBudgetPort = {
+      usage: async () => { budgetInteractions.push("usage"); return { model_invocations: 0, workflow_attempts: 0, total_tokens: 0, cached_input_tokens: 0, reasoning_output_tokens: 0, active_elapsed_ms: 0, external_effects: 0, token_accounting: "known", uncertain_model_claim_ids: [], token_overshoot: 0 }; },
+      claim: async () => { budgetInteractions.push("claim"); throw new Error("must not claim"); },
+      complete: async () => { budgetInteractions.push("complete"); throw new Error("must not complete"); },
+      runWorkflowAttempt: async (_key, action) => { budgetInteractions.push("runWorkflowAttempt"); return action(); },
+      remainingActiveElapsedMs: async () => { budgetInteractions.push("remainingActiveElapsedMs"); return 0; },
+    };
+    const input = {
+      runDir: root, worktreePath: root, actionId: "R1-A1", reviewRevision: 1,
+      approvedPlanSha256: "a".repeat(64), claim, validationErrors: ["invalid"], workItem,
+      verifierProfile: { model: "verifier", reasoning_effort: "high" as const }, budget,
+      codex: { invoke: async (invocation: unknown) => { codexCalls.push(invocation); throw new Error("must not invoke"); } },
+    };
+    const authority = reviewFixPacketCorrectionAuthority(input);
+
+    await expect(correctVerifierRemediationClaim(input)).rejects.toThrow(/Verifier correction prompt exceeds 1048576 bytes/);
+
+    expect(codexCalls).toHaveLength(0);
+    expect(budgetInteractions).toEqual([]);
+    for (const relativePath of [
+      authority.requestPath,
+      `${authority.root}/prompt.md`,
+      `${authority.root}/schema.json`,
+      authority.claimPath,
+      authority.responsePath,
+      authority.completionPath,
+    ]) {
+      await expect(readFile(join(root, relativePath), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
   it("derives trusted provenance and persists immutable canonical bytes", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-packet-"));
     const workItem = executionSpec("item-1");
