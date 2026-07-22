@@ -1,6 +1,11 @@
 import { access, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { CodexAdapter, CodexInvokeResult } from "../adapters/codex.js";
+import {
+  assertPromptWithinBytes,
+  MAX_HANDS_PROMPT_BYTES,
+  type CodexAdapter,
+  type CodexInvokeResult,
+} from "../adapters/codex.js";
 import { handsSelfReviewReportOutputSchema } from "../core/output-schemas.js";
 import { handsSelfReviewReportSchema } from "../core/schema.js";
 import type {
@@ -18,6 +23,7 @@ import { renderTemplate } from "../prompts/renderer.js";
 import type { ResourceBudgetPort } from "../core/resource-budget.js";
 import { invocationArtifactName } from "./invocation-artifacts.js";
 import { compactModelDiff } from "./model-diff.js";
+import { boundedHandsDiff, compactHandsWorkItem } from "./role-context.js";
 
 export interface HandsSelfReviewInput {
   runDir: string;
@@ -139,29 +145,37 @@ export async function runHandsSelfReview(input: HandsSelfReviewInput): Promise<H
   const reportPath = `self-review/${id}/attempt-${input.parentAttempt}/pass-${input.pass}.json`;
   const claimPath = `self-review/${id}/attempt-${input.parentAttempt}/pass-${input.pass}.claim.json`;
   const activeActionId = input.activeAction?.action_id ?? null;
+  const template = await loadPromptTemplate("hands-self-review-v2");
+  const scopeInstruction = input.activeAction === null
+    ? "Because no active Reviewer action is present, you may fix other defects only when they are inside the approved work-item scope. Defer findings outside that scope."
+    : "Because an active Reviewer action is present, fixes are limited exclusively to that action, regressions caused by the current mutation, and preservation of completed actions. Defer every other finding.";
+  const completedActions = input.completedActions.map((completed) => ({
+    action_id: completed.action_id,
+    order: completed.order,
+    depends_on: completed.depends_on,
+    file: completed.file,
+    acceptance_criterion: completed.acceptance_criterion,
+  }));
+  const prompt = renderTemplate(template, {
+    work_item_json: JSON.stringify(compactHandsWorkItem(input.workItem), null, 2),
+    implementation_json: JSON.stringify(input.implementation, null, 2),
+    current_diff: boundedHandsDiff(compactModelDiff(input.currentDiff)),
+    verification_json: JSON.stringify(input.verification, null, 2),
+    active_action_json: JSON.stringify(input.activeAction, null, 2),
+    completed_actions_json: JSON.stringify(completedActions, null, 2),
+    prior_pass_reports_json: JSON.stringify(input.priorPassReports, null, 2),
+    self_review_work_item_id: input.workItem.id,
+    self_review_parent_attempt: String(input.parentAttempt),
+    self_review_mutation_kind: input.mutationKind,
+    self_review_pass: String(input.pass),
+    self_review_active_action_id: activeActionId ?? "null",
+    self_review_scope_instruction: scopeInstruction,
+  });
+  assertPromptWithinBytes(prompt, MAX_HANDS_PROMPT_BYTES, "Hands self-review prompt");
+
   const absoluteClaimPath = await claimPass(input.runDir, reportPath, claimPath, input.resumeBlockedClaim);
   let invocationStarted = false;
   try {
-    const template = await loadPromptTemplate("hands-self-review-v2");
-    const scopeInstruction = input.activeAction === null
-      ? "Because no active Reviewer action is present, you may fix other defects only when they are inside the approved work-item scope. Defer findings outside that scope."
-      : "Because an active Reviewer action is present, fixes are limited exclusively to that action, regressions caused by the current mutation, and preservation of completed actions. Defer every other finding.";
-    const prompt = renderTemplate(template, {
-      work_item_json: JSON.stringify(input.workItem, null, 2),
-      implementation_json: JSON.stringify(input.implementation, null, 2),
-      current_diff: compactModelDiff(input.currentDiff),
-      verification_json: JSON.stringify(input.verification, null, 2),
-      active_action_json: JSON.stringify(input.activeAction, null, 2),
-      completed_actions_json: JSON.stringify(input.completedActions, null, 2),
-      prior_pass_reports_json: JSON.stringify(input.priorPassReports, null, 2),
-      self_review_work_item_id: input.workItem.id,
-      self_review_parent_attempt: String(input.parentAttempt),
-      self_review_mutation_kind: input.mutationKind,
-      self_review_pass: String(input.pass),
-      self_review_active_action_id: activeActionId ?? "null",
-      self_review_scope_instruction: scopeInstruction,
-    });
-
     await writeTextArtifact(input.runDir, `prompts/${artifactName}.md`, prompt);
     await writeTextArtifact(
       input.runDir,

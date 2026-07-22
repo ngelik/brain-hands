@@ -2,7 +2,11 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CodexAdapter, CodexInvokeInput } from "../../src/adapters/codex.js";
+import {
+  MAX_HANDS_PROMPT_BYTES,
+  type CodexAdapter,
+  type CodexInvokeInput,
+} from "../../src/adapters/codex.js";
 import { createRunLedgerV2 } from "../../src/core/ledger.js";
 import type {
   HandsSelfReviewReport,
@@ -152,17 +156,35 @@ describe("runHandsSelfReview", () => {
     expect(result.reportPath).toBe("self-review/item-1/attempt-2/pass-1.json");
   });
 
-  it("omits binary patch payloads and bounds oversized text diffs before invocation", async () => {
+  it("bounds large self-review context while preserving current intent and action authority", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-bounded-diff-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
     const codex = new RecordingHands();
+    const largeWorkItem: WorkItem = {
+      ...workItem,
+      objective: [
+        "BASE-INTENT: preserve the original migration boundary.",
+        "中😀".repeat(50_000),
+        "LATEST-INTENT: preserve the final rollout boundary.",
+      ].join("\n"),
+    };
     const binaryPayload = "A".repeat(1_200_000);
     const textPayload = `+${"x".repeat(700_000)}`;
+    const completedRequiredFix = `COMPLETED-REQUIRED-FIX:${"r".repeat(80_000)}`;
+    const completedActions: ReviewerAction[] = [1, 2].map((order) => ({
+      ...action,
+      action_id: `R2-A${order + 1}`,
+      order: order + 1,
+      depends_on: order === 1 ? [] : ["R2-A2"],
+      file: `src/completed-${order}.ts`,
+      acceptance_criterion: `Completed criterion ${order}`,
+      required_fix: completedRequiredFix,
+    }));
 
     await runHandsSelfReview({
       runDir: ledger.runDir,
       worktreePath: join(root, "worktree"),
-      workItem,
+      workItem: largeWorkItem,
       intake: { ...intake, repo_root: root },
       codex,
       parentAttempt: 2,
@@ -183,17 +205,72 @@ describe("runHandsSelfReview", () => {
       ].join("\n"),
       verification,
       activeAction: action,
-      completedActions: [],
+      completedActions,
       priorPassReports: [],
     });
 
     const prompt = codex.calls[0]!.prompt;
-    expect(prompt.length).toBeLessThan(600_000);
-    expect(prompt).toContain("Binary patch payload omitted from the model prompt (1200000 bytes)");
-    expect(prompt).toContain("Diff content compacted to stay within the model input limit");
+    const activeActionJson = prompt
+      .split("Active Reviewer action (null means the approved work-item scope is active):\n")[1]!
+      .split("\n\nCompleted Reviewer actions:")[0]!;
+    const completedActionsJson = prompt
+      .split("Completed Reviewer actions:\n")[1]!
+      .split("\n\nPrior self-review pass reports:")[0]!;
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(MAX_HANDS_PROMPT_BYTES);
+    expect(prompt).toContain("BASE-INTENT: preserve the original migration boundary.");
+    expect(prompt).toContain("LATEST-INTENT: preserve the final rollout boundary.");
+    expect(prompt).toContain("Source patch section summarized for bounded Hands context.");
     expect(prompt).toContain("public/planet.webp");
     expect(prompt).toContain("src/example.ts");
     expect(prompt).not.toContain(binaryPayload);
+    expect(JSON.parse(activeActionJson)).toEqual(action);
+    expect(JSON.parse(completedActionsJson)).toEqual(completedActions.map((completed) => ({
+      action_id: completed.action_id,
+      order: completed.order,
+      depends_on: completed.depends_on,
+      file: completed.file,
+      acceptance_criterion: completed.acceptance_criterion,
+    })));
+    expect(prompt).not.toContain(completedRequiredFix);
+  });
+
+  it("rejects a residual oversized prompt before claim, Codex, or artifact writes", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-oversized-prompt-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
+    const codex = new RecordingHands();
+    const artifactName = "hands-self-review-item-1-attempt-2-pass-1";
+
+    await expect(runHandsSelfReview({
+      runDir: ledger.runDir,
+      worktreePath: join(root, "worktree"),
+      workItem,
+      intake: { ...intake, repo_root: root },
+      codex,
+      parentAttempt: 2,
+      mutationKind: "normal_fix",
+      pass: 1,
+      implementation: {
+        ...implementation,
+        remaining_risks: [`RESIDUAL-OVERSIZE:${"z".repeat(MAX_HANDS_PROMPT_BYTES)}`],
+      },
+      currentDiff: "diff",
+      verification,
+      activeAction: action,
+      completedActions: [],
+      priorPassReports: [],
+    })).rejects.toThrow(`Hands self-review prompt exceeds ${MAX_HANDS_PROMPT_BYTES} bytes`);
+
+    expect(codex.calls).toHaveLength(0);
+    for (const relativePath of [
+      "self-review/item-1/attempt-2/pass-1.claim.json",
+      "self-review/item-1/attempt-2/pass-1.json",
+      `prompts/${artifactName}.md`,
+      `schemas/${artifactName}.json`,
+      `responses/${artifactName}.json`,
+    ]) {
+      await expect(readFile(join(ledger.runDir, relativePath), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("writes distinct prompt, schema, response, and immutable report artifacts", async () => {
