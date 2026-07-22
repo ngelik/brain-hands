@@ -5334,9 +5334,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     completed: readonly ReviewerAction[],
     packet?: ReviewFixPacketV1,
   ): WorkItem => {
-    const commands = packet
-      ? packet.verification.commands.map((command) => command.argv)
-      : actionCommands(active, completed);
+    const commands = actionCommands(active, completed);
     const packetArtifacts = packet
       ? packet.verification.required_evidence
           .filter((evidence) => evidence.kind === "artifact")
@@ -5349,11 +5347,13 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         `Resolve only Reviewer action ${active.action_id}: ${active.required_fix}`,
         `Completed Reviewer actions to preserve without reopening: ${completed.length === 0
           ? "none"
-          : completed.map((action) => `${action.action_id}: ${action.required_fix}`).join("; ")}`,
+          : completed.map((action) => packet ? action.action_id : `${action.action_id}: ${action.required_fix}`).join("; ")}`,
       ].join("\n"),
-      verification_commands: commands.length > 0
-        ? commands.map((argv, index) => ({ id: `review-action-${active.action_id}-${index + 1}`, argv, expected_exit_code: 0 as const }))
-        : workItem.verification_commands,
+      verification_commands: packet
+        ? packet.verification.commands.map((command) => ({ id: command.id, argv: command.argv, expected_exit_code: 0 as const }))
+        : commands.length > 0
+          ? commands.map((argv, index) => ({ id: `review-action-${active.action_id}-${index + 1}`, argv, expected_exit_code: 0 as const }))
+          : workItem.verification_commands,
       expected_artifacts: [...new Set([...workItem.expected_artifacts, ...packetArtifacts])],
     };
   };

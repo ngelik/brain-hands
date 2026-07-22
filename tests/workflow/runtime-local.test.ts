@@ -16,7 +16,7 @@ import type { RunVerificationInput } from "../../src/verification/runner.js";
 import type { LocalRuntimeDependencies, RunLocalWorkflowInput } from "../../src/workflow/runtime.js";
 import { assertImplementationScope, isExactBlockedSelfReviewClaim, isResumableReviewerActionQualityGate, isResumableSelfReviewQualityState, runLocalWorkflow, shouldResumeBlockedSelfReviewClaim } from "../../src/workflow/runtime.js";
 import { actionResolutionReviewPath } from "../../src/workflow/action-verifier.js";
-import { runHandsFixPacket } from "../../src/workflow/worker.js";
+import { runHandsFixPacket, type HandsFixPacketInput } from "../../src/workflow/worker.js";
 import { approvePreparedReplanRevision } from "../../src/workflow/replan.js";
 import { executionSpec } from "../fixtures/execution-spec.js";
 import { openProgressReporter, readProgressEvents, type ProgressReporter } from "../../src/progress/log.js";
@@ -1392,6 +1392,179 @@ describe("runLocalWorkflow", () => {
     expect(records.find((record) => record.finding_id === lowId)).toMatchObject({
       finding_id: lowId, severity: "low", disposition: "advisory",
     });
+  });
+
+  it("preserves packet verification command identity in action-scoped Hands inputs", async () => {
+    const originalCommand = {
+      id: "vc-render-tests",
+      argv: ["node", "node_modules/vitest/vitest.mjs", "run", "tests/original-render.test.ts"],
+      expected_exit_code: 0 as const,
+      tier: "focused" as const,
+    };
+    const baseWorkItem = item("first");
+    const workItem = {
+      ...baseWorkItem,
+      tests: baseWorkItem.tests.map((test) => ({ ...test, verification_command_ids: [originalCommand.id] })),
+      verification_commands: [originalCommand],
+    };
+    const config = qualityConfig(0);
+    const legacySetup = await setup(config.retry_policy.quality_gate); root = legacySetup.root;
+    const legacyPlan = { ...plan, work_items: [workItem] };
+    const legacyPlanRevision = await recordPlan(legacySetup.runDir, `${JSON.stringify(legacyPlan)}\n`);
+    await approvePlanRevision(legacySetup.runDir, legacyPlanRevision.revision, { actor: "test" });
+    const completedFix = "Preserve the completed parser correction without repeating this prose.";
+    const activeFix = "Apply the active renderer correction in full.";
+    const packetCommand = (finding: ReturnType<typeof packetFinding>, id: string, argv: string[]) => {
+      const priorCommandIds = new Set(finding.remediation.verification.commands.map((command) => command.id));
+      return {
+        ...finding,
+        remediation: {
+          ...finding.remediation,
+          verification: {
+            ...finding.remediation.verification,
+            commands: [{ id, argv }],
+            success_conditions: finding.remediation.verification.success_conditions.map((condition) => ({
+              ...condition,
+              satisfied_by: condition.satisfied_by.map((entry) => priorCommandIds.has(entry) ? id : entry),
+            })),
+            required_evidence: finding.remediation.verification.required_evidence.map((entry) => ({
+              ...entry,
+              source_id: id,
+            })),
+          },
+        },
+      };
+    };
+    const firstFinding = packetCommand(
+      { ...packetFinding(workItem, verificationEvidencePath(identity("first"), 1)), required_fix: completedFix },
+      "packet-parser-tests",
+      originalCommand.argv,
+    );
+    const secondBase = advisoryPacketFinding(workItem, verificationEvidencePath(identity("first"), 1));
+    const secondFinding = packetCommand({
+      ...secondBase,
+      severity: "medium" as const,
+      problem_class: "correctness" as const,
+      required_fix: activeFix,
+      action_id: "R1-A2",
+      order: 2,
+      depends_on: ["R1-A1"],
+    } as unknown as ReturnType<typeof packetFinding>, "packet-render-tests", originalCommand.argv);
+    const legacyInputs: HandsFixPacketInput[] = [];
+    let legacyReviews = 0;
+    const legacyDependencies: LocalRuntimeDependencies = {
+      hands: async (input) => ({
+        implementation: implementation(input.workItem.id),
+        reportPath: `implementation/${input.workItem.id}/attempt-${input.attempt}.json`,
+        invocation: {} as never,
+      }),
+      verification: async (input) => evidenceForInput(input),
+      verifier: async (input) => {
+        const requestChanges = !input.final && legacyReviews++ === 0;
+        const value: VerifierReview = requestChanges
+          ? {
+              ...review("request_changes", input.workItem.id, input.attempt, false),
+              failure_class: "implementation_failure", blocker: null, blocker_code: null,
+              acceptance_coverage: [], evidence_reviewed: [verifierEvidenceRef(input)],
+              findings: [firstFinding, secondFinding],
+            }
+          : {
+              ...review("approve", input.workItem.id, input.attempt, input.final),
+              failure_class: "none", blocker: null, blocker_code: null,
+              evidence_reviewed: [verifierEvidenceRef(input)],
+            };
+        const path = input.final
+          ? `reviews/integrated/final-attempt-${input.attempt}.json`
+          : `reviews/${input.workItem.id}/attempt-${input.attempt}.json`;
+        return { review: value, reviewPath: await persistReview(input.runDir, path, value), invocation: {} as never };
+      },
+      handsFixPacket: async (input) => {
+        legacyInputs.push(input);
+        const changedPath = input.packet.completion_contract.expected_changed_files[0]!;
+        await mkdir(join(input.worktreePath, changedPath.startsWith("tests/") ? "tests" : "src"), { recursive: true });
+        await writeFile(join(input.worktreePath, changedPath), `export const packetAttempt = ${legacyInputs.length};\n`, "utf8");
+        const value = {
+          schema_version: 1 as const, packet_id: input.packet.provenance.packet_id,
+          packet_sha256: hashReviewFixPacket(input.packet), action_attempt: input.actionAttempt,
+          status: "implemented" as const,
+          change_units: input.packet.remediation.change_units.map((unit) => ({
+            change_unit_id: unit.id, status: "completed" as const,
+            changed_files: [unit.path], summary: `Applied ${unit.id}`,
+          })),
+          changed_files: input.packet.completion_contract.expected_changed_files,
+          commands_attempted: [], unresolved_requirements: [], blocker: null,
+        };
+        const reportPath = `reviews/fix-packets/${Buffer.from(input.packet.provenance.packet_id).toString("base64url")}/attempts/${input.actionAttempt}/hands-result.json`;
+        await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(value)}\n`);
+        const profile = input.profile ?? input.intake.roles.hands;
+        return { result: value, reportPath, invocation: {} as never, profile: { kind: input.profileKind ?? "primary", model: profile.model, reasoning_effort: profile.reasoning_effort } };
+      },
+      packetVerifier: async (input) => {
+        const value = {
+          packet_id: input.packet.provenance.packet_id,
+          packet_sha256: hashReviewFixPacket(input.packet), action_attempt: input.actionAttempt,
+          decision: "resolved" as const,
+          condition_results: input.packet.verification.success_conditions.map((condition) => ({
+            success_condition_id: condition.id, status: "satisfied" as const,
+            evidence_refs: [input.verificationEvidence.evidence_path!], remaining_problem: null,
+          })),
+          required_next_fix: null, blocker: null,
+        };
+        const reviewPath = `reviews/fix-packets/${Buffer.from(input.packet.provenance.packet_id).toString("base64url")}/attempts/${input.actionAttempt}/focused-resolution.json`;
+        await writeTextArtifact(input.runDir, reviewPath, `${JSON.stringify(value)}\n`);
+        return { review: value, reviewPath, invocation: {} as never };
+      },
+      diff: async () => "diff",
+      hasWorktreeChanges: async () => false,
+      gitSnapshot: cleanSnapshot,
+      commit: async () => "no-op",
+    };
+
+    const legacyResult = await runLocalWorkflow({
+      runDir: legacySetup.runDir, worktreePath: legacySetup.worktree,
+      intake: { ...intake, repo_root: legacySetup.root }, plan: legacyPlan,
+      codex: {} as never, config, dependencies: legacyDependencies,
+    });
+
+    expect(legacyResult.status, legacyResult.blocker).toBe("local_ready");
+    expect(legacyInputs).toHaveLength(2);
+    const activeInput = legacyInputs[1]!;
+    const expectedCommands = activeInput.packet.verification.commands.map((command) => ({
+      id: command.id, argv: command.argv, expected_exit_code: 0,
+    }));
+    expect(activeInput.workItem.verification_commands).toEqual(expectedCommands);
+    expect(activeInput.workItem.verification_commands.map((command) => command.id)).not.toContain("vc-render-tests");
+    expect(activeInput.workItem.objective).toContain(workItem.objective);
+    expect(activeInput.workItem.objective).toContain(`R1-A2: ${activeFix}`);
+    expect(activeInput.workItem.objective).toContain("R1-A1");
+    expect(activeInput.workItem.objective).not.toContain(completedFix);
+
+    await rm(legacySetup.root, { recursive: true, force: true }); root = undefined;
+    const boundedSetup = await setupBounded({ ...plan, work_items: [workItem] }, false, config.retry_policy.quality_gate);
+    root = boundedSetup.root;
+    const boundedHarness = boundedQueueDependencies(workItem);
+    let boundedInput: HandsFixPacketInput | undefined;
+    const boundedResult = await runLocalWorkflow({
+      runDir: boundedSetup.runDir, worktreePath: boundedSetup.worktree,
+      intake: { ...intake, repo_root: boundedSetup.root }, plan: { ...plan, work_items: [workItem] },
+      codex: {} as never, config,
+      dependencies: {
+        ...boundedHarness.dependencies,
+        handsFixPacket: async (input) => {
+          boundedInput = input;
+          return boundedHarness.dependencies.handsFixPacket!(input);
+        },
+      },
+      deferTerminalDisposition: true,
+    });
+
+    expect(boundedResult.status, boundedResult.blocker).toBe("local_ready");
+    expect(boundedInput).toBeDefined();
+    expect(boundedInput!.packet.verification.commands).toEqual([
+      { id: "CMD-1", argv: originalCommand.argv },
+    ]);
+    expect(boundedInput!.context?.work_item).toEqual(workItem);
+    expect((boundedInput!.context?.work_item as unknown as WorkItem).verification_commands).toEqual([originalCommand]);
   });
 
   it("keeps two bounded R1-A1 packet workflows in distinct scoped artifact roots", async () => {
