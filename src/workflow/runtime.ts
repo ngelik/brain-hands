@@ -3504,10 +3504,32 @@ async function reconcileRuntimeReplanApprovalBoundary(
   }
 }
 
+function persistedInvalidVerifierContractReplanBlocker(manifest: RunManifestV2): string | null {
+  const prefix = "Replan preparation blocked: ";
+  if (manifest.stage !== "replanning" || !manifest.last_blocker?.startsWith(prefix)) return null;
+  const diagnostics = manifest.last_blocker.slice(prefix.length).split(" | ");
+  if (diagnostics.length === 0 || !diagnostics.every((diagnostic) =>
+    diagnostic.includes("references unknown command")
+    || diagnostic.includes("is not linked to an exact approved verification command"))) return null;
+  return `invalid_verifier_contract: ${diagnostics.join(" | ")}`;
+}
+
 async function preBootstrapApprovalStop(
   input: RunLocalWorkflowInput,
 ): Promise<{ result: LocalWorkflowResult; initial: boolean; concurrentPromotion: boolean } | null> {
   let manifest = await readManifestV2(input.runDir);
+  const persistedVerifierContractBlocker = persistedInvalidVerifierContractReplanBlocker(manifest);
+  const retryWorkItemId = manifest.current_work_item_id;
+  if (
+    persistedVerifierContractBlocker !== null
+    && retryWorkItemId !== null
+    && manifest.work_item_progress[retryWorkItemId]?.replan_contract_retry_used !== true
+  ) {
+    manifest = await retryVerifierReviewAfterInvalidReplanContract(input.runDir, {
+      workItemId: retryWorkItemId,
+      blocker: persistedVerifierContractBlocker,
+    });
+  }
   const currentRevision = manifest.current_revision ?? manifest.current_plan_revision;
   const approvedRevision = manifest.approved_revision ?? manifest.approved_plan_revision;
   const initialApprovalPending = manifest.pending_plan_approval?.base_revision === null

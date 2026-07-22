@@ -2486,6 +2486,73 @@ describe("runLocalWorkflow", () => {
     expect(events.at(-1)?.safe_label).toBe("Worker session completed");
   });
 
+  it("re-enters Verifier once when a persisted replan blocker proves malformed command linkage", async () => {
+    const setupResult = await setup(); root = setupResult.root;
+    const workItem = item("first");
+    const runtimePlan = { ...plan, work_items: [workItem] };
+    const reportPath = "implementation/first/attempt-1.json";
+    const oldReviewPath = "reviews/first/attempt-1.json";
+    const oldEvidence = evidence("first");
+    await writeTextArtifact(setupResult.runDir, reportPath, `${JSON.stringify(implementation("first"))}\n`);
+    await persistEvidenceBundle(setupResult.runDir, oldEvidence);
+    await persistReview(setupResult.runDir, oldReviewPath, review("request_changes", "first", 1, false));
+    await transitionRun(setupResult.runDir, "implementing", { actor: "test" });
+    await transitionRun(setupResult.runDir, "verifying", { actor: "test" });
+    await transitionRun(setupResult.runDir, "verifier_review", { actor: "test" });
+    await transitionRun(setupResult.runDir, "replanning", { actor: "test" });
+    const malformedBlocker = "Replan preparation blocked: Generated artifact output artifacts/report.json references unknown command report";
+    await updateManifestV2(setupResult.runDir, {
+      current_work_item_id: "first",
+      delivery_state: "blocked",
+      last_blocker: malformedBlocker,
+      work_item_progress: {
+        first: {
+          status: "blocked",
+          attempts: 1,
+          implementation_path: reportPath,
+          verification_path: oldEvidence.evidence_path,
+          review_path: oldReviewPath,
+          review_revision: 9,
+          review_cycle_path: "reviews/decisions/first/revision-9.json",
+          review_effect_id: `review-effect:${"a".repeat(64)}`,
+          replan_patch_path: "replans/first-base-1-review-9.json",
+          replan_target_work_item_id: "first",
+        },
+      },
+    });
+    let verifierCalls = 0;
+
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: setupResult.worktree,
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: runtimePlan,
+      codex: {} as never,
+      dependencies: {
+        hands: async () => { throw new Error("Hands must not run during Verifier-contract recovery"); },
+        verification: async (input) => evidenceForInput(input),
+        verifier: async (input) => {
+          verifierCalls += 1;
+          const value = review("approve", input.workItem.id, input.attempt, input.final);
+          const path = input.final
+            ? `reviews/integrated/final-attempt-${input.attempt}.json`
+            : `reviews/${input.workItem.id}/attempt-${input.attempt}.json`;
+          return { review: value, reviewPath: await persistReview(input.runDir, path, value), invocation: {} as never };
+        },
+        commit: async () => "no-op",
+        gitSnapshot: cleanSnapshot,
+      },
+    });
+
+    expect(result.status, result.blocker).toBe("local_ready");
+    expect(verifierCalls).toBe(2);
+    const manifest = await readManifestV2(setupResult.runDir);
+    expect(manifest.work_item_progress.first?.replan_contract_retry_used).toBe(true);
+    expect(manifest.work_item_progress.first?.review_path).not.toBe(oldReviewPath);
+    expect(await readFile(join(setupResult.runDir, "events.jsonl"), "utf8"))
+      .toContain('"type":"invalid_replan_contract_retry"');
+  });
+
   it("resumes a fixing stage from the persisted fix report and prior review attempt", async () => {
     const setupResult = await setup(); root = setupResult.root;
     const workItem = item("first");

@@ -3241,8 +3241,14 @@ export async function retryVerifierReviewAfterInvalidReplanContract(
     if (progress.replan_contract_retry_used === true) {
       throw new Error(`Verifier-contract retry already used for work item ${input.workItemId}`);
     }
-    if (typeof progress.review_path !== "string" || typeof progress.verification_path !== "string") {
-      throw new Error("Invalid Verifier-contract retry requires immutable review and verification evidence");
+    if (
+      typeof progress.review_path !== "string"
+      || typeof progress.verification_path !== "string"
+      || typeof progress.review_revision !== "number"
+      || typeof progress.review_cycle_path !== "string"
+      || typeof progress.review_effect_id !== "string"
+    ) {
+      throw new Error("Invalid Verifier-contract retry requires immutable review, verification, and replan-cycle evidence");
     }
     if (!input.blocker.startsWith("invalid_verifier_contract:")) {
       throw new Error("Invalid Verifier-contract retry blocker");
