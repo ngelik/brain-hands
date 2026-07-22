@@ -4153,6 +4153,21 @@ describe("runLocalWorkflow", () => {
     } as RunLocalWorkflowInput;
     const interrupted = await runLocalWorkflow(workflowInput);
     expect(interrupted.blocker).toContain("crash after persisted replan effect");
+    const interruptedManifest = await readManifestV2(setupResult.runDir);
+    await transitionRun(setupResult.runDir, "verifying", { actor: "test" });
+    await transitionRun(setupResult.runDir, "verifier_review", { actor: "test" });
+    await updateManifestV2(setupResult.runDir, {
+      work_item_progress: {
+        ...interruptedManifest.work_item_progress,
+        first: {
+          ...interruptedManifest.work_item_progress.first!,
+          queue_state: "complete",
+          review_path: undefined,
+          review_cycle_path: undefined,
+          review_effect_id: undefined,
+        },
+      },
+    });
     const result = await runLocalWorkflow(workflowInput);
 
     expect(result.status).toBe("human_action_required");

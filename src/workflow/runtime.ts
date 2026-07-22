@@ -6924,6 +6924,53 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
 
     if (
       policyEnabled
+      && manifest.stage === "verifier_review"
+      && progress?.queue_state === "complete"
+      && typeof progress.queue_path === "string"
+      && typeof progress.review_revision === "number"
+    ) {
+      const cycle = reviewCycleStateSchema.parse(await readRunArtifact<unknown>(
+        input.runDir,
+        reviewDecisionPath(item.id, progress.review_revision),
+      ));
+      if (
+        cycle.work_item_id !== item.id
+        || cycle.review_revision !== progress.review_revision
+        || !isReviewEffectAction(cycle.decision.action)
+      ) throw new Error(`Completed ordered fix effect provenance is invalid: ${item.id}`);
+      const completedEffect = await loadCompletedReviewEffect({
+        run_dir: input.runDir,
+        cycle,
+        owner: policyEffectOwner,
+      });
+      if (completedEffect) {
+        const result = parseFixEffectResult(completedEffect.effect_result);
+        if (result.kind === "still_blocking" && result.successful_hands_fixes === 0) {
+          const blocker = `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
+          manifest = await transitionRun(input.runDir, "replanning", {
+            actor: "runtime",
+            payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
+          });
+          manifest = await updateManifestV2(input.runDir, {
+            delivery_state: "blocked",
+            last_blocker: blocker,
+            work_item_progress: {
+              ...manifest.work_item_progress,
+              [item.id]: {
+                ...(manifest.work_item_progress[item.id] ?? {}),
+                status: "blocked",
+                blocker,
+                queue_state: "blocked",
+              },
+            },
+          });
+          return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+        }
+      }
+    }
+
+    if (
+      policyEnabled
       && progress?.queue_path
       && progress.queue_state !== "complete"
       && typeof progress.review_cycle_path === "string"
