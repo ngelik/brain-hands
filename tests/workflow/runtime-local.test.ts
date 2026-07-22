@@ -14,7 +14,7 @@ import type { ActionResolutionReview, BrainPlan, HandsSelfReviewReport, Implemen
 import type { VerifyWorkItemInput } from "../../src/workflow/verifier.js";
 import type { RunVerificationInput } from "../../src/verification/runner.js";
 import type { LocalRuntimeDependencies, RunLocalWorkflowInput } from "../../src/workflow/runtime.js";
-import { assertImplementationScope, isExactBlockedSelfReviewClaim, isResumableSelfReviewQualityState, runLocalWorkflow } from "../../src/workflow/runtime.js";
+import { assertImplementationScope, isExactBlockedSelfReviewClaim, isResumableSelfReviewQualityState, runLocalWorkflow, shouldResumeBlockedSelfReviewClaim } from "../../src/workflow/runtime.js";
 import { actionResolutionReviewPath } from "../../src/workflow/action-verifier.js";
 import { runHandsFixPacket } from "../../src/workflow/worker.js";
 import { approvePreparedReplanRevision } from "../../src/workflow/replan.js";
@@ -4707,6 +4707,8 @@ describe("runLocalWorkflow", () => {
     };
     expect(isResumableSelfReviewQualityState(progress, 88000102, true)).toBe(true);
     expect(isResumableSelfReviewQualityState(progress, 88000102, false)).toBe(false);
+    expect(shouldResumeBlockedSelfReviewClaim(false, true)).toBe(true);
+    expect(shouldResumeBlockedSelfReviewClaim(false, false)).toBe(false);
   });
 
   it("uses the snapshotted pass count when repo config changes before resume", async () => {

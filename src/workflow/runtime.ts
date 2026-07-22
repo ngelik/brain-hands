@@ -1384,6 +1384,13 @@ export function isResumableSelfReviewQualityState(
     && typeof progress.verification_path === "string";
 }
 
+export function shouldResumeBlockedSelfReviewClaim(
+  fallbackClaimTransfer: boolean,
+  exactBlockedClaim: boolean,
+): boolean {
+  return fallbackClaimTransfer || exactBlockedClaim;
+}
+
 async function artifactReference(runDir: string, artifactPath: string): Promise<ArtifactRefV1> {
   const path = controllerArtifactRelativePath(runDir, artifactPath);
   return artifactRefFromBytes(path, await readFile(resolve(runDir, path)));
@@ -5096,7 +5103,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
             completedActions: gateInput.completedActions,
             priorPassReports: reports,
             profile: selfReviewProfile(profile),
-            resumeBlockedClaim,
+            resumeBlockedClaim: shouldResumeBlockedSelfReviewClaim(resumeBlockedClaim, exactBlockedClaim),
             contextPlanRevision: budgetPlanRevision(),
             budget,
           }), (passAlreadyStarted && progress?.self_review_state === "invoking") || exactBlockedClaim);
