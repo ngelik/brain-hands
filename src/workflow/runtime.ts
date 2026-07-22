@@ -327,6 +327,7 @@ export type RuntimeCheckpoint =
   | "after_work_item_fix_effect_claim"
   | "after_work_item_convergence_report"
   | "after_work_item_effect"
+  | "after_ordered_replan_effect_complete"
   | "after_ordered_fix_effect_complete"
   | "after_ordered_fix_effect_progress"
   | "after_ordered_recovery_outcome"
@@ -5819,8 +5820,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         } catch (error) {
           if (classifyFixPacketCompilationFailure(error) === "replan") {
             if (policyEffect) {
-              effectKind = "still_blocking";
-              break;
+              return { kind: "blocked", blocker: errorMessage(error), blockerCode: "replan_required" };
             }
             return { kind: "blocked", blocker: errorMessage(error), blockerCode: "replan_required" };
           }
@@ -6377,6 +6377,7 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       reviewPass: number;
       savedEvidencePath: string;
     })
+    | { kind: "replan_required"; blocker: string }
     | Extract<FixEffectResult, { kind: "operationally_blocked" }>;
 
   const executeOrderedFixEffect = async (
@@ -6389,6 +6390,9 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       throw new Error("Policy ordered fix effect returned legacy review authority");
     }
     if (result.kind === "blocked") {
+      if (result.blockerCode === "replan_required") {
+        return { kind: "replan_required", blocker: result.blocker };
+      }
       return {
         kind: "operationally_blocked",
         blocker: {
@@ -6947,6 +6951,27 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           manifest = await updateManifestV2(input.runDir, { delivery_state: "blocked", last_blocker: blocker });
           return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
         }
+        if (result.kind === "still_blocking" && result.successful_hands_fixes === 0) {
+          const blocker = `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
+          manifest = await transitionRun(input.runDir, "replanning", {
+            actor: "runtime",
+            payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
+          });
+          manifest = await updateManifestV2(input.runDir, {
+            delivery_state: "blocked",
+            last_blocker: blocker,
+            work_item_progress: {
+              ...manifest.work_item_progress,
+              [item.id]: {
+                ...(manifest.work_item_progress[item.id] ?? {}),
+                status: "blocked",
+                blocker,
+                queue_state: "blocked",
+              },
+            },
+          });
+          return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+        }
         if (result.evidence_paths.some((path) => path.includes("..") || path.startsWith("/"))) {
           throw new Error(`Completed ordered fix effect evidence path escapes its run: ${item.id}`);
         }
@@ -7049,6 +7074,55 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         });
         manifest = recovered.manifest;
         return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker: recovered.blocker };
+      }
+      if (
+        queueResult.kind === "replan_required"
+        || (queueResult.kind === "still_blocking" && queueResult.successful_hands_fixes === 0)
+      ) {
+        await recordAuthorizedRuntimeSuccess(
+          orderedRecoveryOperation,
+          orderedRecoveryContext,
+          {
+            implementation_path: progress.implementation_path as string,
+            verification_path: progress.verification_path as string,
+            review_path: reference.review_path,
+          },
+        );
+        await completeReviewEffect({
+          run_dir: input.runDir,
+          cycle,
+          owner: policyEffectOwner,
+          outcome: "complete",
+          result: queueResult.kind === "replan_required"
+            ? { kind: "still_blocking", successful_hands_fixes: 0, evidence_paths: [] }
+            : {
+                kind: queueResult.kind,
+                successful_hands_fixes: queueResult.successful_hands_fixes,
+                evidence_paths: queueResult.evidence_paths,
+              },
+        });
+        await input.dependencies?.afterCheckpoint?.("after_ordered_replan_effect_complete");
+        const blocker = queueResult.kind === "replan_required"
+          ? `Fix packet requires replanning for work item ${item.id}: ${queueResult.blocker}`
+          : `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
+        manifest = await transitionRun(input.runDir, "replanning", {
+          actor: "runtime",
+          payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
+        });
+        manifest = await updateManifestV2(input.runDir, {
+          delivery_state: "blocked",
+          last_blocker: blocker,
+          work_item_progress: {
+            ...manifest.work_item_progress,
+            [item.id]: {
+              ...(manifest.work_item_progress[item.id] ?? {}),
+              status: "blocked",
+              blocker,
+              queue_state: "blocked",
+            },
+          },
+        });
+        return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
       }
       await recordAuthorizedRuntimeSuccess(
         orderedRecoveryOperation,
@@ -8283,6 +8357,55 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
                 implementationResult,
                 recoverStartedPacketInvocation: orderedRecoveryContext.gate.mode === "authorized_attempt",
               }, policyEffectOwner);
+              if (
+                queueResult.kind === "replan_required"
+                || (queueResult.kind === "still_blocking" && queueResult.successful_hands_fixes === 0)
+              ) {
+                await recordAuthorizedRuntimeSuccess(
+                  orderedRecoveryOperation,
+                  orderedRecoveryContext,
+                  {
+                    implementation_path: implementationResult.reportPath,
+                    verification_path: savedEvidencePath,
+                    review_path: cycle.work_item_progress_reference!.review_path,
+                  },
+                );
+                await completeReviewEffect({
+                  run_dir: input.runDir,
+                  cycle,
+                  owner: policyEffectOwner,
+                  outcome: "complete",
+                  result: queueResult.kind === "replan_required"
+                    ? { kind: "still_blocking", successful_hands_fixes: 0, evidence_paths: [] }
+                    : {
+                        kind: queueResult.kind,
+                        successful_hands_fixes: queueResult.successful_hands_fixes,
+                        evidence_paths: queueResult.evidence_paths,
+                      },
+                });
+                await input.dependencies?.afterCheckpoint?.("after_ordered_replan_effect_complete");
+                const blocker = queueResult.kind === "replan_required"
+                  ? `Fix packet requires replanning for work item ${item.id}: ${queueResult.blocker}`
+                  : `Reviewer fix effect made no successful Hands mutation for work item ${item.id}`;
+                manifest = await transitionRun(input.runDir, "replanning", {
+                  actor: "runtime",
+                  payload: { work_item_id: item.id, review_revision: cycle.review_revision, blocker },
+                });
+                manifest = await updateManifestV2(input.runDir, {
+                  delivery_state: "blocked",
+                  last_blocker: blocker,
+                  work_item_progress: {
+                    ...manifest.work_item_progress,
+                    [item.id]: {
+                      ...(manifest.work_item_progress[item.id] ?? {}),
+                      status: "blocked",
+                      blocker,
+                      queue_state: "blocked",
+                    },
+                  },
+                });
+                return { status: "human_action_required", manifest, orderedWorkItems, implementationResults, verification: evidenceByItem, reviews, blocker };
+              }
               if (queueResult.kind === "operationally_blocked") {
                 const blocker = queueResult.blocker.message;
                 if (queueResult.blocker.code === "corrupt_state" || queueResult.blocker.code === "invalid_verifier_contract") {

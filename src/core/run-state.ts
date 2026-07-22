@@ -20,7 +20,7 @@ export const ALLOWED_TRANSITIONS: Readonly<Record<RunStageV2, readonly RunStageV
   implementing: ["verifying"],
   verifying: ["verifier_review"],
   verifier_review: ["verifying", "fixing", "replanning", "implementing", "final_verification", "delivery"],
-  fixing: ["verifying", "final_verification"],
+  fixing: ["verifying", "replanning", "final_verification"],
   replanning: ["brain_planning", "awaiting_plan_approval"],
   final_verification: ["verifying", "verifier_review"],
   awaiting_github_delivery_effects: [],

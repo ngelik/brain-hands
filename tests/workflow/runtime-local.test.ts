@@ -4085,6 +4085,87 @@ describe("runLocalWorkflow", () => {
     });
   });
 
+  it("recovers a persisted policy replan effect without re-verifying unchanged bytes", async () => {
+    const config = qualityConfig(0);
+    const setupResult = await setup(config.retry_policy.quality_gate, undefined, true); root = setupResult.root;
+    const workItem = item("first");
+    const runtimePlan = { ...plan, work_items: [workItem] };
+    const recorded = await recordPlan(setupResult.runDir, `${JSON.stringify(runtimePlan)}\n`);
+    await approvePlanRevision(setupResult.runDir, recorded.revision, { actor: "test" });
+    let verifierCalls = 0;
+    let verificationCalls = 0;
+    let handsFixCalls = 0;
+    let interruptAfterEffect = true;
+    const workflowInput = {
+      runDir: setupResult.runDir,
+      worktreePath: join(setupResult.root, "worktree"),
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: runtimePlan,
+      codex: {} as never,
+      config,
+      dependencies: {
+        hands: async (input) => {
+          const value = implementation(input.workItem.id);
+          const reportPath = `implementation/${input.workItem.id}/attempt-${input.attempt}.json`;
+          await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(value)}\n`);
+          return { implementation: value, reportPath, invocation: {} as never };
+        },
+        verification: async (input) => {
+          verificationCalls += 1;
+          const value = evidenceForInput(input);
+          await persistEvidenceBundle(input.runDir, value);
+          return value;
+        },
+        verifier: async (input) => {
+          verifierCalls += 1;
+          const evidencePath = verifierEvidenceRef(input);
+          const finding = packetFinding(input.workItem, evidencePath);
+          finding.remediation.verification.required_evidence = [{
+            id: "EVID-1",
+            kind: "artifact",
+            source_id: "CMD-1",
+            output_path: "artifacts/unapproved.json",
+          }] as never;
+          const value = {
+            ...review("request_changes", input.workItem.id, input.attempt, false),
+            failure_class: "implementation_failure" as const,
+            blocker: null,
+            blocker_code: null,
+            evidence_reviewed: [evidencePath],
+            findings: [finding],
+          };
+          const path = `reviews/${input.workItem.id}/attempt-${input.attempt}.json`;
+          return { review: value, reviewPath: await persistReview(input.runDir, path, value), invocation: {} as never };
+        },
+        handsFixPacket: async () => {
+          handsFixCalls += 1;
+          throw new Error("Hands must not run for a packet that requires replanning");
+        },
+        afterCheckpoint: async (name) => {
+          if (name === "after_ordered_replan_effect_complete" && interruptAfterEffect) {
+            interruptAfterEffect = false;
+            throw new Error("crash after persisted replan effect");
+          }
+        },
+        hasWorktreeChanges: async () => false,
+        gitSnapshot: cleanSnapshot,
+      },
+    } as RunLocalWorkflowInput;
+    const interrupted = await runLocalWorkflow(workflowInput);
+    expect(interrupted.blocker).toContain("crash after persisted replan effect");
+    const result = await runLocalWorkflow(workflowInput);
+
+    expect(result.status).toBe("human_action_required");
+    expect(result.blocker).toContain("Reviewer fix effect made no successful Hands mutation for work item first");
+    expect(verifierCalls).toBe(1);
+    expect(verificationCalls).toBe(1);
+    expect(handsFixCalls).toBe(0);
+    const manifest = await readManifestV2(setupResult.runDir);
+    expect(manifest.stage).toBe("replanning");
+    expect(manifest.review_accounting?.fix_cycles_used).toBe(0);
+    expect(manifest.work_item_progress.first).toMatchObject({ status: "blocked", queue_state: "blocked" });
+  });
+
   it("runs deterministic verification after the mutation and each changed self-review before Verifier", async () => {
     const config = qualityConfig(2);
     const setupResult = await setup(config.retry_policy.quality_gate); root = setupResult.root;
