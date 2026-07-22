@@ -31,7 +31,7 @@ import {
 import { replanPatchOutputSchema } from "../../src/core/output-schemas.js";
 import { detectSecretMaterial } from "../../src/core/secret-detector.js";
 import { verificationIdentityDirectory } from "../../src/core/types.js";
-import type { BrainPlan, FindingRevisionInput, ReplanPatch, ResolvedRunIntake } from "../../src/core/types.js";
+import type { BrainPlan, FindingRevisionInput, ReplanPatch, ResolvedRunIntake, VerifierReview } from "../../src/core/types.js";
 import { rewriteLegacyCheckoutSnapshot } from "../fixtures/legacy-run.js";
 import { findingHistoryPath, fingerprintFinding, recordFindingRevision } from "../../src/workflow/findings.js";
 import {
@@ -41,7 +41,9 @@ import {
   InvalidReplanCandidateError,
   NoMaterialReplanError,
   prepareReplanApprovalBoundary,
+  replanOutputScopeDiagnostics,
   reconcilePendingReplanApprovalBoundary,
+  rejectPreparedReplanRevision,
   resolvePendingReplanTarget,
   validateActiveReplanPatch,
   type CreateReplanPatchInput,
@@ -164,6 +166,7 @@ function validPatch(overrides: Partial<ReplanPatch> = {}): ReplanPatch {
     added_verification_commands: [],
     added_cross_cutting_impacts: [],
     added_read_only_file_contracts: [],
+    added_expected_artifacts: [],
     explicitly_rejected_hardening: ["Do not refactor unrelated completed work."],
     ...overrides,
   };
@@ -382,6 +385,49 @@ async function validInput(
 }
 
 describe("createReplanPatch", () => {
+  it("requires exact command-linked remediation outputs and rejects unrelated artifact widening", () => {
+    const baseTarget = plan.work_items[0]!;
+    const artifactPath = "artifacts/replan-report.json";
+    const review = {
+      findings: [{
+        problem: findingRevision.problem,
+        required_fix: findingRevision.required_fix,
+        remediation: {
+          verification: {
+            commands: [{ id: "CMD-1", argv: [...baseTarget.verification_commands[0]!.argv] }],
+            required_evidence: [{ id: "EVID-1", kind: "artifact", source_id: "CMD-1", output_path: artifactPath }],
+          },
+        },
+      }],
+    } as VerifierReview;
+    const findingRecords = [{
+      finding_id: findingId,
+      problem_class: findingRevision.problem_class,
+      criterion_ref: findingRevision.criterion_ref,
+      normalized_location: findingRevision.normalized_location,
+      severity: findingRevision.severity,
+      disposition: findingRevision.disposition,
+      problem: findingRevision.problem,
+      required_fix: findingRevision.required_fix,
+      evidence_refs: findingRevision.evidence_refs,
+    }];
+
+    expect(replanOutputScopeDiagnostics({
+      baseTarget,
+      proposedTarget: { ...baseTarget, expected_artifacts: [...baseTarget.expected_artifacts, artifactPath] },
+      review,
+      findingRecords,
+    })).toEqual([]);
+    expect(replanOutputScopeDiagnostics({ baseTarget, proposedTarget: baseTarget, review, findingRecords }))
+      .toContain(`Generated artifact output ${artifactPath} is outside proposed expected_artifacts scope`);
+    expect(replanOutputScopeDiagnostics({
+      baseTarget,
+      proposedTarget: { ...baseTarget, expected_artifacts: [...baseTarget.expected_artifacts, "artifacts/unrelated.json"] },
+      review,
+      findingRecords,
+    })).toContain("Proposed expected artifact artifacts/unrelated.json is not required by exact unresolved remediation evidence");
+  });
+
   it("keeps the TypeScript, Zod, JSON, and prompt objective contract in parity", async () => {
     const base = validPatch();
     expect(replanPatchSchema.safeParse({ ...base, revised_objective: null }).success).toBe(true);
@@ -408,6 +454,7 @@ describe("createReplanPatch", () => {
     expect(replanPatchOutputSchema.required).toContain("added_verification_commands");
     expect(replanPatchOutputSchema.required).toContain("added_cross_cutting_impacts");
     expect(replanPatchOutputSchema.required).toContain("added_read_only_file_contracts");
+    expect(replanPatchOutputSchema.required).toContain("added_expected_artifacts");
     expect(replanPatchOutputSchema.properties.added_verification_commands.items.required).toContain("tier");
     expect(replanPatchOutputSchema.properties.added_verification_commands.items.required).toContain("satisfies");
     const { added_change_units: _legacyOmission, ...legacy } = base;
@@ -418,6 +465,8 @@ describe("createReplanPatch", () => {
     expect(replanPatchSchema.parse(legacyImpacts).added_cross_cutting_impacts).toEqual([]);
     const { added_read_only_file_contracts: _legacyReadOnlyOmission, ...legacyReadOnly } = base;
     expect(replanPatchSchema.parse(legacyReadOnly).added_read_only_file_contracts).toEqual([]);
+    const { added_expected_artifacts: _legacyArtifactOmission, ...legacyArtifact } = base;
+    expect(replanPatchSchema.parse(legacyArtifact).added_expected_artifacts).toEqual([]);
     const legacyCommand = replanPatchSchema.parse({
       ...base,
       added_verification_commands: [{
@@ -437,6 +486,7 @@ describe("createReplanPatch", () => {
     expect(prompt).toContain("focused");
     expect(prompt).toContain("cross_cutting");
     expect(prompt).toContain("representative_fixtures");
+    expect(prompt).toContain("added_expected_artifacts");
     expect(prompt).toContain(
       "either add its path to the reviewed critical-surface registry in the same change or classify its change unit as shared_helper",
     );
@@ -1764,6 +1814,61 @@ describe("approvePreparedReplanRevision", () => {
     });
     expect(replay).toEqual(prepared);
     expect(await readFile(join(input.run_dir, "plans/revision-3.md"), "utf8").catch(() => null)).toBeNull();
+  });
+
+  it("durably rejects an exact pending replan and allocates the next candidate above the rejected revision", async () => {
+    const input = await prepareInput();
+    await prepareReplanApprovalBoundary({ runDir: input.run_dir, targetWorkItemId: "BH-005" });
+    const pendingManifest = await readManifestV2(input.run_dir);
+    pendingManifest.review_accounting!.fix_cycles_used = 0;
+    pendingManifest.work_item_progress["BH-005"]!.fix_cycles_used = 0;
+    await writeFile(join(input.run_dir, "manifest.json"), JSON.stringify(pendingManifest, null, 2));
+
+    let manifest = await rejectPreparedReplanRevision({
+      runDir: input.run_dir,
+      revision: 2,
+      actor: "operator",
+      reason: "The candidate does not authorize its exact generated artifact output.",
+    });
+    expect(manifest).toMatchObject({ stage: "replanning", pending_plan_approval: null });
+    expect(manifest.plan_revisions["2"]?.origin).toBe("replan");
+    expect(manifest.review_accounting?.review_revision).toBe(2);
+    const progress = manifest.work_item_progress["BH-005"]!;
+    expect(progress.replan_patch_path).toBeUndefined();
+    const cycle = JSON.parse(await readFile(join(input.run_dir, progress.review_cycle_path!), "utf8"));
+    expect(cycle.decision.action).toBe("create_replan");
+
+    const summary = manifest.convergence_reports!["BH-005"]!;
+    const report = JSON.parse(await readFile(join(input.run_dir, summary.path), "utf8"));
+    const regenerated = await createReplanPatch({
+      ...input,
+      target_work_item: plan.work_items[0]!,
+      base_plan_revision: 1,
+      unresolved_finding_ids: report.unresolved_finding_ids,
+      convergence_report_path: summary.path,
+      evidence_paths: report.evidence_refs,
+    });
+    const patchPath = regenerated.path.slice(input.run_dir.length + 1);
+    await claimReviewEffect({ run_dir: input.run_dir, cycle, owner: "runtime:work-item:BH-005" });
+    await completeReviewEffect({
+      run_dir: input.run_dir,
+      cycle,
+      owner: "runtime:work-item:BH-005",
+      outcome: "complete",
+      result: { blocker: "Review policy requires replanning for work item BH-005", replan_patch_path: patchPath },
+    });
+    manifest = await readManifestV2(input.run_dir);
+    await updateManifestV2(input.run_dir, {
+      work_item_progress: {
+        ...manifest.work_item_progress,
+        "BH-005": { ...manifest.work_item_progress["BH-005"]!, replan_patch_path: patchPath, replan_target_work_item_id: "BH-005" },
+      },
+    });
+
+    const prepared = await prepareReplanApprovalBoundary({ runDir: input.run_dir, targetWorkItemId: "BH-005" });
+    expect(prepared.coordinates).toMatchObject({ baseRevision: 1, proposedRevision: 3 });
+    expect(prepared.manifest.plan_revisions["2"]?.origin).toBe("replan");
+    expect(prepared.manifest.pending_plan_approval?.proposed_revision).toBe(3);
   });
 
   it("rejects noncanonical run-configuration bytes before exposing a replan boundary", async () => {

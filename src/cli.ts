@@ -101,6 +101,7 @@ import {
   InvalidReplanCandidateError,
   NoMaterialReplanError,
   reconcilePendingReplanApprovalBoundary,
+  rejectPreparedReplanRevision,
   resolvePendingReplanTarget,
   type PreparedReplanApprovalBoundary,
 } from "./workflow/replan.js";
@@ -2090,6 +2091,37 @@ export function buildCli(): Command {
       await rejectDiscoveryBrief(runDir, parsePositiveInteger(options.revision, "--revision"), guidance);
       await advanceDiscoveryToBoundary(runDir, options.dryRun, progress);
       await printDiscoveryBoundary(runDir, options.json);
+        },
+      });
+    });
+
+  program.command("revise-plan").description("Reject an exact pending material replan and prepare a fresh replan cycle")
+    .requiredOption("--run <runDir>", "Run directory")
+    .requiredOption("--revision <number>", "Exact pending plan revision")
+    .requiredOption("--actor <identity>", "Operator identity")
+    .option("--input-file <path>", "Read revision guidance from a local file")
+    .option("--json", "Print machine-readable output", false)
+    .action(async (options: { run: string; revision: string; actor: string; inputFile?: string; json: boolean }) => {
+      let runDir: string | undefined;
+      await runCliProducingCommand({
+        command: "revise-plan",
+        runDir: () => runDir,
+        action: async () => {
+          runDir = await resolveRunDirectory(options.run);
+          const manifest = await requireV2Manifest(runDir, "revise-plan");
+          assertNotAbandoned(manifest);
+          await assertCurrentControllerMatches(runDir, manifest);
+          await requiresPinnedRuntimeAuthority(runDir, manifest);
+          const reason = await readOperatorText(options.inputFile);
+          const revised = await rejectPreparedReplanRevision({
+            runDir,
+            revision: parsePositiveInteger(options.revision, "--revision"),
+            actor: options.actor,
+            reason,
+          });
+          const status = await readOperatorStatus(runDir);
+          if (options.json) console.log(JSON.stringify(status, null, 2));
+          else console.log(`Plan revision ${options.revision} rejected; run ${revised.run_id} is ready to resume replanning.\n${renderRunStatus(status)}`);
         },
       });
     });

@@ -54,6 +54,7 @@ const patch: ReplanPatch = {
   }],
   added_cross_cutting_impacts: [],
   added_read_only_file_contracts: [],
+  added_expected_artifacts: ["artifacts/replan-report.json"],
   explicitly_rejected_hardening: [],
 };
 
@@ -81,6 +82,7 @@ describe("materializeReplanCandidate", () => {
     const target = proposed.work_items[0]!;
     expect(target).toMatchObject({
       objective: [patch.revised_objective, ...patch.changed_instructions].join("\n"),
+      expected_artifacts: ["artifacts/replan-report.json"],
       completion_contract: {
         expected_changed_files: ["src/BH-005.ts", "tests/BH-005.test.ts", "src/new.ts"],
       },

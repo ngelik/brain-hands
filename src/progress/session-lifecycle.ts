@@ -10,6 +10,7 @@ export const PRODUCING_COMMANDS = [
   "proceed-discovery",
   "approve-discovery",
   "revise-discovery",
+  "revise-plan",
   "approve-plan",
   "resume",
   "close-run",

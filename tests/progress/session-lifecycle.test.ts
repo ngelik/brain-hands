@@ -229,7 +229,7 @@ describe("producing-command session lifecycle", () => {
       outcomes.push(result.status === "human_action_required" ? "blocked" : result.status === "failed" ? "failed" : "successful");
     }
 
-    expect(PRODUCING_COMMANDS).toHaveLength(10);
+    expect(PRODUCING_COMMANDS).toHaveLength(11);
     expect(outcomes).toEqual(PRODUCING_COMMANDS.map((command) => command === "resume" ? "blocked" : command === "abandon" ? "failed" : "successful"));
     expect(seen.filter((event) => event.endsWith(":run")).length).toBe(2);
     expect(seen.filter((event) => event.endsWith(":resume")).length).toBe(2);

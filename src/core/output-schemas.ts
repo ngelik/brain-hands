@@ -942,6 +942,10 @@ export const replanPatchOutputSchema = {
         required: ["path", "targets"],
       },
     },
+    added_expected_artifacts: {
+      type: "array",
+      items: artifactPathSchema,
+    },
     explicitly_rejected_hardening: stringArray,
   },
   required: [
@@ -955,6 +959,7 @@ export const replanPatchOutputSchema = {
     "added_verification_commands",
     "added_cross_cutting_impacts",
     "added_read_only_file_contracts",
+    "added_expected_artifacts",
     "explicitly_rejected_hardening",
   ],
 } as const;

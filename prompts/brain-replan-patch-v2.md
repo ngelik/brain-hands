@@ -57,6 +57,10 @@ Requirements:
 - Add every previously undeclared caller or fixture path to `added_read_only_file_contracts` with
   explicit targets. These paths authorize compatibility inspection only and must not become changed files.
   Otherwise return an empty array.
+- When an exact unresolved remediation requires a generated artifact output that is already linked to an
+  approved verification command but is absent from `expected_artifacts`, add that repository-relative path
+  to `added_expected_artifacts`. Do not add screenshots here; browser outputs remain governed by the
+  existing browser checks. Otherwise return an empty array.
 - Do not use npm test, npm run build, or npm run clean as a work-item verification command.
 - GitHub pull-request creation is controller-owned and happens only after the integrated commit exists.
   For a pre-delivery release-guard finding, revise the objective and affected criterion so Hands never

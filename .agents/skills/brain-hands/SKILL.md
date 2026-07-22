@@ -179,6 +179,10 @@ runtime authority for actual availability and supported reasoning efforts.
    5. Ask for explicit approval of the request's exact plan revision and
       `approval_subject_sha256`. Silence, “looks good”, or an unrelated reply
       is not approval.
+      If the user instead rejects the material replan, record their guidance with
+      `brain-hands revise-plan --run <run-dir> --revision <revision> --actor <identity>`
+      using standard input or `--input-file`, then resume the fresh controller-owned
+      replan cycle. Never overwrite or delete the rejected immutable candidate.
    6. On explicit approval, invoke `brain-hands approve-plan --run <run-dir>
       --revision <revision> --follow`.
    7. If no request is pending and exact approval is already recorded, invoke

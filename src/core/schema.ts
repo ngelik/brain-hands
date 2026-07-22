@@ -407,6 +407,7 @@ export const replanPatchSchema = z.object({
   }).strict()).default([]),
   added_cross_cutting_impacts: z.array(executionCrossCuttingImpactSchema).default([]),
   added_read_only_file_contracts: z.array(replanReadOnlyFileContractSchema).default([]),
+  added_expected_artifacts: z.array(safeEvidenceRefSchema).default([]),
 }).strict().superRefine((patch, context) => {
   if (new Set(patch.unresolved_finding_ids).size !== patch.unresolved_finding_ids.length) {
     context.addIssue({ code: "custom", path: ["unresolved_finding_ids"], message: "Replan finding IDs must be unique" });
@@ -427,6 +428,7 @@ export const generatedReplanPatchSchema = z.object({
   }).strict()),
   added_cross_cutting_impacts: z.array(executionCrossCuttingImpactSchema),
   added_read_only_file_contracts: z.array(replanReadOnlyFileContractSchema),
+  added_expected_artifacts: z.array(safeEvidenceRefSchema),
 }).strict().superRefine((patch, context) => {
   if (new Set(patch.unresolved_finding_ids).size !== patch.unresolved_finding_ids.length) {
     context.addIssue({ code: "custom", path: ["unresolved_finding_ids"], message: "Replan finding IDs must be unique" });
@@ -2256,7 +2258,7 @@ export const runManifestV2Schema = z.object({
       }
     }
     const exactRevision = manifest.pending_plan_approval?.proposed_revision ?? manifest.current_revision;
-    if (exactRevision !== null) {
+    if (exactRevision !== null && exactRevision >= (startRevision ?? 1)) {
       const record = manifest.plan_revisions[String(exactRevision)];
       if (!record
         || record.origin === undefined

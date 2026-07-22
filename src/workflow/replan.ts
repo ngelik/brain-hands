@@ -11,6 +11,7 @@ import {
   beginExecutionEffect,
   reconcilePreparedPlanApprovalBoundary,
   appendPlanApprovalEvent,
+  appendRunEventOnce,
   buildPlanApprovalEventRecord,
   assertPlanApprovalEventPrecondition,
   hasExactPlanApprovalEvent,
@@ -24,6 +25,8 @@ import {
   recordExecutionEffectChild,
   endExecutionEffect,
   releaseExecutionLease,
+  rejectPreparedPlanApprovalBoundary,
+  updateManifestV2,
   type ApprovalControllerCapture,
   type RunLedgerTransactionHooks,
   writeCreateOnceValidated,
@@ -43,6 +46,7 @@ import {
   executionSpecV2Schema,
   generatedReplanPatchSchema,
   planApprovalRequestSchema,
+  persistedVerifierReviewSchema,
   verificationEvidenceSchema,
 } from "../core/schema.js";
 import type {
@@ -53,6 +57,7 @@ import type {
   ReplanPatchResult,
   RoleProfile,
   WorkItem,
+  EngineFinding,
   RunEvent,
   RunManifestV2,
   ReviewCycleState,
@@ -60,6 +65,7 @@ import type {
   DiscoveredBrainPlan,
   PendingPlanApprovalV1,
   PlanApprovalRequestV1,
+  VerifierReview,
 } from "../core/types.js";
 import {
   assertPlanReady,
@@ -93,17 +99,20 @@ import {
 } from "../core/owned-evidence.js";
 import { loadPromptTemplate } from "../prompts/loader.js";
 import { renderTemplate } from "../prompts/renderer.js";
-import { loadFindingRevisionRecords } from "./findings.js";
+import { loadFindingRevisionRecords, recordFindingRevision } from "./findings.js";
 import { loadVerifiedPlanBundle } from "./verified-plan.js";
 import { materializeReplanCandidate } from "./replan-candidate.js";
 import { buildPlanDelta, planDecisionContractSha256 } from "./plan-delta.js";
 import { loadCurrentCycleEvidence } from "./convergence.js";
 import {
   reviewCycleIdentity,
+  beginReviewCycle,
   reviewDecisionPath,
   reviewEffectIdentity,
   validatePersistedReviewEffectState,
 } from "./review-cycle.js";
+import { writeConvergenceReport } from "./convergence.js";
+import { evaluateReviewPolicy, qualityRecoveryEligibilitySnapshot } from "./review-policy.js";
 
 function errorCode(error: unknown): unknown {
   return error && typeof error === "object" && "code" in error ? error.code : undefined;
@@ -204,6 +213,203 @@ export class InvalidReplanCandidateError extends Error {
     this.name = "InvalidReplanCandidateError";
     this.diagnostics = diagnostics;
   }
+}
+
+export function replanOutputScopeDiagnostics(input: {
+  baseTarget: WorkItem;
+  proposedTarget: WorkItem;
+  review: VerifierReview;
+  findingRecords: readonly ReplanFindingContext[];
+}): string[] {
+  const unresolved = new Set(input.findingRecords.map((finding) =>
+    `${finding.problem}\0${finding.required_fix ?? ""}`));
+  const approvedArgv = new Set(input.proposedTarget.verification_commands.map((command) => canonical(command.argv)));
+  const artifactScope = new Set(input.proposedTarget.expected_artifacts);
+  const browserScope = new Set(input.proposedTarget.browser_checks.map((check) => check.screenshot_artifact));
+  const requiredArtifacts = new Set<string>();
+  const diagnostics: string[] = [];
+  for (const finding of input.review.findings) {
+    if (!unresolved.has(`${finding.problem}\0${finding.required_fix}`) || finding.remediation === undefined) continue;
+    const commands = new Map(finding.remediation.verification.commands.map((command) => [command.id, command.argv]));
+    for (const evidence of finding.remediation.verification.required_evidence) {
+      if (evidence.kind !== "artifact" && evidence.kind !== "browser") continue;
+      const argv = commands.get(evidence.source_id);
+      if (argv === undefined) {
+        diagnostics.push(`Generated ${evidence.kind} output ${evidence.output_path} references unknown command ${evidence.source_id}`);
+        continue;
+      }
+      if (!approvedArgv.has(canonical(argv))) {
+        diagnostics.push(`Generated ${evidence.kind} output ${evidence.output_path} is not linked to an exact approved verification command`);
+        continue;
+      }
+      if (evidence.kind === "artifact") {
+        requiredArtifacts.add(evidence.output_path);
+        if (!artifactScope.has(evidence.output_path)) {
+          diagnostics.push(`Generated artifact output ${evidence.output_path} is outside proposed expected_artifacts scope`);
+        }
+      } else if (!browserScope.has(evidence.output_path)) {
+        diagnostics.push(`Generated browser output ${evidence.output_path} is outside proposed browser-check scope`);
+      }
+    }
+  }
+  const baseArtifacts = new Set(input.baseTarget.expected_artifacts);
+  for (const path of input.proposedTarget.expected_artifacts) {
+    if (!baseArtifacts.has(path) && !requiredArtifacts.has(path)) {
+      diagnostics.push(`Proposed expected artifact ${path} is not required by exact unresolved remediation evidence`);
+    }
+  }
+  return [...new Set(diagnostics)];
+}
+
+export async function rejectPreparedReplanRevision(input: {
+  runDir: string;
+  revision: number;
+  actor: string;
+  reason: string;
+}): Promise<RunManifestV2Ledger> {
+  const actor = input.actor.trim();
+  const reason = input.reason.trim();
+  if (!actor) throw new Error("Plan rejection actor must be non-empty");
+  if (!reason) throw new Error("Plan rejection reason must be non-empty");
+  assertNoSecretMaterial("Plan rejection reason", reason);
+  let manifest = await readManifestV2(input.runDir);
+  const pending = manifest.pending_plan_approval;
+  if (!pending || pending.base_revision === null || pending.proposed_revision !== input.revision) {
+    throw new Error(`Plan revision ${input.revision} is not the exact pending material replan`);
+  }
+  const request = await readVerifiedPlanApprovalRequest(input.runDir, manifest);
+  const targetWorkItemId = resolvePendingReplanTarget(manifest);
+  const sourceWorkItemId = manifest.current_work_item_id;
+  if (!targetWorkItemId || !sourceWorkItemId) throw new Error("Pending replan rejection lineage is missing");
+  const sourceProgress = manifest.work_item_progress[sourceWorkItemId];
+  const priorCyclePath = sourceProgress?.review_cycle_path;
+  if (!sourceProgress || typeof priorCyclePath !== "string") {
+    throw new Error("Pending replan rejection review-cycle lineage is missing");
+  }
+  const priorCycle = reviewCycleStateSchema.parse(JSON.parse((await readOwnedEvidenceFile(
+    input.runDir,
+    priorCyclePath,
+    "reviews/",
+  )).toString("utf8")));
+  if (priorCycle.decision.action !== "create_replan" || priorCycle.work_item_id !== sourceWorkItemId) {
+    throw new Error("Pending plan rejection requires the exact create-replan cycle");
+  }
+  const rejection = {
+    schema_version: 1,
+    run_id: manifest.run_id,
+    rejected_revision: input.revision,
+    base_revision: pending.base_revision,
+    request_path: pending.request_path,
+    request_sha256: pending.request_sha256,
+    approval_subject_sha256: request.approval_subject_sha256,
+    source_work_item_id: sourceWorkItemId,
+    target_work_item_id: targetWorkItemId,
+    prior_review_revision: priorCycle.review_revision,
+    reason,
+    actor,
+  };
+  const rejectionPath = `approvals/plan/revision-${input.revision}-rejection.json`;
+  const rejectionBytes = `${JSON.stringify(rejection, null, 2)}\n`;
+  try {
+    await writeOwnedEvidenceFile(input.runDir, rejectionPath, "approvals/", rejectionBytes);
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") throw error;
+    const existing = (await readOwnedEvidenceFile(input.runDir, rejectionPath, "approvals/")).toString("utf8");
+    if (existing !== rejectionBytes) throw new Error("Plan rejection artifact conflicts with the exact pending revision");
+  }
+
+  const rejectionSha256 = createHash("sha256").update(rejectionBytes).digest("hex");
+  manifest = await rejectPreparedPlanApprovalBoundary({
+    runDir: input.runDir,
+    revision: input.revision,
+    rejectionPath,
+    rejectionSha256,
+    blocker: `Plan revision ${input.revision} rejected: ${reason}`,
+  });
+  const resetProgress = { ...manifest.work_item_progress[sourceWorkItemId]! };
+  delete resetProgress.review_revision;
+  delete resetProgress.review_cycle_path;
+  delete resetProgress.review_effect_id;
+  delete resetProgress.replan_patch_path;
+  delete resetProgress.replan_target_work_item_id;
+  resetProgress.queue_state = "blocked";
+  manifest = await updateManifestV2(input.runDir, {
+    work_item_progress: { ...manifest.work_item_progress, [sourceWorkItemId]: resetProgress },
+  });
+  const policy = manifest.review_policy_snapshot;
+  const accounting = manifest.review_accounting;
+  if (!policy || !accounting) throw new Error("Plan rejection requires snapshotted review policy accounting");
+  const reviewRevision = accounting.review_revision + 1;
+  const priorFindings = await loadFindingRevisionRecords(
+    input.runDir,
+    sourceWorkItemId,
+    priorCycle.review_revision,
+    priorCycle.finding_ids,
+  );
+  const findings: EngineFinding[] = [];
+  for (const finding of priorFindings) {
+    findings.push(await recordFindingRevision(input.runDir, {
+      work_item_id: finding.work_item_id,
+      source: finding.source,
+      severity: finding.severity,
+      disposition: "requires_replan",
+      criterion_ref: finding.criterion_ref,
+      normalized_location: finding.normalized_location,
+      problem_class: finding.problem_class,
+      problem: finding.problem,
+      required_fix: finding.required_fix,
+      evidence_refs: finding.evidence_refs,
+      review_revision: reviewRevision,
+    }));
+  }
+  const reference = priorCycle.work_item_progress_reference;
+  if (!reference) throw new Error("Plan rejection source cycle lacks immutable work-item evidence");
+  const cycle = await beginReviewCycle({
+    run_dir: input.runDir,
+    work_item_id: sourceWorkItemId,
+    phase: priorCycle.phase,
+    review_revision: reviewRevision,
+    policy_hash: createHash("sha256").update(JSON.stringify(policy)).digest("hex"),
+    finding_ids: findings.map((finding) => finding.finding_id).sort(),
+    accounting_before: accounting,
+    work_item_progress_reference: reference,
+    evaluate: () => evaluateReviewPolicy({
+      policy,
+      findings,
+      accounting,
+      phase: priorCycle.phase,
+      operational_blocker: null,
+      replan_patch_pending: false,
+      authorization: null,
+      quality_recovery: qualityRecoveryEligibilitySnapshot(manifest, sourceWorkItemId),
+    }),
+  });
+  if (cycle.decision.action !== "create_replan") {
+    throw new Error("Rejected plan revision did not create a fresh replan decision");
+  }
+  manifest = await readManifestV2(input.runDir);
+  await writeConvergenceReport({
+    run_dir: input.runDir,
+    cycle,
+    policy,
+    accounting: manifest.review_accounting!,
+    finding_index: manifest.finding_index ?? {},
+    findings,
+    release_guards: manifest.release_guards ?? [],
+    authorization: null,
+  });
+  manifest = await updateManifestV2(input.runDir, {
+    delivery_state: "blocked",
+    last_blocker: `Plan revision ${input.revision} rejected: ${reason}`,
+  });
+  await appendRunEventOnce(input.runDir, {
+    eventId: `plan-rejection:${rejectionSha256}`,
+    actor,
+    stage: "replanning",
+    type: "plan_revision_rejected",
+    payload: { rejected_revision: input.revision, rejection_path: rejectionPath, next_review_revision: reviewRevision },
+  });
+  return manifest;
 }
 
 export interface CreateReplanPatchInput {
@@ -595,6 +801,10 @@ function buildReplanCandidate(
       ...target.verification_commands,
       ...patch.added_verification_commands.map(({ satisfies: _satisfies, ...command }) => command),
     ],
+    expected_artifacts: [
+      ...target.expected_artifacts,
+      ...patch.added_expected_artifacts.filter((path) => !target.expected_artifacts.includes(path)),
+    ],
     completion_contract: {
       ...target.completion_contract,
       expected_changed_files: [
@@ -723,6 +933,7 @@ function validatePatch(
       ...impact.verification_command_ids,
     ]),
     ...patch.added_read_only_file_contracts.flatMap((contract) => [contract.path, ...contract.targets]),
+    ...patch.added_expected_artifacts,
     ...patch.explicitly_rejected_hardening,
   ];
   for (const value of outputText) assertNoSecretMaterial("Brain replan output", value);
@@ -1053,7 +1264,7 @@ export function resolvePendingReplanTarget(manifest: RunManifestV2): string | nu
       || manifest.current_plan_revision !== pending.base_revision
       || manifest.approved_revision !== pending.base_revision
       || manifest.approved_plan_revision !== pending.base_revision
-      || pending.proposed_revision !== pending.base_revision + 1
+      || pending.proposed_revision <= pending.base_revision
       || revision?.revision !== pending.proposed_revision
       || revision?.origin !== "replan"
       || revision.base_revision !== pending.base_revision) {
@@ -1438,6 +1649,8 @@ async function readApprovedResetEvent(
       && (event.payload as { plan_revision?: unknown }).plan_revision === revision);
   if (events.length > 1) throw new Error(`Duplicate approved replan reset event for revision ${revision}`);
   if (events.length === 0) return null;
+  const revisionRecord = manifest.plan_revisions[String(revision)];
+  const recordedBaseRevision = revisionRecord?.origin === "replan" ? revisionRecord.base_revision : null;
   const event = events[0]!;
   const payload = event.payload as {
     work_item_id?: unknown;
@@ -1447,7 +1660,7 @@ async function readApprovedResetEvent(
   };
   if (typeof payload.work_item_id !== "string"
     || typeof payload.base_plan_revision !== "number"
-    || payload.base_plan_revision !== revision - 1
+    || payload.base_plan_revision !== recordedBaseRevision
     || payload.plan_revision !== revision
     || typeof payload.replan_patch_path !== "string") {
     throw new Error("Approved replan reset event payload conflicts with durable approval");
@@ -1773,7 +1986,7 @@ export async function prepareReplanApprovalBoundary(
     || manifest.approved_plan_revision !== baseRevision) {
     throw new Error("Replan preparation requires one exact current approved base revision");
   }
-  const proposedRevision = baseRevision + 1;
+  const proposedRevision = Math.max(baseRevision, ...Object.keys(manifest.plan_revisions).map(Number)) + 1;
   const sourceWorkItemId = manifest.current_work_item_id;
   const sourceProgress = sourceWorkItemId === null
     ? undefined
@@ -1910,7 +2123,24 @@ export async function prepareReplanApprovalBoundary(
       if (verified.brief === null) throw new Error("Durable replan base is missing its verified approved brief");
       validateDiscoveryCoverage(proposed as DiscoveredBrainPlan, verified.brief);
     }
+    const baseTarget = basePlan.work_items.find((item) => item.id === input.targetWorkItemId)!;
+    const proposedTarget = proposed.work_items.find((item) => item.id === input.targetWorkItemId)!;
+    const reviewPath = decision.work_item_progress_reference?.review_path;
+    if (!reviewPath) throw new Error("Replan candidate validation is missing its exact review evidence");
+    const review = persistedVerifierReviewSchema.parse(JSON.parse((await readOwnedEvidenceFile(
+      input.runDir,
+      reviewPath,
+      "reviews/",
+    )).toString("utf8")));
+    const outputDiagnostics = replanOutputScopeDiagnostics({
+      baseTarget,
+      proposedTarget,
+      review,
+      findingRecords: record.provenance.finding_records,
+    });
+    if (outputDiagnostics.length > 0) throw new InvalidReplanCandidateError(outputDiagnostics);
   } catch (error) {
+    if (error instanceof InvalidReplanCandidateError) throw error;
     throw new InvalidReplanCandidateError(invalidCandidateDiagnostics(error), { cause: error });
   }
 
@@ -2056,7 +2286,11 @@ export async function approvePreparedReplanRevision(
   }
   return withRunLedgerCompoundTransaction(runDir, async (transaction) => {
     const manifest = await transaction.readManifestV2();
-    const baseRevision = planRevision - 1;
+    const proposedRecord = manifest.plan_revisions[String(planRevision)];
+    const baseRevision = proposedRecord?.base_revision;
+    if (proposedRecord?.origin !== "replan" || baseRevision === null || baseRevision === undefined) {
+      throw new Error("Prepared replan revision metadata does not identify its approved base");
+    }
     const verifiedApproval = options.verifyCurrentController === false
       ? await verifyPersistedPlanApprovalSubject(
           transaction.runDir,
@@ -2072,7 +2306,6 @@ export async function approvePreparedReplanRevision(
     if (verifiedApproval === null) {
       throw new Error("Prepared replan approval requires immutable request metadata");
     }
-    const proposedRecord = manifest.plan_revisions[String(planRevision)];
     if (!proposedRecord
       || proposedRecord.origin !== "replan"
       || proposedRecord.base_revision !== baseRevision) {
@@ -2150,7 +2383,7 @@ export async function approvePreparedReplanRevision(
       }
       if ((manifest.current_revision ?? manifest.current_plan_revision) !== baseRevision
         || (manifest.approved_revision ?? manifest.approved_plan_revision) !== baseRevision) {
-        throw new Error(`Replan approval revision ${planRevision} must immediately follow approved base revision ${baseRevision}`);
+      throw new Error(`Replan approval revision ${planRevision} does not preserve approved base revision ${baseRevision}`);
       }
       if (manifest.current_work_item_id !== sourceWorkItemId) {
         throw new Error("Replan approval source does not match the current work item");
@@ -2435,6 +2668,8 @@ export async function continueApprovedReplanRevision(
   } = {},
 ): Promise<RunManifestV2Ledger> {
   const manifest = await readManifestV2(runDir);
+  const approvedRecord = manifest.plan_revisions[String(planRevision)];
+  const approvedBaseRevision = approvedRecord?.origin === "replan" ? approvedRecord.base_revision : null;
   const resetEvent = await readApprovedResetEvent(
     runDir,
     manifest,
@@ -2452,8 +2687,8 @@ export async function continueApprovedReplanRevision(
       }
       const convergence = manifest.convergence_reports?.[sourceWorkItemId];
       if (progress.plan_revision === planRevision
-        && convergence?.plan_revision === planRevision - 1
-        && convergence.recommended_action === "create_replan") {
+        && convergence?.plan_revision === approvedBaseRevision
+        && convergence?.recommended_action === "create_replan") {
         candidates.add(sourceWorkItemId);
       }
     }

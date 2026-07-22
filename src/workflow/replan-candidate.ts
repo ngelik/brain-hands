@@ -102,6 +102,10 @@ export function materializeReplanCandidate({
       ...target.verification_commands,
       ...patch.added_verification_commands.map(({ satisfies: _satisfies, ...command }) => command),
     ],
+    expected_artifacts: [
+      ...target.expected_artifacts,
+      ...patch.added_expected_artifacts.filter((path) => !target.expected_artifacts.includes(path)),
+    ],
     completion_contract: {
       ...target.completion_contract,
       expected_changed_files: [

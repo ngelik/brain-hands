@@ -131,6 +131,7 @@ export interface ReplanPatch {
     path: string;
     targets: string[];
   }>;
+  added_expected_artifacts: string[];
   explicitly_rejected_hardening: string[];
 }
 

@@ -197,6 +197,12 @@ export interface RunLedgerTransaction {
     run_configuration_sha256: string;
     canonical_blocker: string;
   }): Promise<RunManifestV2Ledger>;
+  rejectPreparedPlanApprovalBoundary(input: {
+    revision: number;
+    rejection_path: string;
+    rejection_sha256: string;
+    blocker: string;
+  }): Promise<RunManifestV2Ledger>;
   recordTerminalDisposition(disposition: TerminalDisposition): Promise<RunManifestV2Ledger>;
   acquireExecutionLease(input: { invocation_id: string; mode: ExecutionLeaseV1["mode"] }): Promise<ExecutionLeaseClaim>;
   assertExecutionLease(claim: ExecutionLeaseClaim): Promise<void>;
@@ -2099,7 +2105,7 @@ export async function withRunLedgerTransaction<T>(
       commitPreparedPlanApprovalBoundary: (input) => enqueueUpdate(async () => {
         const current = await readManifestV2NoFollow(canonicalRunDir);
         if (current.terminal !== null) throw new Error(`Cannot mutate run with terminal outcome ${current.terminal.outcome}`);
-        if (input.proposed_revision !== input.base_revision + 1
+        if (input.proposed_revision <= input.base_revision
           || input.revision.revision !== input.proposed_revision
           || input.revision.origin !== "replan"
           || input.revision.base_revision !== input.base_revision
@@ -2217,6 +2223,42 @@ export async function withRunLedgerTransaction<T>(
           updated_at: new Date().toISOString(),
         }) as RunManifestV2Ledger;
         return persistManifest(current, next, current.execution_lease === null ? "preserve" : "pending_publication");
+      }),
+      rejectPreparedPlanApprovalBoundary: (input) => enqueueUpdate(async () => {
+        const current = await readManifestV2NoFollow(canonicalRunDir);
+        const pending = current.pending_plan_approval;
+        const revision = current.plan_revisions[String(input.revision)];
+        if (current.stage !== "awaiting_plan_approval"
+          || !pending
+          || pending.base_revision === null
+          || pending.proposed_revision !== input.revision
+          || revision?.origin !== "replan"
+          || revision.base_revision !== pending.base_revision
+          || input.rejection_path !== `approvals/plan/revision-${input.revision}-rejection.json`
+          || input.blocker.trim() === "") {
+          throw new Error("Prepared plan rejection boundary coordinates are inconsistent");
+        }
+        const rejectionBytes = await readOwnedEvidenceFile(canonicalRunDir, input.rejection_path, "approvals/");
+        if (createHash("sha256").update(rejectionBytes).digest("hex") !== input.rejection_sha256) {
+          throw new Error("Prepared plan rejection artifact digest does not match canonical bytes");
+        }
+        const rejection = JSON.parse(rejectionBytes.toString("utf8")) as Record<string, unknown>;
+        if (rejection.rejected_revision !== input.revision
+          || rejection.base_revision !== pending.base_revision
+          || rejection.request_path !== pending.request_path
+          || rejection.request_sha256 !== pending.request_sha256
+          || rejection.approval_subject_sha256 !== pending.approval_subject_sha256) {
+          throw new Error("Prepared plan rejection artifact does not bind the exact pending request");
+        }
+        const next = runManifestV2Schema.parse({
+          ...current,
+          stage: "replanning",
+          pending_plan_approval: null,
+          delivery_state: "blocked",
+          last_blocker: input.blocker,
+          updated_at: new Date().toISOString(),
+        }) as RunManifestV2Ledger;
+        return persistManifest(current, next);
       }),
       recordTerminalDisposition: (...args: [TerminalDisposition]) => args.length === 1
         ? persistTerminalDisposition(args[0], undefined, false)
@@ -3503,6 +3545,22 @@ export async function commitPreparedPlanApprovalBoundary(input: {
     }));
 }
 
+export async function rejectPreparedPlanApprovalBoundary(input: {
+  runDir: string;
+  revision: number;
+  rejectionPath: string;
+  rejectionSha256: string;
+  blocker: string;
+}): Promise<RunManifestV2Ledger> {
+  return withRunLedgerTransaction(input.runDir, (transaction) =>
+    transaction.rejectPreparedPlanApprovalBoundary({
+      revision: input.revision,
+      rejection_path: input.rejectionPath,
+      rejection_sha256: input.rejectionSha256,
+      blocker: input.blocker,
+    }));
+}
+
 /** Normalize one exact pending replan boundary, or return a concurrent promotion unchanged. */
 export async function reconcilePreparedPlanApprovalBoundary(input: {
   runDir: string;
@@ -3511,7 +3569,7 @@ export async function reconcilePreparedPlanApprovalBoundary(input: {
   pending: PendingPlanApprovalV1;
   canonicalBlocker: string;
 }): Promise<{ state: "pending" | "approved"; manifest: RunManifestV2Ledger }> {
-  if (input.proposedRevision !== input.baseRevision + 1 || input.canonicalBlocker.trim() === "") {
+  if (input.proposedRevision <= input.baseRevision || input.canonicalBlocker.trim() === "") {
     throw new Error("Prepared plan approval reconciliation coordinates are invalid");
   }
   return withRunLedgerCompoundTransaction(input.runDir, async (transaction) => {
