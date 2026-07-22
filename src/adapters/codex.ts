@@ -140,6 +140,15 @@ export class CodexInvocationError extends Error {
 
 export type CodexFailureKind = "primary_usage_limit" | "other";
 
+export const MAX_CODEX_PROMPT_BYTES = 1024 * 1024;
+export const MAX_HANDS_PROMPT_BYTES = 128 * 1024;
+
+export function assertPromptWithinBytes(prompt: string, maxBytes: number, label: string): void {
+  if (Buffer.byteLength(prompt, "utf8") > maxBytes) {
+    throw new Error(`${label} exceeds ${maxBytes} bytes`);
+  }
+}
+
 const ZERO_TOKEN_USAGE: TokenUsage = {
   input_tokens: 0,
   cached_input_tokens: 0,
@@ -444,6 +453,7 @@ export class DryRunCodexAdapter implements CodexAdapter {
   constructor(private readonly fixture?: unknown) {}
 
   async invoke(input: CodexInvokeInput): Promise<CodexInvokeResult> {
+    assertPromptWithinBytes(input.prompt, MAX_CODEX_PROMPT_BYTES, "Codex prompt");
     return withResourceBudget(input, async () => input.budget ? await input.budget.remainingActiveElapsedMs() : 1, () => this.invokeUnbudgeted(input));
   }
 
@@ -570,6 +580,7 @@ export class SubprocessCodexAdapter implements CodexAdapter {
   }
 
   async invoke(input: CodexInvokeInput): Promise<CodexInvokeResult> {
+    assertPromptWithinBytes(input.prompt, MAX_CODEX_PROMPT_BYTES, "Codex prompt");
     return withResourceBudget(input, async () => input.budget ? await input.budget.remainingActiveElapsedMs() : 1, () => this.invokeUnbudgeted(input));
   }
 

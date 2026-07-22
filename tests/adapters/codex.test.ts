@@ -298,6 +298,29 @@ describe("classifyCodexFailure", () => {
 });
 
 describe("DryRunCodexAdapter", () => {
+  it("rejects an oversized prompt before claiming budget or writing artifacts", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-codex-prompt-limit-"));
+    const budget = recordingBudget();
+
+    await expect(new DryRunCodexAdapter({ ok: true }).invoke({
+      role: "verifier",
+      model: "gpt-5.5",
+      reasoningEffort: "high",
+      sandbox: "read-only",
+      prompt: "x".repeat(1024 * 1024 + 1),
+      runDir,
+      artifactName: "oversized-dry-run",
+      budget,
+      attemptKey: "verifier:1:item:oversized:1",
+      outputSchema: { type: "object" },
+      outputParser: z.object({ ok: z.boolean() }),
+    })).rejects.toThrow("Codex prompt exceeds 1048576 bytes");
+
+    expect(budget.claims).toEqual([]);
+    expect(budget.completions).toEqual([]);
+    await expect(readdir(runDir)).resolves.toEqual([]);
+  });
+
   it("uses a fresh model budget identity when retrying the same immutable artifact", () => {
     const first = modelInvocationBudgetKey("hands-work-item-foundation-attempt-1");
     const second = modelInvocationBudgetKey("hands-work-item-foundation-attempt-1");
@@ -515,6 +538,33 @@ describe("DryRunCodexAdapter", () => {
 });
 
 describe("SubprocessCodexAdapter", () => {
+  it("rejects an oversized prompt before claiming budget, writing artifacts, or invoking Codex", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-codex-prompt-limit-"));
+    const budget = recordingBudget();
+    const adapter = new SubprocessCodexAdapter(createTestConfig(), "/repo/root", async () => {
+      throw new Error("model validation should not run");
+    });
+
+    await expect(adapter.invoke({
+      role: "verifier",
+      model: "gpt-5.5",
+      reasoningEffort: "high",
+      sandbox: "read-only",
+      prompt: "x".repeat(1024 * 1024 + 1),
+      runDir,
+      artifactName: "oversized-subprocess",
+      budget,
+      attemptKey: "verifier:1:item:oversized:1",
+      outputSchema: { type: "object" },
+      outputParser: z.object({ ok: z.boolean() }),
+    })).rejects.toThrow("Codex prompt exceeds 1048576 bytes");
+
+    expect(budget.claims).toEqual([]);
+    expect(budget.completions).toEqual([]);
+    expect(mockedRunCommand).not.toHaveBeenCalled();
+    await expect(readdir(runDir)).resolves.toEqual([]);
+  });
+
   it("classifies only output JSON/schema failures as retryable validation failures", async () => {
     runDir = await mkdtemp(join(tmpdir(), "brain-hands-codex-validation-kind-"));
     mockedRunCommand.mockImplementation(async ({ args }) => {
