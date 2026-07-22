@@ -1883,6 +1883,9 @@ describe("approvePreparedReplanRevision", () => {
     expect(prepared.coordinates).toMatchObject({ baseRevision: 1, proposedRevision: 3 });
     expect(prepared.manifest.plan_revisions["2"]?.origin).toBe("replan");
     expect(prepared.manifest.pending_plan_approval?.proposed_revision).toBe(3);
+    await approvePreparedReplanRevision(input.run_dir, "BH-005", 3);
+    manifest = await readManifestV2(input.run_dir);
+    await expect(requiresPinnedRuntimeAuthority(input.run_dir, manifest)).resolves.toBe(true);
   });
 
   it("rejects noncanonical run-configuration bytes before exposing a replan boundary", async () => {

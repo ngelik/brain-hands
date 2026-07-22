@@ -4279,6 +4279,18 @@ export async function requiresPinnedRuntimeAuthority(
       if (legacyApprovalEvents.has(revision)) {
         throw new Error(`Legacy plan approval event conflicts with exact revision ${revision}`);
       }
+      const approvalPointer = await approvalPointerForRevision(runDir, manifest, revision);
+      const isRejected = approvalPointer !== null
+        && await hasExactPlanRejection(runDir, manifest, revision, approvalPointer);
+      if (isRejected) {
+        if (revision === approvedRevision) {
+          throw new Error(`Approved revision ${revision} conflicts with its exact rejection artifact`);
+        }
+        if (modernApprovalEvents.has(revision) || approvedResetEvents.has(revision)) {
+          throw new Error(`Rejected plan revision ${revision} conflicts with approval provenance`);
+        }
+        continue;
+      }
       const verifiedApproval = await verifyPersistedPlanApprovalSubject(runDir, manifest, revision);
       if (verifiedApproval === null) {
         throw new Error(`Exact approval artifacts are missing for revision ${revision}`);
