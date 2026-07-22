@@ -6885,10 +6885,15 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
       const reviewRevision = accounting.review_revision + 1;
       const reference = sourceCycle.work_item_progress_reference;
       if (!reference) throw new Error(`Zero-mutation replan lacks work-item evidence provenance: ${item.id}`);
+      const currentImplementationPath = current.work_item_progress[item.id]?.implementation_path;
+      const mutationAttemptMatch = typeof currentImplementationPath === "string"
+        ? currentImplementationPath.match(/\/attempt-(\d+)\.json$/)
+        : null;
+      const mutationAttempt = mutationAttemptMatch ? Number(mutationAttemptMatch[1]) : reference.attempts;
       manifest = await setProgress(input.runDir, item.id, {
         ...(current.work_item_progress[item.id] ?? progress ?? { status: "blocked", attempts: reference.attempts }),
         status: "blocked",
-        attempts: reference.attempts,
+        attempts: mutationAttempt,
         blocker,
         queue_state: undefined,
         queue_path: undefined,
@@ -6988,8 +6993,12 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
         && cycle.effect_id === progress.review_effect_id
         && cycle.decision.action === "create_replan"
       ) {
+        const mutationAttemptMatch = typeof progress.implementation_path === "string"
+          ? progress.implementation_path.match(/\/attempt-(\d+)\.json$/)
+          : null;
         manifest = await setProgress(input.runDir, item.id, {
           ...progress,
+          attempts: mutationAttemptMatch ? Number(mutationAttemptMatch[1]) : progress.attempts,
           queue_state: undefined,
           queue_path: undefined,
           active_action_id: null,
