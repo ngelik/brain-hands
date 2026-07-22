@@ -7813,7 +7813,13 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
 
     if (["verifier_review", "replanning", "awaiting_plan_approval"].includes(resumeStage)) {
       const mutationParentAttempt = implementationAttempt(progress);
-      const validatedGate = qualityGatePolicy && progress?.queue_state !== "complete" && !retryOperationalVerifierReview
+      const pendingReplanCycle = typeof progress?.review_cycle_path === "string"
+        ? reviewCycleStateSchema.parse(await readRunArtifact<unknown>(input.runDir, progress.review_cycle_path))
+        : null;
+      const validatedGate = qualityGatePolicy
+        && progress?.queue_state !== "complete"
+        && !retryOperationalVerifierReview
+        && pendingReplanCycle?.decision.action !== "create_replan"
         ? await validatePersistedMutationQualityGate({ workItem: item, parentAttempt: mutationParentAttempt, expectedMutationKind: expectedMutationKind(mutationParentAttempt), activeAction: null })
         : undefined;
       const persistedEvidence = validatedGate
