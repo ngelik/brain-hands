@@ -115,8 +115,27 @@ function boundedSourceDiff(patch: string, role: "Hands" | "Verifier"): string {
   return patch;
 }
 
+function omitHandsBinaryPatchPayloads(patch: string): string {
+  return patch
+    .split(/(?=^diff --git )/m)
+    .map((section) => {
+      const marker = "\nGIT binary patch\n";
+      const markerIndex = section.indexOf(marker);
+      if (markerIndex < 0) return section;
+      const literalBytes = /^literal (\d+)$/m.exec(section.slice(markerIndex + marker.length))?.[1] ?? "unknown";
+      return [
+        `${section.slice(0, markerIndex)}${marker}# Binary patch payload omitted from the bounded Hands context (${literalBytes} bytes).`,
+        `Git patch section bytes (not file content bytes): ${Buffer.byteLength(section, "utf8")}`,
+        `Git patch section sha256 (not file content sha256): ${createHash("sha256").update(section).digest("hex")}`,
+        "Inspect the authoritative worktree for the complete changed file.",
+        "",
+      ].join("\n");
+    })
+    .join("");
+}
+
 export function boundedHandsDiff(patch: string): string {
-  const bounded = boundedSourceDiff(patch, "Hands");
+  const bounded = boundedSourceDiff(omitHandsBinaryPatchPayloads(patch), "Hands");
   return Buffer.byteLength(bounded, "utf8") <= CONTEXT_LIMITS_V1.hands_diff_bytes
     ? bounded
     : compactRoleDiff(patch);
@@ -512,16 +531,6 @@ function compactTextTail(value: string, maxBytes: number, label: string): string
   return [prefix, marker, suffix].join("\n");
 }
 
-function compactTextTailV051(value: string, maxBytes: number, label: string): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  let tail = value.slice(-maxBytes);
-  while (Buffer.byteLength(tail, "utf8") > maxBytes) tail = tail.slice(1);
-  return [
-    `[Earlier ${label} summarized: ${Buffer.byteLength(value, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(value).digest("hex")}]`,
-    tail,
-  ].join("\n");
-}
-
 function compactTextEdges(value: string, maxBytes: number, label: string): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
   void label;
@@ -558,15 +567,20 @@ function compactChangeUnits(workItem: WorkItem): WorkItem["change_units"] {
   }];
 }
 
-function compactHandsWorkItemWithObjective(workItem: WorkItem, objective: string): WorkItem {
+export function compactHandsWorkItem(workItem: WorkItem): WorkItem {
   const changeUnits = compactChangeUnits(workItem);
   const changeUnitIds = new Set(changeUnits.map((unit) => unit.id));
+  const originalChangeUnitIds = new Set(workItem.change_units.map((unit) => unit.id));
+  const executableEvidenceIds = new Set([
+    ...workItem.tests.map((test) => test.id),
+    ...workItem.verification_commands.map((command) => command.id),
+  ]);
   const compactedChangeUnitId = changeUnits.length === 1 && changeUnits[0]!.id === "compact-approved-change-units"
     ? changeUnits[0]!.id
     : null;
   return executionSpecV2Schema.parse({
     ...workItem,
-    objective,
+    objective: compactTextTail(workItem.objective, 2 * 1024, "approved objective history"),
     file_contract: workItem.file_contract.map((entry) => ({
       ...entry,
       targets: compactStringArray(entry.targets, "file-contract targets"),
@@ -579,9 +593,12 @@ function compactHandsWorkItemWithObjective(workItem: WorkItem, objective: string
     acceptance: workItem.acceptance.map((criterion) => ({
       ...criterion,
       statement: compactTextEdges(criterion.statement, 96, "acceptance statement"),
-      satisfied_by: compactedChangeUnitId === null
-        ? criterion.satisfied_by.filter((id) => changeUnitIds.has(id))
-        : [compactedChangeUnitId],
+      satisfied_by: [...new Set(criterion.satisfied_by.flatMap((id) => {
+        if (originalChangeUnitIds.has(id)) {
+          return compactedChangeUnitId === null && !changeUnitIds.has(id) ? [] : [compactedChangeUnitId ?? id];
+        }
+        return executableEvidenceIds.has(id) ? [id] : [];
+      }))],
     })),
     tests: workItem.tests.map((test) => ({
       ...test,
@@ -605,18 +622,32 @@ function compactHandsWorkItemWithObjective(workItem: WorkItem, objective: string
   });
 }
 
-export function compactHandsWorkItem(workItem: WorkItem): WorkItem {
-  return compactHandsWorkItemWithObjective(
-    workItem,
-    compactTextTail(workItem.objective, 2 * 1024, "approved objective history"),
-  );
-}
-
-function compactHandsWorkItemV051(workItem: WorkItem): WorkItem {
-  return compactHandsWorkItemWithObjective(
-    workItem,
-    compactTextTailV051(workItem.objective, 2 * 1024, "approved objective history"),
-  );
+function legacyCompactHandsWorkItemV051(workItem: WorkItem): WorkItem {
+  const current = compactHandsWorkItem(workItem);
+  let objectiveTail = workItem.objective.slice(-(2 * 1024));
+  while (Buffer.byteLength(objectiveTail, "utf8") > 2 * 1024) objectiveTail = objectiveTail.slice(1);
+  const objective = Buffer.byteLength(workItem.objective, "utf8") <= 2 * 1024
+    ? workItem.objective
+    : [
+        `[Earlier approved objective history summarized: ${Buffer.byteLength(workItem.objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(workItem.objective).digest("hex")}]`,
+        objectiveTail,
+      ].join("\n");
+  const changeUnitIds = new Set(current.change_units.map((unit) => unit.id));
+  const compactedChangeUnitId = current.change_units.length === 1
+    && current.change_units[0]!.id === "compact-approved-change-units"
+    ? current.change_units[0]!.id
+    : null;
+  return executionSpecV2Schema.parse({
+    ...current,
+    objective,
+    acceptance: workItem.acceptance.map((criterion, index) => ({
+      ...criterion,
+      statement: current.acceptance[index]!.statement,
+      satisfied_by: compactedChangeUnitId === null
+        ? criterion.satisfied_by.filter((id) => changeUnitIds.has(id))
+        : [compactedChangeUnitId],
+    })),
+  });
 }
 
 function compactActiveFinding(finding: JsonValue): JsonValue {
@@ -648,7 +679,7 @@ function compactActiveFindings(findings: JsonValue[]): JsonValue[] {
 function matchesFullOrCompactedWorkItem(candidate: unknown, authority: WorkItem): boolean {
   return equalJson(candidate, authority)
     || equalJson(candidate, compactHandsWorkItem(authority))
-    || equalJson(candidate, compactHandsWorkItemV051(authority));
+    || equalJson(candidate, legacyCompactHandsWorkItemV051(authority));
 }
 
 function matchesFullOrCompactedFindings(candidate: unknown, authority: JsonValue[]): boolean {
@@ -724,7 +755,7 @@ function packOptional<T>(
       if (!diffCompacted && typeof currentDiff === "string" && currentDiff.length > 0) {
         boundedRequired = {
           ...(boundedRequired as Record<string, unknown>),
-          diff: diffFallback ?? compactRoleDiff(currentDiff),
+          diff: compactRoleDiff(diffFallback ?? currentDiff),
         } as T;
         diffCompacted = true;
         packed = render();
@@ -767,7 +798,6 @@ export const reflectionContextPath = "contexts/reflection/final.json";
 
 async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<ArtifactRefV1> {
   const boundedDiff = boundedHandsDiff(input.diff);
-  const rawDiffDigest = compactRoleDiff(input.diff);
   if (Buffer.byteLength(boundedDiff, "utf8") > CONTEXT_LIMITS_V1.hands_diff_bytes) {
     throw new Error(`Hands diff exceeds ${CONTEXT_LIMITS_V1.hands_diff_bytes} UTF-8 bytes`);
   }
@@ -798,7 +828,7 @@ async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<A
   if (canonicalJsonBytes(handsContextV1Schema, required).byteLength > CONTEXT_LIMITS_V1.hands_total_bytes) {
     required = handsContextV1Schema.parse({
       ...required,
-      diff: rawDiffDigest,
+      diff: compactRoleDiff(input.diff),
     });
   }
   assertRequiredContextFits(required, handsContextV1Schema, CONTEXT_LIMITS_V1.hands_total_bytes, "Hands");
@@ -823,7 +853,7 @@ async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<A
     candidates,
     CONTEXT_LIMITS_V1.hands_total_bytes,
     { target: "bounded_evidence", bytes: CONTEXT_LIMITS_V1.hands_evidence_bytes },
-    rawDiffDigest,
+    input.diff,
   );
   return writeImmutableValidatedJson(
     input.runDir,

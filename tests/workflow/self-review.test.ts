@@ -266,6 +266,124 @@ describe("runHandsSelfReview", () => {
     expect(prompt).not.toContain(completedRequiredFix);
   });
 
+  it("preserves test, command, and mixed acceptance authority in the compact self-review prompt", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-acceptance-authority-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
+    const codex = new RecordingHands();
+    const changeUnits = Array.from({ length: 180 }, (_, index) => ({
+      ...workItem.change_units[0]!,
+      id: `item-1-CH-${String(index + 1).padStart(3, "0")}`,
+      target: `approved target ${index + 1}`,
+    }));
+    const testId = workItem.tests[0]!.id;
+    const commandId = workItem.verification_commands[0]!.id;
+    const acceptance = [
+      { id: "item-1-AC-test", statement: "Test-only authority remains executable.", satisfied_by: [testId] },
+      { id: "item-1-AC-command", statement: "Command-only authority remains executable.", satisfied_by: [commandId] },
+      {
+        id: "item-1-AC-mixed",
+        statement: "Mixed authority remains executable.",
+        satisfied_by: [testId, changeUnits[1]!.id, commandId, changeUnits[0]!.id],
+      },
+    ];
+
+    await runHandsSelfReview({
+      runDir: ledger.runDir,
+      worktreePath: join(root, "worktree"),
+      workItem: {
+        ...workItem,
+        change_units: changeUnits,
+        acceptance,
+        completion_contract: {
+          ...workItem.completion_contract,
+          required_acceptance_ids: acceptance.map(({ id }) => id),
+        },
+      },
+      intake: { ...intake, repo_root: root },
+      codex,
+      parentAttempt: 2,
+      mutationKind: "normal_fix",
+      pass: 1,
+      implementation,
+      currentDiff: "diff --git a/src/example.ts b/src/example.ts",
+      verification,
+      activeAction: action,
+      completedActions: [],
+      priorPassReports: [],
+    });
+
+    const promptWorkItem = JSON.parse(codex.calls[0]!.prompt
+      .split("Work item:\n")[1]!
+      .split("\n\nParent mutation result:")[0]!) as WorkItem;
+    expect(promptWorkItem.acceptance.map((criterion) => criterion.satisfied_by)).toEqual([
+      [testId],
+      [commandId],
+      [testId, "compact-approved-change-units", commandId],
+    ]);
+  });
+
+  it("derives bounded self-review diff identities from the full raw diff", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-raw-diff-identity-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
+    const binaryPayload = "SMALL-BINARY-PAYLOAD-MUST-NOT-REACH-HANDS";
+    const commonHead = `+${"h".repeat(300_000)}`;
+    const commonTail = `+${"t".repeat(300_000)}`;
+    const binarySection = [
+      "diff --git a/public/planet.webp b/public/planet.webp",
+      "new file mode 100644",
+      "GIT binary patch",
+      "literal 42",
+      binaryPayload,
+      "",
+    ].join("\n");
+    const textSection = (middle: string) => [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "--- a/src/example.ts",
+      "+++ b/src/example.ts",
+      "@@ -0,0 +1 @@",
+      commonHead,
+      middle,
+      commonTail,
+      "",
+    ].join("\n");
+    const rawDiff = (middle: string) => `${binarySection}${textSection(middle)}`;
+    const middleA = `+${"a".repeat(180_000)}`;
+    const middleB = `+${"b".repeat(180_000)}`;
+    const prompts: string[] = [];
+
+    for (const [index, middle] of [middleA, middleB].entries()) {
+      const report = { ...validReport, pass: index + 1 };
+      const codex = new RecordingHands(report);
+      await runHandsSelfReview({
+        runDir: ledger.runDir,
+        worktreePath: join(root, "worktree"),
+        workItem,
+        intake: { ...intake, repo_root: root },
+        codex,
+        parentAttempt: 2,
+        mutationKind: "normal_fix",
+        pass: index + 1,
+        implementation,
+        currentDiff: rawDiff(middle),
+        verification,
+        activeAction: action,
+        completedActions: [],
+        priorPassReports: [],
+      });
+      prompts.push(codex.calls[0]!.prompt);
+    }
+
+    const renderedDiffs = prompts.map((prompt) => prompt
+      .split("Current diff:\n")[1]!
+      .split("\n\nCurrent deterministic verification evidence:")[0]!);
+    expect(renderedDiffs[0]).not.toBe(renderedDiffs[1]);
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt, "utf8") <= MAX_HANDS_PROMPT_BYTES)).toBe(true);
+    expect(prompts.every((prompt) => !prompt.includes(binaryPayload))).toBe(true);
+    expect(prompts.every((prompt) => prompt.includes(createHash("sha256").update(binarySection).digest("hex")))).toBe(true);
+    expect(prompts[0]).toContain(createHash("sha256").update(textSection(middleA)).digest("hex"));
+    expect(prompts[1]).toContain(createHash("sha256").update(textSection(middleB)).digest("hex"));
+  });
+
   it("rejects a residual oversized prompt before claim, Codex, or artifact writes", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-oversized-prompt-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });

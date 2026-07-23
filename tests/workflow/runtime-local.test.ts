@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CodexInvocationError, type CodexAdapter } from "../../src/adapters/codex.js";
+import { CodexInvocationError, MAX_HANDS_PROMPT_BYTES, type CodexAdapter } from "../../src/adapters/codex.js";
 import { defaultConfig } from "../../src/core/config.js";
 import { initialDiscoveryState } from "../../src/core/discovery.js";
 import { appendRunEventOnce, approvePlanRevision, createRunLedgerV2, readManifestV2, recordPlan, recordTerminalDisposition, transitionRun, updateManifestV2, writeTextArtifact } from "../../src/core/ledger.js";
@@ -16,7 +16,7 @@ import type { RunVerificationInput } from "../../src/verification/runner.js";
 import type { LocalRuntimeDependencies, RunLocalWorkflowInput } from "../../src/workflow/runtime.js";
 import { assertImplementationScope, isExactBlockedSelfReviewClaim, isResumableReviewerActionQualityGate, isResumableSelfReviewQualityState, runLocalWorkflow, shouldResumeBlockedSelfReviewClaim } from "../../src/workflow/runtime.js";
 import { actionResolutionReviewPath } from "../../src/workflow/action-verifier.js";
-import { runHandsFixPacket, type HandsFixPacketInput } from "../../src/workflow/worker.js";
+import { runHandsFixPacket } from "../../src/workflow/worker.js";
 import { approvePreparedReplanRevision } from "../../src/workflow/replan.js";
 import { executionSpec } from "../fixtures/execution-spec.js";
 import { openProgressReporter, readProgressEvents, type ProgressReporter } from "../../src/progress/log.js";
@@ -30,6 +30,7 @@ import * as evidenceIndexWorkflow from "../../src/workflow/evidence-index.js";
 import { hashReviewFixPacket } from "../../src/core/review-fix-packet.js";
 import { fingerprintFinding, loadFindingRevisionRecords } from "../../src/workflow/findings.js";
 import { approveDiscoveryBrief, recordDiscoveryBrief, recordDiscoveryReadiness } from "../../src/core/discovery-ledger.js";
+import { compactHandsWorkItem } from "../../src/workflow/role-context.js";
 const codexMetrics = { usage: null, durationMs: 0, processStarted: false, turnStarted: false, structuredTerminalError: false } as const;
 
 async function enableBoundedProtocol(runDir: string): Promise<void> {
@@ -1321,6 +1322,8 @@ describe("runLocalWorkflow", () => {
     let itemReviews = 0;
     const handsAttempts: number[] = [];
     const packetVerifierAttempts: number[] = [];
+    const preparedPrompts: string[] = [];
+    const dispatchedPrompts: string[] = [];
     const dependencies: LocalRuntimeDependencies = {
       ...harness.dependencies,
       verifier: async (input) => {
@@ -1336,8 +1339,9 @@ describe("runLocalWorkflow", () => {
       },
       handsFixPacket: async (input) => {
         handsAttempts.push(input.actionAttempt);
-        await mkdir(join(input.worktreePath, "src"), { recursive: true });
-        await writeFile(join(input.worktreePath, "src/first.ts"), "export const policyFixed = true;\n", "utf8");
+        expect(input.preparedPrompt).toBeDefined();
+        expect(Buffer.byteLength(input.preparedPrompt!.prompt, "utf8")).toBeLessThanOrEqual(MAX_HANDS_PROMPT_BYTES);
+        preparedPrompts.push(input.preparedPrompt!.prompt);
         const result = {
           schema_version: 1 as const, packet_id: input.packet.provenance.packet_id,
           packet_sha256: hashReviewFixPacket(input.packet), action_attempt: input.actionAttempt,
@@ -1346,10 +1350,21 @@ describe("runLocalWorkflow", () => {
           changed_files: input.packet.completion_contract.expected_changed_files,
           commands_attempted: [], unresolved_requirements: [], blocker: null,
         };
-        const reportPath = `reviews/fix-packets/${Buffer.from(input.packet.provenance.packet_id).toString("base64url")}/attempts/${input.actionAttempt}/hands-result.json`;
-        await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(result)}\n`);
-        const profile = input.profile ?? input.intake.roles.hands;
-        return { result, reportPath, invocation: {} as never, profile: { kind: input.profileKind ?? "primary", model: profile.model, reasoning_effort: profile.reasoning_effort } };
+        return runHandsFixPacket({
+          ...input,
+          codex: {
+            invoke: async (invocation) => {
+              dispatchedPrompts.push(invocation.prompt);
+              await mkdir(join(input.worktreePath, "src"), { recursive: true });
+              await writeFile(join(input.worktreePath, "src/first.ts"), "export const policyFixed = true;\n", "utf8");
+              return {
+                text: JSON.stringify(result), parsed: result, exitCode: 0,
+                promptPath: "prompt", stdoutPath: "stdout", stderrPath: "stderr",
+                ...codexMetrics,
+              };
+            },
+          },
+        });
       },
       packetVerifier: async (input) => {
         packetVerifierAttempts.push(input.actionAttempt);
@@ -1377,6 +1392,8 @@ describe("runLocalWorkflow", () => {
     expect(result.status, result.blocker).toBe("local_ready");
     expect(handsAttempts).toEqual([1]);
     expect(packetVerifierAttempts).toEqual([1]);
+    expect(preparedPrompts).toHaveLength(1);
+    expect(dispatchedPrompts).toEqual(preparedPrompts);
     const queue = JSON.parse(await readFile(join(setupResult.runDir, "action-queues/first/revision-1.json"), "utf8"));
     expect(queue.actions).toHaveLength(1);
     expect(queue.actions[0].severity).toBe("medium");
@@ -1394,116 +1411,183 @@ describe("runLocalWorkflow", () => {
     });
   });
 
-  it("preserves packet verification command identity in action-scoped Hands inputs", async () => {
-    const originalCommand = {
-      id: "vc-render-tests",
-      argv: ["node", "node_modules/vitest/vitest.mjs", "run", "tests/original-render.test.ts"],
-      expected_exit_code: 0 as const,
-      tier: "focused" as const,
-    };
-    const baseWorkItem = item("first");
-    const workItem = {
-      ...baseWorkItem,
-      tests: baseWorkItem.tests.map((test) => ({ ...test, verification_command_ids: [originalCommand.id] })),
-      verification_commands: [originalCommand],
-    };
+  it("preflights an oversized policy fix-packet prompt before reservation or invocation claims", async () => {
+    const workItem = item("first");
+    const boundedPlan = { ...plan, work_items: [workItem] };
     const config = qualityConfig(0);
-    const legacySetup = await setup(config.retry_policy.quality_gate); root = legacySetup.root;
-    const legacyPlan = { ...plan, work_items: [workItem] };
-    const legacyPlanRevision = await recordPlan(legacySetup.runDir, `${JSON.stringify(legacyPlan)}\n`);
-    await approvePlanRevision(legacySetup.runDir, legacyPlanRevision.revision, { actor: "test" });
-    const completedFix = "Preserve the completed parser correction without repeating this prose.";
-    const activeFix = "Apply the active renderer correction in full.";
-    const packetCommand = (finding: ReturnType<typeof packetFinding>, id: string, argv: string[]) => {
-      const priorCommandIds = new Set(finding.remediation.verification.commands.map((command) => command.id));
-      return {
-        ...finding,
-        remediation: {
-          ...finding.remediation,
-          verification: {
-            ...finding.remediation.verification,
-            commands: [{ id, argv }],
-            success_conditions: finding.remediation.verification.success_conditions.map((condition) => ({
-              ...condition,
-              satisfied_by: condition.satisfied_by.map((entry) => priorCommandIds.has(entry) ? id : entry),
-            })),
-            required_evidence: finding.remediation.verification.required_evidence.map((entry) => ({
-              ...entry,
-              source_id: id,
-            })),
-          },
+    const setupResult = await setupBounded(boundedPlan, true, config.retry_policy.quality_gate); root = setupResult.root;
+    const harness = boundedDependencies();
+    const baseVerifier = harness.dependencies.verifier!;
+    let itemReviews = 0;
+    const codexCalls: unknown[] = [];
+
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: join(setupResult.root, "worktree"),
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: boundedPlan,
+      codex: {
+        invoke: async (input) => {
+          codexCalls.push(input);
+          throw new Error("Codex must not run for an oversized packet prompt");
         },
-      };
-    };
-    const firstFinding = packetCommand(
-      { ...packetFinding(workItem, verificationEvidencePath(identity("first"), 1)), required_fix: completedFix },
-      "packet-parser-tests",
-      originalCommand.argv,
+      },
+      config,
+      dependencies: {
+        ...harness.dependencies,
+        verifier: async (input) => {
+          if (input.final || itemReviews++ > 0) return baseVerifier(input);
+          const evidencePath = verifierEvidenceRef(input);
+          const finding = packetFinding(workItem, evidencePath);
+          finding.remediation.diagnosis.observed_behavior = `OVERSIZED-PACKET:${"z".repeat(MAX_HANDS_PROMPT_BYTES)}`;
+          const value: VerifierReview = {
+            ...review("request_changes", input.workItem.id, input.attempt, false),
+            failure_class: "implementation_failure",
+            blocker: null,
+            blocker_code: null,
+            acceptance_coverage: [],
+            evidence_reviewed: [evidencePath],
+            findings: [finding],
+          };
+          return {
+            review: value,
+            reviewPath: await persistReview(input.runDir, `reviews/first/attempt-${input.attempt}.json`, value),
+            invocation: {} as never,
+          };
+        },
+      },
+      deferTerminalDisposition: true,
+    });
+
+    expect(result.status).toBe("human_action_required");
+    expect(result.blocker).toContain(`Hands fix-packet prompt exceeds ${MAX_HANDS_PROMPT_BYTES} bytes`);
+    expect(codexCalls).toHaveLength(0);
+    const manifest = await readManifestV2(setupResult.runDir);
+    const progress = manifest.work_item_progress.first!;
+    expect(progress.fix_reservation_id).toBeUndefined();
+    expect(manifest.review_accounting?.fix_cycles_used).toBe(0);
+    await expect(readdir(join(setupResult.runDir, "reviews/accounting/reservations")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readdir(join(setupResult.runDir, "reviews/action-invocations")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(join(setupResult.runDir, "budgets/claims"))).toEqual([]);
+    expect(await readdir(join(setupResult.runDir, "budgets/completions"))).toEqual([]);
+    const packetAttemptRoot = join(
+      setupResult.runDir,
+      progress.fix_packet_path!.replace(/\/packet\.json$/, "/attempts/1"),
     );
-    const secondBase = advisoryPacketFinding(workItem, verificationEvidencePath(identity("first"), 1));
-    const secondFinding = packetCommand({
-      ...secondBase,
-      severity: "medium" as const,
-      problem_class: "correctness" as const,
-      required_fix: activeFix,
-      action_id: "R1-A2",
-      order: 2,
-      depends_on: ["R1-A1"],
-    } as unknown as ReturnType<typeof packetFinding>, "packet-render-tests", originalCommand.argv);
-    const legacyInputs: HandsFixPacketInput[] = [];
-    let legacyReviews = 0;
-    const legacyDependencies: LocalRuntimeDependencies = {
-      hands: async (input) => ({
-        implementation: implementation(input.workItem.id),
-        reportPath: `implementation/${input.workItem.id}/attempt-${input.attempt}.json`,
-        invocation: {} as never,
-      }),
-      verification: async (input) => evidenceForInput(input),
+    for (const name of ["hands-invocation-claim.json", "hands-result.json", "hands-result-recovery.json"]) {
+      await expect(readFile(join(packetAttemptRoot, name), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("preserves packet verification command identity and command-only acceptance authority across ordered action-scoped work", async () => {
+    const baseWorkItem = item("first");
+    const approvedCommandId = baseWorkItem.verification_commands[0]!.id;
+    const workItem: WorkItem = {
+      ...baseWorkItem,
+      acceptance: baseWorkItem.acceptance.map((criterion) => ({
+        ...criterion,
+        satisfied_by: [approvedCommandId],
+      })),
+    };
+    const boundedPlan = { ...plan, work_items: [workItem] };
+    const config = qualityConfig(1);
+    const setupResult = await setupBounded(boundedPlan, false, config.retry_policy.quality_gate); root = setupResult.root;
+    const harness = boundedDependencies();
+    const baseVerifier = harness.dependencies.verifier!;
+    const packetInputs: Array<Parameters<NonNullable<LocalRuntimeDependencies["handsFixPacket"]>>[0]> = [];
+    const actionVerificationInputs: RunVerificationInput[] = [];
+    const selfReviewInputs: Array<Parameters<NonNullable<LocalRuntimeDependencies["selfReview"]>>[0]> = [];
+    let itemReviews = 0;
+    const dependencies: LocalRuntimeDependencies = {
+      ...harness.dependencies,
       verifier: async (input) => {
-        const requestChanges = !input.final && legacyReviews++ === 0;
-        const value: VerifierReview = requestChanges
-          ? {
-              ...review("request_changes", input.workItem.id, input.attempt, false),
-              failure_class: "implementation_failure", blocker: null, blocker_code: null,
-              acceptance_coverage: [], evidence_reviewed: [verifierEvidenceRef(input)],
-              findings: [firstFinding, secondFinding],
-            }
-          : {
-              ...review("approve", input.workItem.id, input.attempt, input.final),
-              failure_class: "none", blocker: null, blocker_code: null,
-              evidence_reviewed: [verifierEvidenceRef(input)],
-            };
-        const path = input.final
-          ? `reviews/integrated/final-attempt-${input.attempt}.json`
-          : `reviews/${input.workItem.id}/attempt-${input.attempt}.json`;
-        return { review: value, reviewPath: await persistReview(input.runDir, path, value), invocation: {} as never };
+        if (input.final || itemReviews++ > 0) return baseVerifier(input);
+        const evidencePath = verifierEvidenceRef(input);
+        const firstAction = packetFinding(workItem, evidencePath);
+        const secondAction = {
+          ...packetFinding(workItem, evidencePath),
+          file: "tests/first.test.ts",
+          problem: "The second packet behavior is still wrong",
+          required_fix: "Apply the full second packet-scoped correction.",
+          action_id: "R1-A2",
+          order: 2,
+          depends_on: ["R1-A1"],
+          remediation: {
+            ...packetFinding(workItem, evidencePath).remediation,
+            targets: [{ kind: "test" as const, path: "tests/first.test.ts", test_name: "first regression tests", line_hint: null }],
+            remediation: {
+              ...packetFinding(workItem, evidencePath).remediation.remediation,
+              change_units: [{
+                id: "FIX-2", path: "tests/first.test.ts", target: "first regression tests", operation: "modify" as const,
+                requirements: ["Implement the second exact packet behavior."], satisfies: ["SC-2"],
+              }],
+              allowed_files: ["tests/first.test.ts"],
+            },
+            verification: {
+              commands: [{ id: "CMD-2", argv: [...workItem.verification_commands[0]!.argv] }],
+              success_conditions: [{ id: "SC-2", statement: "The second packet behavior is correct", satisfied_by: ["CMD-2", "EVID-2"] }],
+              required_evidence: [{ id: "EVID-2", kind: "test_result" as const, source_id: "CMD-2", output_path: "verification/packet-second-result.json" }],
+            },
+            completion_contract: {
+              required_change_unit_ids: ["FIX-2"], expected_changed_files: ["tests/first.test.ts"], allow_additional_files: false as const,
+            },
+          },
+        } as ReviewerAction;
+        const value: VerifierReview = {
+          ...review("request_changes", input.workItem.id, input.attempt, false),
+          failure_class: "implementation_failure", blocker: null, blocker_code: null,
+          acceptance_coverage: [], evidence_reviewed: [evidencePath],
+          findings: [firstAction as ReviewerAction, secondAction],
+        };
+        return { review: value, reviewPath: await persistReview(input.runDir, `reviews/first/attempt-${input.attempt}.json`, value), invocation: {} as never };
       },
       handsFixPacket: async (input) => {
-        legacyInputs.push(input);
-        const changedPath = input.packet.completion_contract.expected_changed_files[0]!;
-        await mkdir(join(input.worktreePath, changedPath.startsWith("tests/") ? "tests" : "src"), { recursive: true });
-        await writeFile(join(input.worktreePath, changedPath), `export const packetAttempt = ${legacyInputs.length};\n`, "utf8");
-        const value = {
-          schema_version: 1 as const, packet_id: input.packet.provenance.packet_id,
-          packet_sha256: hashReviewFixPacket(input.packet), action_attempt: input.actionAttempt,
+        packetInputs.push(input);
+        expect(input.workItem.objective).toBe(workItem.objective);
+        expect(input.workItem.verification_commands).toEqual(workItem.verification_commands);
+        await mkdir(join(input.worktreePath, input.packet.completion_contract.expected_changed_files[0]!.split("/")[0]!), { recursive: true });
+        await writeFile(join(input.worktreePath, input.packet.completion_contract.expected_changed_files[0]!), `// ${input.packet.provenance.action_id}\n`, "utf8");
+        const result = {
+          schema_version: 1 as const,
+          packet_id: input.packet.provenance.packet_id,
+          packet_sha256: hashReviewFixPacket(input.packet),
+          action_attempt: input.actionAttempt,
           status: "implemented" as const,
           change_units: input.packet.remediation.change_units.map((unit) => ({
-            change_unit_id: unit.id, status: "completed" as const,
-            changed_files: [unit.path], summary: `Applied ${unit.id}`,
+            change_unit_id: unit.id, status: "completed" as const, changed_files: [unit.path], summary: "Applied packet fix",
           })),
           changed_files: input.packet.completion_contract.expected_changed_files,
           commands_attempted: [], unresolved_requirements: [], blocker: null,
         };
         const reportPath = `reviews/fix-packets/${Buffer.from(input.packet.provenance.packet_id).toString("base64url")}/attempts/${input.actionAttempt}/hands-result.json`;
-        await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(value)}\n`);
+        await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(result)}\n`);
         const profile = input.profile ?? input.intake.roles.hands;
-        return { result: value, reportPath, invocation: {} as never, profile: { kind: input.profileKind ?? "primary", model: profile.model, reasoning_effort: profile.reasoning_effort } };
+        return { result, reportPath, invocation: {} as never, profile: { kind: input.profileKind ?? "primary", model: profile.model, reasoning_effort: profile.reasoning_effort } };
+      },
+      verification: async (input) => {
+        if ((input.attempt ?? 0) >= 1_000_000) actionVerificationInputs.push(input);
+        const value = boundedEvidence(input);
+        await persistEvidenceBundle(input.runDir, value);
+        return value;
+      },
+      selfReview: async (input) => {
+        compactHandsWorkItem(input.workItem);
+        selfReviewInputs.push(input);
+        const report = {
+          ...selfReviewReport(input.workItem.id, input.parentAttempt, input.pass, false, input.mutationKind),
+          active_action_id: input.activeAction?.action_id ?? null,
+        };
+        const reportPath = `self-review/first/attempt-${input.parentAttempt}/pass-${input.pass}.json`;
+        await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(report)}\n`);
+        return { report, reportPath, invocation: {} as never };
       },
       packetVerifier: async (input) => {
-        const value = {
-          packet_id: input.packet.provenance.packet_id,
-          packet_sha256: hashReviewFixPacket(input.packet), action_attempt: input.actionAttempt,
-          decision: "resolved" as const,
+        const reviewValue = {
+          packet_id: input.packet.provenance.packet_id, packet_sha256: hashReviewFixPacket(input.packet),
+          action_attempt: input.actionAttempt, decision: "resolved" as const,
           condition_results: input.packet.verification.success_conditions.map((condition) => ({
             success_condition_id: condition.id, status: "satisfied" as const,
             evidence_refs: [input.verificationEvidence.evidence_path!], remaining_problem: null,
@@ -1511,63 +1595,128 @@ describe("runLocalWorkflow", () => {
           required_next_fix: null, blocker: null,
         };
         const reviewPath = `reviews/fix-packets/${Buffer.from(input.packet.provenance.packet_id).toString("base64url")}/attempts/${input.actionAttempt}/focused-resolution.json`;
-        await writeTextArtifact(input.runDir, reviewPath, `${JSON.stringify(value)}\n`);
-        return { review: value, reviewPath, invocation: {} as never };
+        await writeTextArtifact(input.runDir, reviewPath, `${JSON.stringify(reviewValue)}\n`);
+        return { review: reviewValue, reviewPath, invocation: {} as never };
       },
-      diff: async () => "diff",
-      hasWorktreeChanges: async () => false,
-      gitSnapshot: cleanSnapshot,
-      commit: async () => "no-op",
     };
 
-    const legacyResult = await runLocalWorkflow({
-      runDir: legacySetup.runDir, worktreePath: legacySetup.worktree,
-      intake: { ...intake, repo_root: legacySetup.root }, plan: legacyPlan,
-      codex: {} as never, config, dependencies: legacyDependencies,
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir, worktreePath: join(setupResult.root, "worktree"),
+      intake: { ...intake, repo_root: setupResult.root }, plan: boundedPlan,
+      codex: {} as never, config, dependencies, deferTerminalDisposition: true,
     });
 
-    expect(legacyResult.status, legacyResult.blocker).toBe("local_ready");
-    expect(legacyInputs).toHaveLength(2);
-    const activeInput = legacyInputs[1]!;
-    const expectedCommands = activeInput.packet.verification.commands.map((command) => ({
-      id: command.id, argv: command.argv, expected_exit_code: 0,
-    }));
-    expect(activeInput.workItem.verification_commands).toEqual(expectedCommands);
-    expect(activeInput.workItem.verification_commands.map((command) => command.id)).not.toContain("vc-render-tests");
-    expect(activeInput.workItem.objective).toContain(workItem.objective);
-    expect(activeInput.workItem.objective).toContain(`R1-A2: ${activeFix}`);
-    expect(activeInput.workItem.objective).toContain("R1-A1");
-    expect(activeInput.workItem.objective).not.toContain(completedFix);
+    expect(result.status, result.blocker).toBe("local_ready");
+    expect(packetInputs.map((input) => input.packet.verification.commands)).toEqual([
+      [{ id: "CMD-1", argv: workItem.verification_commands[0]!.argv }],
+      [{ id: "CMD-2", argv: workItem.verification_commands[0]!.argv }],
+    ]);
+    expect(actionVerificationInputs.map((input) => ({ commandIds: input.commandIds, commands: input.commands }))).toEqual([
+      { commandIds: ["CMD-1"], commands: [workItem.verification_commands[0]!.argv] },
+      { commandIds: ["CMD-2"], commands: [workItem.verification_commands[0]!.argv] },
+    ]);
+    const actionSelfReviewInputs = selfReviewInputs.filter((input) => input.mutationKind === "reviewer_action");
+    expect(actionSelfReviewInputs.map((input) => ({
+      action: input.activeAction?.action_id,
+      commands: input.workItem.verification_commands.map((command) => ({ id: command.id, argv: command.argv })),
+      acceptanceAuthority: input.workItem.acceptance[0]!.satisfied_by,
+      testCommandAuthority: input.workItem.tests[0]!.verification_command_ids,
+      objective: input.workItem.objective,
+    }))).toEqual([
+      {
+        action: "R1-A1",
+        commands: [{ id: "CMD-1", argv: workItem.verification_commands[0]!.argv }],
+        acceptanceAuthority: ["CMD-1"],
+        testCommandAuthority: ["CMD-1"],
+        objective: expect.stringContaining("Resolve only Reviewer action R1-A1: Apply the packet-scoped correction"),
+      },
+      {
+        action: "R1-A2",
+        commands: [{ id: "CMD-2", argv: workItem.verification_commands[0]!.argv }],
+        acceptanceAuthority: ["CMD-2"],
+        testCommandAuthority: ["CMD-2"],
+        objective: expect.stringContaining("Completed Reviewer actions to preserve without reopening: R1-A1"),
+      },
+    ]);
+    expect(actionSelfReviewInputs[1]!.workItem.objective).not.toContain("Apply the packet-scoped correction");
+  });
 
-    await rm(legacySetup.root, { recursive: true, force: true }); root = undefined;
-    const boundedSetup = await setupBounded({ ...plan, work_items: [workItem] }, false, config.retry_policy.quality_gate);
-    root = boundedSetup.root;
-    const boundedHarness = boundedQueueDependencies(workItem);
-    let boundedInput: HandsFixPacketInput | undefined;
-    const boundedResult = await runLocalWorkflow({
-      runDir: boundedSetup.runDir, worktreePath: boundedSetup.worktree,
-      intake: { ...intake, repo_root: boundedSetup.root }, plan: { ...plan, work_items: [workItem] },
-      codex: {} as never, config,
+  it("translates command-only acceptance authority to synthetic non-packet action commands", async () => {
+    const config = qualityConfig(1);
+    const setupResult = await setup(config.retry_policy.quality_gate); root = setupResult.root;
+    const baseWorkItem = item("first");
+    const approvedCommand = baseWorkItem.verification_commands[0]!;
+    const workItem: WorkItem = {
+      ...baseWorkItem,
+      acceptance: baseWorkItem.acceptance.map((criterion) => ({
+        ...criterion,
+        satisfied_by: [approvedCommand.id],
+      })),
+    };
+    const scopedSelfReviewItems: WorkItem[] = [];
+    let itemReviews = 0;
+
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: setupResult.worktree,
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: { ...plan, work_items: [workItem] },
+      codex: {} as never,
+      config,
       dependencies: {
-        ...boundedHarness.dependencies,
-        handsFixPacket: async (input) => {
-          boundedInput = input;
-          return boundedHarness.dependencies.handsFixPacket!(input);
+        hands: async (input) => {
+          const value = implementation(input.workItem.id);
+          const reportPath = `implementation/${input.workItem.id}/attempt-${input.attempt}.json`;
+          await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(value)}\n`);
+          return { implementation: value, reportPath, invocation: {} as never };
+        },
+        verification: async (input) => evidenceForInput(input),
+        selfReview: async (input) => {
+          const compacted = compactHandsWorkItem(input.workItem);
+          if (input.mutationKind === "reviewer_action") scopedSelfReviewItems.push(compacted);
+          const report = {
+            ...selfReviewReport(input.workItem.id, input.parentAttempt, input.pass, false, input.mutationKind),
+            active_action_id: input.activeAction?.action_id ?? null,
+          };
+          const reportPath = `self-review/${input.workItem.id}/attempt-${input.parentAttempt}/pass-${input.pass}.json`;
+          await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(report)}\n`);
+          return { report, reportPath, invocation: {} as never };
+        },
+        diff: async () => "diff",
+        verifier: async (input) => {
+          const requested = !input.final && itemReviews++ === 0;
+          const value = review(requested ? "request_changes" : "approve", input.workItem.id, input.attempt, input.final);
+          if (requested) {
+            value.findings = value.findings.map((finding) => ({
+              ...finding,
+              re_verification: [[...approvedCommand.argv]],
+            }));
+          }
+          const reviewPath = input.final
+            ? `reviews/integrated/final-attempt-${input.attempt}.json`
+            : `reviews/${input.workItem.id}/attempt-${input.attempt}.json`;
+          return { review: value, reviewPath: await persistReview(input.runDir, reviewPath, value), invocation: {} as never };
+        },
+        gitSnapshot: cleanSnapshot,
+        afterCheckpoint: async (checkpoint) => {
+          if (checkpoint === "after_self_review_pass_1" && scopedSelfReviewItems.length > 0) {
+            throw new Error("stop after synthetic command authority regression");
+          }
         },
       },
       deferTerminalDisposition: true,
     });
 
-    expect(boundedResult.status, boundedResult.blocker).toBe("local_ready");
-    expect(boundedInput).toBeDefined();
-    expect(boundedInput!.packet.verification.commands).toEqual([
-      { id: "CMD-1", argv: originalCommand.argv },
-    ]);
-    expect(boundedInput!.workItem).toEqual(workItem);
-    expect(boundedInput!.workItem.objective).toBe(workItem.objective);
-    expect(boundedInput!.workItem.verification_commands).toEqual([originalCommand]);
-    expect(boundedInput!.context?.work_item).toEqual(workItem);
-    expect((boundedInput!.context?.work_item as unknown as WorkItem).verification_commands).toEqual([originalCommand]);
+    expect(result.status).toBe("human_action_required");
+    expect(result.blocker).toContain("stop after synthetic command authority regression");
+    expect(scopedSelfReviewItems).toHaveLength(1);
+    expect(scopedSelfReviewItems[0]!.verification_commands).toEqual([{
+      id: "review-action-R1-A1-1",
+      argv: approvedCommand.argv,
+      expected_exit_code: 0,
+    }]);
+    expect(scopedSelfReviewItems[0]!.acceptance[0]!.satisfied_by).toEqual(["review-action-R1-A1-1"]);
+    expect(scopedSelfReviewItems[0]!.tests[0]!.verification_command_ids).toEqual(["review-action-R1-A1-1"]);
   });
 
   it("keeps two bounded R1-A1 packet workflows in distinct scoped artifact roots", async () => {

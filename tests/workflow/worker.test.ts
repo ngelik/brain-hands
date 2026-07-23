@@ -6,6 +6,7 @@ import { MAX_HANDS_PROMPT_BYTES, type CodexAdapter, type CodexInvokeInput } from
 import type { ResourceBudgetPort } from "../../src/core/resource-budget.js";
 import { approvePlanRevision, createRunLedgerV2, recordPlan, updateManifestV2 } from "../../src/core/ledger.js";
 import { artifactRefFromBytes, canonicalJsonBytes, handsContextV1Schema } from "../../src/core/context-contracts.js";
+import { verifierFindingSchema } from "../../src/core/schema.js";
 import type { ImplementationResult, ResolvedRunIntake, WorkItem } from "../../src/core/types.js";
 import { ImplementationResultMismatchError, runHandsWorkItem } from "../../src/workflow/worker.js";
 import { buildHandsContext, loadRoleContext, type HandsAttemptKind } from "../../src/workflow/role-context.js";
@@ -109,6 +110,60 @@ async function persistedContext(
 }
 
 describe("runHandsWorkItem", () => {
+  const oversizedOrdinaryFinding = verifierFindingSchema.parse({
+    severity: "medium",
+    file: "src/example.ts",
+    line: null,
+    acceptance_criterion: "The ordinary prompt remains bounded.",
+    problem_class: "correctness",
+    problem: "x".repeat(128 * 1024),
+    required_fix: "Keep the prompt bounded.",
+    evidence_refs: ["verification/evidence.json"],
+    re_verification: [],
+  });
+
+  it.each([
+    ["ordinary", 1, "initial" as const, "Hands work-item prompt", { findings: [oversizedOrdinaryFinding] }],
+    ["quality recovery", 2, "quality_recovery" as const, "Hands recovery prompt", { diagnosticContext: "x".repeat(128 * 1024) }],
+  ])("rejects an oversized %s Hands prompt before artifacts, Codex, or budget interaction", async (_label, attempt, attemptKind, expectedPromptLabel, promptInput) => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-worker-oversized-prompt-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
+    const codex = new RecordingHands();
+    const budgetInteractions: string[] = [];
+    const budget: ResourceBudgetPort = {
+      usage: async () => { budgetInteractions.push("usage"); return { model_invocations: 0, workflow_attempts: 0, total_tokens: 0, cached_input_tokens: 0, reasoning_output_tokens: 0, active_elapsed_ms: 0, external_effects: 0, token_accounting: "known", uncertain_model_claim_ids: [], token_overshoot: 0 }; },
+      claim: async () => { budgetInteractions.push("claim"); throw new Error("must not claim"); },
+      complete: async () => { budgetInteractions.push("complete"); throw new Error("must not complete"); },
+      runWorkflowAttempt: async (_key, action) => { budgetInteractions.push("runWorkflowAttempt"); return action(); },
+      remainingActiveElapsedMs: async () => { budgetInteractions.push("remainingActiveElapsedMs"); return 0; },
+    };
+    const artifactName = `hands-work-item-item-1-attempt-${attempt}${attemptKind === "quality_recovery" ? "-quality_recovery-primary" : ""}`;
+
+    await expect(runHandsWorkItem({
+      runDir: ledger.runDir,
+      worktreePath: join(root, "worktree"),
+      workItem: item,
+      intake: { ...intake, repo_root: root },
+      codex,
+      budget,
+      attempt,
+      attemptKind,
+      ...promptInput,
+    })).rejects.toThrow(`${expectedPromptLabel} exceeds 131072 bytes`);
+
+    expect(codex.calls).toHaveLength(0);
+    expect(budgetInteractions).toEqual([]);
+    for (const relativePath of [
+      `prompts/${artifactName}.md`,
+      `schemas/${artifactName}.json`,
+      `responses/${artifactName}.json`,
+      `implementation/item-1/attempt-${attempt}.json`,
+    ]) {
+      await expect(readFile(join(ledger.runDir, relativePath), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
   it("suffixes Hands invocation evidence when an interrupted turn already owns the base response", async () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-worker-resume-evidence-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });

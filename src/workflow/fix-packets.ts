@@ -1,10 +1,6 @@
 import type { ExecutionSpecV2, VerifierProblemClass } from "../core/types.js";
 import { createHash } from "node:crypto";
-import {
-  assertPromptWithinBytes,
-  MAX_CODEX_PROMPT_BYTES,
-  type CodexAdapter,
-} from "../adapters/codex.js";
+import { assertPromptWithinBytes, MAX_CODEX_PROMPT_BYTES, type CodexAdapter } from "../adapters/codex.js";
 import type { CommittedRecoveryEvidence } from "../adapters/git.js";
 import type { ResourceBudgetPort } from "../core/resource-budget.js";
 import type { ReasoningEffort } from "../core/types.js";
@@ -703,7 +699,7 @@ export async function correctVerifierRemediationClaim(
     validation_errors_json: JSON.stringify(input.validationErrors, null, 2),
     work_item_json: JSON.stringify(input.workItem, null, 2),
   });
-  assertPromptWithinBytes(prompt, MAX_CODEX_PROMPT_BYTES, "Verifier fix-packet correction prompt");
+  assertPromptWithinBytes(prompt, MAX_CODEX_PROMPT_BYTES, "Verifier correction prompt");
   await writeCreateOnceValidated(input.runDir, authority.requestPath, authority.request, correctionRequestSchema);
   await writeTextArtifact(input.runDir, `${authority.root}/prompt.md`, prompt);
   await writeTextArtifact(input.runDir, `${authority.root}/schema.json`, `${JSON.stringify(verifierRemediationClaimV1OutputSchema, null, 2)}\n`);

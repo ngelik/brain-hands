@@ -10,7 +10,7 @@ import { hashReviewFixPacket, reviewFixPacketV1Schema, type FixPacketResultV1, t
 import { fixPacketResultV1Schema } from "../../src/core/review-fix-packet.js";
 import type { ResourceBudgetPort } from "../../src/core/resource-budget.js";
 import type { ResolvedRunIntake } from "../../src/core/types.js";
-import { runHandsFixPacket } from "../../src/workflow/worker.js";
+import { prepareHandsFixPacketPrompt, runHandsFixPacket } from "../../src/workflow/worker.js";
 import { correctVerifierRemediationClaim, persistFixAttemptSupplement, persistReviewFixPacket, reviewFixPacketIdentity, reviewFixPacketRoot } from "../../src/workflow/fix-packets.js";
 import { buildHandsContext, loadRoleContext } from "../../src/workflow/role-context.js";
 import { reviewerActionQueueSchema } from "../../src/core/schema.js";
@@ -250,6 +250,49 @@ async function authorizeRetry(
 }
 
 describe("runHandsFixPacket", () => {
+  it("rejects a schema-valid oversized packet before prompt, schema, claim, result, Codex, or budget interaction", async () => {
+    root = await mkdtemp(join(tmpdir(), "brain-hands-fix-oversized-prompt-"));
+    const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: "fix" });
+    const codex = new RecordingHands();
+    const budgetInteractions: string[] = [];
+    const budget = {
+      usage: async () => { budgetInteractions.push("usage"); return { model_invocations: 0, workflow_attempts: 0, total_tokens: 0, cached_input_tokens: 0, reasoning_output_tokens: 0, active_elapsed_ms: 0, external_effects: 0, token_accounting: "known" as const, uncertain_model_claim_ids: [], token_overshoot: 0 }; },
+      claim: async () => { budgetInteractions.push("claim"); throw new Error("must not claim"); },
+      complete: async () => { budgetInteractions.push("complete"); throw new Error("must not complete"); },
+      runWorkflowAttempt: async <T>(_key: string, action: () => Promise<T>) => { budgetInteractions.push("runWorkflowAttempt"); return action(); },
+      remainingActiveElapsedMs: async () => { budgetInteractions.push("remainingActiveElapsedMs"); return 0; },
+    };
+    const oversizedPacket = {
+      ...packet,
+      remediation: {
+        ...packet.remediation,
+        change_units: [{
+          ...packet.remediation.change_units[0]!,
+          requirements: ["x".repeat(128 * 1024)],
+        }],
+      },
+    };
+    const artifactName = "hands-fix-packet-R1-A1-attempt-1";
+
+    await expect(runHandsFixPacket({
+      runDir: ledger.runDir, worktreePath: root, workItem: item, packet: oversizedPacket,
+      actionAttempt: 1, intake: { ...intake, repo_root: root }, codex, budget,
+      relevantSourceContext: [], evidenceContext: [], completedDependencies: [], currentDiff: "", supplement: null,
+    })).rejects.toThrow(/Hands fix-packet prompt exceeds 131072 bytes/);
+
+    expect(codex.calls).toHaveLength(0);
+    expect(budgetInteractions).toEqual([]);
+    for (const relativePath of [
+      `prompts/${artifactName}.md`,
+      `schemas/${artifactName}.json`,
+      `${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-invocation-claim.json`,
+      `${reviewFixPacketRoot("R1-A1")}/attempts/1/hands-result.json`,
+    ]) {
+      await expect(readFile(join(ledger.runDir, relativePath), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
   it("rejects inconsistent implemented and contradiction results", () => {
     expect(fixPacketResultV1Schema.safeParse({ ...result, unresolved_requirements: [{ change_unit_id: "FIX-1", requirement: "missing", reason: "not done" }] }).success).toBe(false);
     expect(fixPacketResultV1Schema.safeParse({ ...result, status: "packet_contradiction", unresolved_requirements: [] }).success).toBe(false);
@@ -337,7 +380,7 @@ describe("runHandsFixPacket", () => {
     const fixture = await boundedFixture(root, "COMPLETE_FIX_DIFF_SENTINEL");
     const codex = new RecordingHands(fixture.boundedResult);
 
-    await runHandsFixPacket({
+    const invocationInput = {
       runDir: fixture.ledger.runDir,
       worktreePath: root,
       workItem: item,
@@ -354,9 +397,13 @@ describe("runHandsFixPacket", () => {
       supplement: null,
       contextRef: fixture.contextRef,
       context: fixture.context,
-    } as Parameters<typeof runHandsFixPacket>[0]);
+    } as Parameters<typeof runHandsFixPacket>[0];
+    const preparedPrompt = await prepareHandsFixPacketPrompt(invocationInput);
+
+    await runHandsFixPacket({ ...invocationInput, preparedPrompt });
 
     const prompt = codex.calls[0]!.prompt;
+    expect(prompt).toBe(preparedPrompt.prompt);
     expect(prompt).toContain(fixture.contextRef.path);
     expect(prompt).toContain(fixture.contextRef.sha256);
     expect(prompt).toContain("COMPLETE_FIX_DIFF_SENTINEL");

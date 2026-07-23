@@ -7,9 +7,8 @@ vi.mock("../../src/core/executor.js", () => ({
   runCommand: vi.fn(),
 }));
 import {
-  MAX_CODEX_PROMPT_BYTES,
   CodexInvocationError,
-  assertPromptWithinBytes,
+  MAX_CODEX_PROMPT_BYTES,
   disabledCodexAgentFeatureArgs,
   DryRunCodexAdapter,
   SubprocessCodexAdapter,
@@ -299,35 +298,41 @@ describe("classifyCodexFailure", () => {
   });
 });
 
-describe("assertPromptWithinBytes", () => {
-  it("accepts a prompt at the exact UTF-8 byte limit", () => {
+describe("DryRunCodexAdapter", () => {
+  it("accepts an exact-limit multibyte prompt", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-codex-prompt-limit-"));
+    const budget = recordingBudget();
     const prompt = "é".repeat(MAX_CODEX_PROMPT_BYTES / 2);
 
-    expect(Buffer.byteLength(prompt, "utf8")).toBe(MAX_CODEX_PROMPT_BYTES);
-    expect(() => assertPromptWithinBytes(prompt, MAX_CODEX_PROMPT_BYTES, "Codex prompt")).not.toThrow();
+    const result = await new DryRunCodexAdapter({ ok: true }).invoke({
+      role: "verifier",
+      model: "gpt-5.5",
+      reasoningEffort: "high",
+      sandbox: "read-only",
+      prompt,
+      runDir,
+      artifactName: "exact-limit-dry-run",
+      budget,
+      outputSchema: { type: "object" },
+      outputParser: z.object({ ok: z.boolean() }),
+    });
+
+    expect(Buffer.byteLength(await readFile(result.promptPath, "utf8"), "utf8")).toBe(MAX_CODEX_PROMPT_BYTES);
+    expect(budget.claims).toHaveLength(1);
+    expect(budget.completions).toHaveLength(1);
   });
 
-  it("rejects a multibyte prompt whose character count fits but UTF-8 bytes overflow", () => {
-    const prompt = `${"é".repeat(MAX_CODEX_PROMPT_BYTES / 2)}a`;
-
-    expect(prompt.length).toBeLessThanOrEqual(MAX_CODEX_PROMPT_BYTES);
-    expect(Buffer.byteLength(prompt, "utf8")).toBe(MAX_CODEX_PROMPT_BYTES + 1);
-    expect(() => assertPromptWithinBytes(prompt, MAX_CODEX_PROMPT_BYTES, "Codex prompt"))
-      .toThrow(`Codex prompt exceeds ${MAX_CODEX_PROMPT_BYTES} bytes`);
-  });
-});
-
-describe("DryRunCodexAdapter", () => {
   it("rejects an oversized prompt before claiming budget or writing artifacts", async () => {
     runDir = await mkdtemp(join(tmpdir(), "brain-hands-codex-prompt-limit-"));
     const budget = recordingBudget();
+    const exactLimitPrompt = "é".repeat(MAX_CODEX_PROMPT_BYTES / 2);
 
     await expect(new DryRunCodexAdapter({ ok: true }).invoke({
       role: "verifier",
       model: "gpt-5.5",
       reasoningEffort: "high",
       sandbox: "read-only",
-      prompt: "x".repeat(1024 * 1024 + 1),
+      prompt: `${exactLimitPrompt}x`,
       runDir,
       artifactName: "oversized-dry-run",
       budget,
@@ -558,9 +563,35 @@ describe("DryRunCodexAdapter", () => {
 });
 
 describe("SubprocessCodexAdapter", () => {
+  it("accepts an exact-limit multibyte prompt", async () => {
+    runDir = await mkdtemp(join(tmpdir(), "brain-hands-codex-prompt-limit-"));
+    const budget = recordingBudget();
+    const prompt = "é".repeat(MAX_CODEX_PROMPT_BYTES / 2);
+    mockSuccessfulCatalogThenExec({ ok: true });
+
+    const result = await new SubprocessCodexAdapter(createTestConfig(), "/repo/root").invoke({
+      role: "verifier",
+      model: "gpt-5.5",
+      reasoningEffort: "high",
+      sandbox: "read-only",
+      prompt,
+      runDir,
+      artifactName: "exact-limit-subprocess",
+      budget,
+      outputSchema: { type: "object" },
+      outputParser: z.object({ ok: z.boolean() }),
+    });
+
+    expect(Buffer.byteLength(await readFile(result.promptPath, "utf8"), "utf8")).toBe(MAX_CODEX_PROMPT_BYTES);
+    expect(budget.claims).toHaveLength(1);
+    expect(budget.completions).toHaveLength(1);
+    expect(mockedRunCommand.mock.calls.some((call) => call[0].args[0] === "exec")).toBe(true);
+  });
+
   it("rejects an oversized prompt before claiming budget, writing artifacts, or invoking Codex", async () => {
     runDir = await mkdtemp(join(tmpdir(), "brain-hands-codex-prompt-limit-"));
     const budget = recordingBudget();
+    const exactLimitPrompt = "é".repeat(MAX_CODEX_PROMPT_BYTES / 2);
     const adapter = new SubprocessCodexAdapter(createTestConfig(), "/repo/root", async () => {
       throw new Error("model validation should not run");
     });
@@ -570,7 +601,7 @@ describe("SubprocessCodexAdapter", () => {
       model: "gpt-5.5",
       reasoningEffort: "high",
       sandbox: "read-only",
-      prompt: "x".repeat(1024 * 1024 + 1),
+      prompt: `${exactLimitPrompt}x`,
       runDir,
       artifactName: "oversized-subprocess",
       budget,

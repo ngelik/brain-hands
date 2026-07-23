@@ -54,7 +54,9 @@ import {
   buildReflectionContext,
   buildVerifierContext,
   compactHandsWorkItem,
+  handsContextPath,
   loadRoleContext,
+  validateHandsInvocationContext,
 } from "../../src/workflow/role-context.js";
 import { integratedWorkItem } from "../../src/workflow/integrated-work-item.js";
 
@@ -672,43 +674,100 @@ describe("bounded role contexts", () => {
     expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(2 * 1024);
   });
 
-  it("loads a persisted v0.5.1 marker-and-tail Hands context for resume", async () => {
+  it("preserves executable acceptance authority when change units collapse", () => {
+    const source = item("BH-001");
+    const changeUnits = Array.from({ length: 180 }, (_, index) => ({
+      ...source.change_units[0]!,
+      id: `BH-001:CH-${String(index + 1).padStart(3, "0")}`,
+      target: `approved target ${index + 1}`,
+    }));
+    const testId = source.tests[0]!.id;
+    const commandId = source.verification_commands[0]!.id;
+    const compacted = compactHandsWorkItem({
+      ...source,
+      change_units: changeUnits,
+      acceptance: [
+        { id: "BH-001:AC-test", statement: "Test-only authority remains executable.", satisfied_by: [testId] },
+        { id: "BH-001:AC-command", statement: "Command-only authority remains executable.", satisfied_by: [commandId] },
+        {
+          id: "BH-001:AC-mixed",
+          statement: "Mixed authority preserves order without duplicate compact references.",
+          satisfied_by: [testId, changeUnits[1]!.id, commandId, changeUnits[0]!.id],
+        },
+      ],
+      completion_contract: {
+        ...source.completion_contract,
+        required_acceptance_ids: ["BH-001:AC-test", "BH-001:AC-command", "BH-001:AC-mixed"],
+      },
+    });
+
+    expect(compacted.change_units).toHaveLength(1);
+    expect(compacted.change_units[0]!.id).toBe("compact-approved-change-units");
+    expect(compacted.acceptance.map((criterion) => criterion.satisfied_by)).toEqual([
+      [testId],
+      [commandId],
+      [testId, "compact-approved-change-units", commandId],
+    ]);
+  });
+
+  it("loads the exact v0.5.1 tail-only Hands projection and rejects mutations", async () => {
     const objective = [
-      "ORIGINAL-INTENT: preserve the initial migration constraint.",
-      "中😀".repeat(12_000),
-      "LATEST-INTENT: preserve the final rollout constraint.",
+      "Original approved intent that legacy compaction omitted.",
+      "x".repeat(CONTEXT_LIMITS_V1.hands_total_bytes),
+      "LEGACY-TAIL: preserve same-run recovery.",
     ].join("\n");
-    const workItem = item("BH-001", [], objective);
-    const run = await runDir([workItem]);
-    const currentRef = await buildHandsContext(handsInput(run, { workItem }));
-    const current = await readReferencedJson(run, currentRef, handsContextV1Schema);
-    const currentWorkItem = executionSpecV2Schema.parse(current.work_item);
+    const approved = item("BH-001", [], objective);
+    const currentProjection = compactHandsWorkItem(approved);
     let legacyTail = objective.slice(-(2 * 1024));
     while (Buffer.byteLength(legacyTail, "utf8") > 2 * 1024) legacyTail = legacyTail.slice(1);
-    const legacyObjective = [
-      `[Earlier approved objective history summarized: ${Buffer.byteLength(objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(objective).digest("hex")}]`,
-      legacyTail,
-    ].join("\n");
-    const legacyRef = await writeImmutableValidatedJson(
-      run,
-      "contexts/hands/QkgtMDAx/plan-1/attempt-2/primary_fix.json",
-      handsContextV1Schema,
-      { ...current, work_item: { ...currentWorkItem, objective: legacyObjective } },
-    );
-
-    await expect(loadRoleContext(run, legacyRef, "hands")).resolves.toMatchObject({
-      work_item: { objective: legacyObjective },
+    const legacyProjection = executionSpecV2Schema.parse({
+      ...currentProjection,
+      objective: [
+        `[Earlier approved objective history summarized: ${Buffer.byteLength(objective, "utf8")} UTF-8 bytes, sha256 ${createHash("sha256").update(objective).digest("hex")}]`,
+        legacyTail,
+      ].join("\n"),
+      acceptance: approved.acceptance.map((criterion, index) => ({
+        ...criterion,
+        statement: currentProjection.acceptance[index]!.statement,
+        satisfied_by: criterion.satisfied_by.filter((id) =>
+          currentProjection.change_units.some((unit) => unit.id === id)),
+      })),
     });
-    expect(currentWorkItem.objective).toContain("ORIGINAL-INTENT: preserve the initial migration constraint.");
-    expect(legacyObjective).not.toContain("ORIGINAL-INTENT: preserve the initial migration constraint.");
-
-    const forgedRef = await writeImmutableValidatedJson(
+    const run = await runDir([approved]);
+    const persist = (attempt: number, workItem: WorkItem) => writeImmutableValidatedJson(
       run,
-      "contexts/hands/QkgtMDAx/plan-1/attempt-3/primary_fix.json",
+      handsContextPath(approved.id, 1, attempt, "initial"),
       handsContextV1Schema,
-      { ...current, work_item: { ...currentWorkItem, objective: `${legacyObjective} ` } },
+      {
+        schema_version: 1,
+        role: "hands",
+        work_item: workItem,
+        diff: "",
+        active_findings: [],
+        dependency_summaries: [],
+        bounded_evidence: [],
+        omitted_evidence: [],
+      },
     );
-    await expect(loadRoleContext(run, forgedRef, "hands"))
+    const ref = await persist(70, legacyProjection);
+    const context = await loadRoleContext(run, ref, "hands");
+
+    await expect(validateHandsInvocationContext({
+      runDir: run,
+      contextRef: ref,
+      context,
+      workItem: approved,
+      workItemId: approved.id,
+      planRevision: 1,
+      attempt: 70,
+      attemptKind: "initial",
+    })).resolves.toMatchObject({ plan_revision: 1 });
+
+    const mutatedRef = await persist(71, {
+      ...legacyProjection,
+      objective: `${legacyProjection.objective.slice(0, -1)}!`,
+    });
+    await expect(loadRoleContext(run, mutatedRef, "hands"))
       .rejects.toThrow(/work item does not match the current approved plan/i);
   });
 
@@ -794,6 +853,43 @@ describe("bounded role contexts", () => {
     expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_diff_bytes);
   });
 
+  it("preserves raw structured patch provenance when total Hands context pressure requires a digest fallback", async () => {
+    const diff = [
+      "diff --git a/src/app.ts b/src/app.ts",
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "@@ -0,0 +1 @@",
+      `+${"y".repeat(CONTEXT_LIMITS_V1.hands_diff_bytes + 1)}`,
+      "",
+    ].join("\n");
+    const seedItem = item("BH-001");
+    const seedRun = await runDir([seedItem]);
+    await setVerificationAuthority(seedRun, "BH-001", 1, {
+      commands: [{ command: "é".repeat(9_000) }],
+    });
+    const seedRef = await buildHandsContext(handsInput(seedRun, { workItem: seedItem, diff }));
+    const seedContext = await loadRoleContext(seedRun, seedRef, "hands");
+    const padding = CONTEXT_LIMITS_V1.hands_total_bytes
+      - canonicalJsonBytes(handsContextV1Schema, seedContext).byteLength
+      + 1;
+    const largeItem = item("BH-001", [], `${seedItem.objective}${"x".repeat(padding)}`);
+    const run = await runDir([largeItem]);
+    await setVerificationAuthority(run, "BH-001", 1, {
+      commands: [{ command: "é".repeat(9_000) }],
+    });
+
+    const ref = await buildHandsContext(handsInput(run, { workItem: largeItem, diff }));
+    const context = await loadRoleContext(run, ref, "hands");
+
+    expect(Buffer.byteLength(diff, "utf8")).toBeGreaterThan(CONTEXT_LIMITS_V1.hands_diff_bytes);
+    expect(context.diff).toContain(`Git patch bytes: ${Buffer.byteLength(diff, "utf8")}`);
+    expect(context.diff).toContain(`Git patch sha256: ${createHash("sha256").update(diff).digest("hex")}`);
+    expect(context.bounded_evidence).toEqual([]);
+    expect(context.omitted_evidence).toHaveLength(1);
+    expect(canonicalJsonBytes(handsContextV1Schema, context).byteLength)
+      .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
+  });
+
   it("omits semantic verification evidence when it exceeds the Hands evidence cap", async () => {
     const run = await runDir();
     await setVerificationAuthority(run, "BH-001", 1, {
@@ -843,43 +939,6 @@ describe("bounded role contexts", () => {
     }));
     const context = await loadRoleContext(run, ref, "hands");
     expect(context.diff).toContain("Source diff summarized to preserve bounded role context");
-    expect(context.bounded_evidence).toEqual([]);
-    expect(context.omitted_evidence).toHaveLength(1);
-    expect(canonicalJsonBytes(handsContextV1Schema, context).byteLength)
-      .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
-  });
-
-  it("preserves raw structured patch provenance when total Hands context pressure requires a digest fallback", async () => {
-    const diff = [
-      "diff --git a/src/app.ts b/src/app.ts",
-      "--- a/src/app.ts",
-      "+++ b/src/app.ts",
-      "@@ -0,0 +1 @@",
-      `+${"y".repeat(CONTEXT_LIMITS_V1.hands_diff_bytes + 1)}`,
-      "",
-    ].join("\n");
-    const seedItem = item("BH-001");
-    const seedRun = await runDir([seedItem]);
-    await setVerificationAuthority(seedRun, "BH-001", 1, {
-      commands: [{ command: "é".repeat(9_000) }],
-    });
-    const seedRef = await buildHandsContext(handsInput(seedRun, { workItem: seedItem, diff }));
-    const seedContext = await loadRoleContext(seedRun, seedRef, "hands");
-    const padding = CONTEXT_LIMITS_V1.hands_total_bytes
-      - canonicalJsonBytes(handsContextV1Schema, seedContext).byteLength
-      + 1;
-    const largeItem = item("BH-001", [], `${seedItem.objective}${"x".repeat(padding)}`);
-    const run = await runDir([largeItem]);
-    await setVerificationAuthority(run, "BH-001", 1, {
-      commands: [{ command: "é".repeat(9_000) }],
-    });
-
-    const ref = await buildHandsContext(handsInput(run, { workItem: largeItem, diff }));
-    const context = await loadRoleContext(run, ref, "hands");
-
-    expect(Buffer.byteLength(diff, "utf8")).toBeGreaterThan(CONTEXT_LIMITS_V1.hands_diff_bytes);
-    expect(context.diff).toContain(`Git patch bytes: ${Buffer.byteLength(diff, "utf8")}`);
-    expect(context.diff).toContain(`Git patch sha256: ${createHash("sha256").update(diff).digest("hex")}`);
     expect(context.bounded_evidence).toEqual([]);
     expect(context.omitted_evidence).toHaveLength(1);
     expect(canonicalJsonBytes(handsContextV1Schema, context).byteLength)
