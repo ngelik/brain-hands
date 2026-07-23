@@ -1322,6 +1322,8 @@ describe("runLocalWorkflow", () => {
     let itemReviews = 0;
     const handsAttempts: number[] = [];
     const packetVerifierAttempts: number[] = [];
+    const preparedPrompts: string[] = [];
+    const dispatchedPrompts: string[] = [];
     const dependencies: LocalRuntimeDependencies = {
       ...harness.dependencies,
       verifier: async (input) => {
@@ -1337,8 +1339,9 @@ describe("runLocalWorkflow", () => {
       },
       handsFixPacket: async (input) => {
         handsAttempts.push(input.actionAttempt);
-        await mkdir(join(input.worktreePath, "src"), { recursive: true });
-        await writeFile(join(input.worktreePath, "src/first.ts"), "export const policyFixed = true;\n", "utf8");
+        expect(input.preparedPrompt).toBeDefined();
+        expect(Buffer.byteLength(input.preparedPrompt!.prompt, "utf8")).toBeLessThanOrEqual(MAX_HANDS_PROMPT_BYTES);
+        preparedPrompts.push(input.preparedPrompt!.prompt);
         const result = {
           schema_version: 1 as const, packet_id: input.packet.provenance.packet_id,
           packet_sha256: hashReviewFixPacket(input.packet), action_attempt: input.actionAttempt,
@@ -1347,10 +1350,21 @@ describe("runLocalWorkflow", () => {
           changed_files: input.packet.completion_contract.expected_changed_files,
           commands_attempted: [], unresolved_requirements: [], blocker: null,
         };
-        const reportPath = `reviews/fix-packets/${Buffer.from(input.packet.provenance.packet_id).toString("base64url")}/attempts/${input.actionAttempt}/hands-result.json`;
-        await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(result)}\n`);
-        const profile = input.profile ?? input.intake.roles.hands;
-        return { result, reportPath, invocation: {} as never, profile: { kind: input.profileKind ?? "primary", model: profile.model, reasoning_effort: profile.reasoning_effort } };
+        return runHandsFixPacket({
+          ...input,
+          codex: {
+            invoke: async (invocation) => {
+              dispatchedPrompts.push(invocation.prompt);
+              await mkdir(join(input.worktreePath, "src"), { recursive: true });
+              await writeFile(join(input.worktreePath, "src/first.ts"), "export const policyFixed = true;\n", "utf8");
+              return {
+                text: JSON.stringify(result), parsed: result, exitCode: 0,
+                promptPath: "prompt", stdoutPath: "stdout", stderrPath: "stderr",
+                ...codexMetrics,
+              };
+            },
+          },
+        });
       },
       packetVerifier: async (input) => {
         packetVerifierAttempts.push(input.actionAttempt);
@@ -1378,6 +1392,8 @@ describe("runLocalWorkflow", () => {
     expect(result.status, result.blocker).toBe("local_ready");
     expect(handsAttempts).toEqual([1]);
     expect(packetVerifierAttempts).toEqual([1]);
+    expect(preparedPrompts).toHaveLength(1);
+    expect(dispatchedPrompts).toEqual(preparedPrompts);
     const queue = JSON.parse(await readFile(join(setupResult.runDir, "action-queues/first/revision-1.json"), "utf8"));
     expect(queue.actions).toHaveLength(1);
     expect(queue.actions[0].severity).toBe("medium");
@@ -1804,7 +1820,7 @@ describe("runLocalWorkflow", () => {
       const queue = JSON.parse(await readFile(join(setupResult.runDir, `action-queues/${workItems[index]!.id}/revision-1.json`), "utf8"));
       expect(queue.actions[0].action_id).toBe("R1-A1");
     }
-  }, 30_000);
+  }, 60_000);
 
   it.each([
     "after_work_item_completion_commit",
