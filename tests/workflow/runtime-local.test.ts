@@ -1563,6 +1563,9 @@ describe("runLocalWorkflow", () => {
     expect(boundedInput!.packet.verification.commands).toEqual([
       { id: "CMD-1", argv: originalCommand.argv },
     ]);
+    expect(boundedInput!.workItem).toEqual(workItem);
+    expect(boundedInput!.workItem.objective).toBe(workItem.objective);
+    expect(boundedInput!.workItem.verification_commands).toEqual([originalCommand]);
     expect(boundedInput!.context?.work_item).toEqual(workItem);
     expect((boundedInput!.context?.work_item as unknown as WorkItem).verification_commands).toEqual([originalCommand]);
   });

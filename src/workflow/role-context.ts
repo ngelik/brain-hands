@@ -671,6 +671,7 @@ function packOptional<T>(
   candidates: LoadedCandidate[],
   totalLimit: number,
   evidenceLimit?: { target: string; bytes: number },
+  diffFallback?: string,
 ): T {
   let boundedRequired = required;
   let diffCompacted = false;
@@ -723,7 +724,7 @@ function packOptional<T>(
       if (!diffCompacted && typeof currentDiff === "string" && currentDiff.length > 0) {
         boundedRequired = {
           ...(boundedRequired as Record<string, unknown>),
-          diff: compactRoleDiff(currentDiff),
+          diff: diffFallback ?? compactRoleDiff(currentDiff),
         } as T;
         diffCompacted = true;
         packed = render();
@@ -766,6 +767,7 @@ export const reflectionContextPath = "contexts/reflection/final.json";
 
 async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<ArtifactRefV1> {
   const boundedDiff = boundedHandsDiff(input.diff);
+  const rawDiffDigest = compactRoleDiff(input.diff);
   if (Buffer.byteLength(boundedDiff, "utf8") > CONTEXT_LIMITS_V1.hands_diff_bytes) {
     throw new Error(`Hands diff exceeds ${CONTEXT_LIMITS_V1.hands_diff_bytes} UTF-8 bytes`);
   }
@@ -796,7 +798,7 @@ async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<A
   if (canonicalJsonBytes(handsContextV1Schema, required).byteLength > CONTEXT_LIMITS_V1.hands_total_bytes) {
     required = handsContextV1Schema.parse({
       ...required,
-      diff: compactRoleDiff(required.diff),
+      diff: rawDiffDigest,
     });
   }
   assertRequiredContextFits(required, handsContextV1Schema, CONTEXT_LIMITS_V1.hands_total_bytes, "Hands");
@@ -821,6 +823,7 @@ async function buildHandsContextLocked(input: BuildHandsContextInput): Promise<A
     candidates,
     CONTEXT_LIMITS_V1.hands_total_bytes,
     { target: "bounded_evidence", bytes: CONTEXT_LIMITS_V1.hands_evidence_bytes },
+    rawDiffDigest,
   );
   return writeImmutableValidatedJson(
     input.runDir,

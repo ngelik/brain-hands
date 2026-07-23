@@ -849,6 +849,43 @@ describe("bounded role contexts", () => {
       .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
   });
 
+  it("preserves raw structured patch provenance when total Hands context pressure requires a digest fallback", async () => {
+    const diff = [
+      "diff --git a/src/app.ts b/src/app.ts",
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "@@ -0,0 +1 @@",
+      `+${"y".repeat(CONTEXT_LIMITS_V1.hands_diff_bytes + 1)}`,
+      "",
+    ].join("\n");
+    const seedItem = item("BH-001");
+    const seedRun = await runDir([seedItem]);
+    await setVerificationAuthority(seedRun, "BH-001", 1, {
+      commands: [{ command: "é".repeat(9_000) }],
+    });
+    const seedRef = await buildHandsContext(handsInput(seedRun, { workItem: seedItem, diff }));
+    const seedContext = await loadRoleContext(seedRun, seedRef, "hands");
+    const padding = CONTEXT_LIMITS_V1.hands_total_bytes
+      - canonicalJsonBytes(handsContextV1Schema, seedContext).byteLength
+      + 1;
+    const largeItem = item("BH-001", [], `${seedItem.objective}${"x".repeat(padding)}`);
+    const run = await runDir([largeItem]);
+    await setVerificationAuthority(run, "BH-001", 1, {
+      commands: [{ command: "é".repeat(9_000) }],
+    });
+
+    const ref = await buildHandsContext(handsInput(run, { workItem: largeItem, diff }));
+    const context = await loadRoleContext(run, ref, "hands");
+
+    expect(Buffer.byteLength(diff, "utf8")).toBeGreaterThan(CONTEXT_LIMITS_V1.hands_diff_bytes);
+    expect(context.diff).toContain(`Git patch bytes: ${Buffer.byteLength(diff, "utf8")}`);
+    expect(context.diff).toContain(`Git patch sha256: ${createHash("sha256").update(diff).digest("hex")}`);
+    expect(context.bounded_evidence).toEqual([]);
+    expect(context.omitted_evidence).toHaveLength(1);
+    expect(canonicalJsonBytes(handsContextV1Schema, context).byteLength)
+      .toBeLessThanOrEqual(CONTEXT_LIMITS_V1.hands_total_bytes);
+  });
+
   it("compacts oversized required work-item prose before sacrificing the Hands diff", async () => {
     const largeItem = {
       ...item("BH-001"),

@@ -9,6 +9,7 @@ import {
   type CodexInvokeInput,
 } from "../../src/adapters/codex.js";
 import { createRunLedgerV2 } from "../../src/core/ledger.js";
+import type { ResourceBudgetPort } from "../../src/core/resource-budget.js";
 import type {
   HandsSelfReviewReport,
   ImplementationResult,
@@ -85,6 +86,29 @@ const validReport: HandsSelfReviewReport = {
   remaining_findings: [],
   ready_for_resolution_check: true,
 };
+
+function recordingBudget(): ResourceBudgetPort & {
+  claims: Parameters<ResourceBudgetPort["claim"]>[0][];
+  completions: Parameters<ResourceBudgetPort["complete"]>[0][];
+} {
+  const claims: Parameters<ResourceBudgetPort["claim"]>[0][] = [];
+  const completions: Parameters<ResourceBudgetPort["complete"]>[0][] = [];
+  return {
+    claims,
+    completions,
+    usage: async () => { throw new Error("oversized prompt must fail before budget usage"); },
+    claim: async (input) => {
+      claims.push(input);
+      throw new Error("oversized prompt must fail before budget claim");
+    },
+    complete: async (input) => {
+      completions.push(input);
+      throw new Error("oversized prompt must fail before budget completion");
+    },
+    runWorkflowAttempt: async (_key, action) => action(),
+    remainingActiveElapsedMs: async () => 1_000,
+  };
+}
 
 class RecordingHands implements CodexAdapter {
   readonly calls: CodexInvokeInput[] = [];
@@ -246,6 +270,7 @@ describe("runHandsSelfReview", () => {
     root = await mkdtemp(join(tmpdir(), "brain-hands-self-review-oversized-prompt-"));
     const ledger = await createRunLedgerV2({ repoRoot: root, originalRequest: intake.task });
     const codex = new RecordingHands();
+    const budget = recordingBudget();
     const artifactName = "hands-self-review-item-1-attempt-2-pass-1";
 
     await expect(runHandsSelfReview({
@@ -266,9 +291,12 @@ describe("runHandsSelfReview", () => {
       activeAction: action,
       completedActions: [],
       priorPassReports: [],
+      budget,
     })).rejects.toThrow(`Hands self-review prompt exceeds ${MAX_HANDS_PROMPT_BYTES} bytes`);
 
     expect(codex.calls).toHaveLength(0);
+    expect(budget.claims).toHaveLength(0);
+    expect(budget.completions).toHaveLength(0);
     for (const relativePath of [
       "self-review/item-1/attempt-2/pass-1.claim.json",
       "self-review/item-1/attempt-2/pass-1.json",
