@@ -30,6 +30,7 @@ import * as evidenceIndexWorkflow from "../../src/workflow/evidence-index.js";
 import { hashReviewFixPacket } from "../../src/core/review-fix-packet.js";
 import { fingerprintFinding, loadFindingRevisionRecords } from "../../src/workflow/findings.js";
 import { approveDiscoveryBrief, recordDiscoveryBrief, recordDiscoveryReadiness } from "../../src/core/discovery-ledger.js";
+import { compactHandsWorkItem } from "../../src/workflow/role-context.js";
 const codexMetrics = { usage: null, durationMs: 0, processStarted: false, turnStarted: false, structuredTerminalError: false } as const;
 
 async function enableBoundedProtocol(runDir: string): Promise<void> {
@@ -1465,8 +1466,16 @@ describe("runLocalWorkflow", () => {
     }
   });
 
-  it("preserves packet verification command identity across ordered action-scoped work", async () => {
-    const workItem = item("first");
+  it("preserves packet verification command identity and command-only acceptance authority across ordered action-scoped work", async () => {
+    const baseWorkItem = item("first");
+    const approvedCommandId = baseWorkItem.verification_commands[0]!.id;
+    const workItem: WorkItem = {
+      ...baseWorkItem,
+      acceptance: baseWorkItem.acceptance.map((criterion) => ({
+        ...criterion,
+        satisfied_by: [approvedCommandId],
+      })),
+    };
     const boundedPlan = { ...plan, work_items: [workItem] };
     const config = qualityConfig(1);
     const setupResult = await setupBounded(boundedPlan, false, config.retry_policy.quality_gate); root = setupResult.root;
@@ -1549,6 +1558,7 @@ describe("runLocalWorkflow", () => {
         return value;
       },
       selfReview: async (input) => {
+        compactHandsWorkItem(input.workItem);
         selfReviewInputs.push(input);
         const report = {
           ...selfReviewReport(input.workItem.id, input.parentAttempt, input.pass, false, input.mutationKind),
@@ -1593,20 +1603,104 @@ describe("runLocalWorkflow", () => {
     expect(actionSelfReviewInputs.map((input) => ({
       action: input.activeAction?.action_id,
       commands: input.workItem.verification_commands.map((command) => ({ id: command.id, argv: command.argv })),
+      acceptanceAuthority: input.workItem.acceptance[0]!.satisfied_by,
+      testCommandAuthority: input.workItem.tests[0]!.verification_command_ids,
       objective: input.workItem.objective,
     }))).toEqual([
       {
         action: "R1-A1",
         commands: [{ id: "CMD-1", argv: workItem.verification_commands[0]!.argv }],
+        acceptanceAuthority: ["CMD-1"],
+        testCommandAuthority: ["CMD-1"],
         objective: expect.stringContaining("Resolve only Reviewer action R1-A1: Apply the packet-scoped correction"),
       },
       {
         action: "R1-A2",
         commands: [{ id: "CMD-2", argv: workItem.verification_commands[0]!.argv }],
+        acceptanceAuthority: ["CMD-2"],
+        testCommandAuthority: ["CMD-2"],
         objective: expect.stringContaining("Completed Reviewer actions to preserve without reopening: R1-A1"),
       },
     ]);
     expect(actionSelfReviewInputs[1]!.workItem.objective).not.toContain("Apply the packet-scoped correction");
+  });
+
+  it("translates command-only acceptance authority to synthetic non-packet action commands", async () => {
+    const config = qualityConfig(1);
+    const setupResult = await setup(config.retry_policy.quality_gate); root = setupResult.root;
+    const baseWorkItem = item("first");
+    const approvedCommand = baseWorkItem.verification_commands[0]!;
+    const workItem: WorkItem = {
+      ...baseWorkItem,
+      acceptance: baseWorkItem.acceptance.map((criterion) => ({
+        ...criterion,
+        satisfied_by: [approvedCommand.id],
+      })),
+    };
+    const scopedSelfReviewItems: WorkItem[] = [];
+    let itemReviews = 0;
+
+    const result = await runLocalWorkflow({
+      runDir: setupResult.runDir,
+      worktreePath: setupResult.worktree,
+      intake: { ...intake, repo_root: setupResult.root },
+      plan: { ...plan, work_items: [workItem] },
+      codex: {} as never,
+      config,
+      dependencies: {
+        hands: async (input) => {
+          const value = implementation(input.workItem.id);
+          const reportPath = `implementation/${input.workItem.id}/attempt-${input.attempt}.json`;
+          await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(value)}\n`);
+          return { implementation: value, reportPath, invocation: {} as never };
+        },
+        verification: async (input) => evidenceForInput(input),
+        selfReview: async (input) => {
+          const compacted = compactHandsWorkItem(input.workItem);
+          if (input.mutationKind === "reviewer_action") scopedSelfReviewItems.push(compacted);
+          const report = {
+            ...selfReviewReport(input.workItem.id, input.parentAttempt, input.pass, false, input.mutationKind),
+            active_action_id: input.activeAction?.action_id ?? null,
+          };
+          const reportPath = `self-review/${input.workItem.id}/attempt-${input.parentAttempt}/pass-${input.pass}.json`;
+          await writeTextArtifact(input.runDir, reportPath, `${JSON.stringify(report)}\n`);
+          return { report, reportPath, invocation: {} as never };
+        },
+        diff: async () => "diff",
+        verifier: async (input) => {
+          const requested = !input.final && itemReviews++ === 0;
+          const value = review(requested ? "request_changes" : "approve", input.workItem.id, input.attempt, input.final);
+          if (requested) {
+            value.findings = value.findings.map((finding) => ({
+              ...finding,
+              re_verification: [[...approvedCommand.argv]],
+            }));
+          }
+          const reviewPath = input.final
+            ? `reviews/integrated/final-attempt-${input.attempt}.json`
+            : `reviews/${input.workItem.id}/attempt-${input.attempt}.json`;
+          return { review: value, reviewPath: await persistReview(input.runDir, reviewPath, value), invocation: {} as never };
+        },
+        gitSnapshot: cleanSnapshot,
+        afterCheckpoint: async (checkpoint) => {
+          if (checkpoint === "after_self_review_pass_1" && scopedSelfReviewItems.length > 0) {
+            throw new Error("stop after synthetic command authority regression");
+          }
+        },
+      },
+      deferTerminalDisposition: true,
+    });
+
+    expect(result.status).toBe("human_action_required");
+    expect(result.blocker).toContain("stop after synthetic command authority regression");
+    expect(scopedSelfReviewItems).toHaveLength(1);
+    expect(scopedSelfReviewItems[0]!.verification_commands).toEqual([{
+      id: "review-action-R1-A1-1",
+      argv: approvedCommand.argv,
+      expected_exit_code: 0,
+    }]);
+    expect(scopedSelfReviewItems[0]!.acceptance[0]!.satisfied_by).toEqual(["review-action-R1-A1-1"]);
+    expect(scopedSelfReviewItems[0]!.tests[0]!.verification_command_ids).toEqual(["review-action-R1-A1-1"]);
   });
 
   it("keeps two bounded R1-A1 packet workflows in distinct scoped artifact roots", async () => {

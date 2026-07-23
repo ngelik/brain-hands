@@ -5337,6 +5337,16 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
     packet?: ReviewFixPacketV1,
   ): WorkItem => {
     const commands = actionCommands(active, completed);
+    const verificationCommands = packet
+      ? packet.verification.commands.map((command) => ({ ...command, expected_exit_code: 0 as const }))
+      : commands.length > 0
+      ? commands.map((argv, index) => ({ id: `review-action-${active.action_id}-${index + 1}`, argv, expected_exit_code: 0 as const }))
+      : workItem.verification_commands;
+    const approvedCommandIds = new Set(workItem.verification_commands.map((command) => command.id));
+    const scopedCommandIds = verificationCommands.map((command) => command.id);
+    const translateCommandReferences = (references: string[]): string[] => [...new Set(references.flatMap((id) =>
+      approvedCommandIds.has(id) ? scopedCommandIds : [id]))];
+    const commandsReplaced = packet !== undefined || commands.length > 0;
     const packetArtifacts = packet
       ? packet.verification.required_evidence
           .filter((evidence) => evidence.kind === "artifact")
@@ -5351,11 +5361,19 @@ async function runLocalWorkflowUnsafe(input: RunLocalWorkflowInput): Promise<Loc
           ? "none"
           : completed.map((action) => action.action_id).join("; ")}`,
       ].join("\n"),
-      verification_commands: packet
-        ? packet.verification.commands.map((command) => ({ ...command, expected_exit_code: 0 as const }))
-        : commands.length > 0
-        ? commands.map((argv, index) => ({ id: `review-action-${active.action_id}-${index + 1}`, argv, expected_exit_code: 0 as const }))
-        : workItem.verification_commands,
+      acceptance: commandsReplaced
+        ? workItem.acceptance.map((criterion) => ({
+            ...criterion,
+            satisfied_by: translateCommandReferences(criterion.satisfied_by),
+          }))
+        : workItem.acceptance,
+      tests: commandsReplaced
+        ? workItem.tests.map((test) => ({
+            ...test,
+            verification_command_ids: translateCommandReferences(test.verification_command_ids),
+          }))
+        : workItem.tests,
+      verification_commands: verificationCommands,
       expected_artifacts: [...new Set([...workItem.expected_artifacts, ...packetArtifacts])],
     };
   };
