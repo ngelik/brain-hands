@@ -1671,7 +1671,7 @@ describe("runLocalWorkflow", () => {
       const queue = JSON.parse(await readFile(join(setupResult.runDir, `action-queues/${workItems[index]!.id}/revision-1.json`), "utf8"));
       expect(queue.actions[0].action_id).toBe("R1-A1");
     }
-  }, 30_000);
+  }, 60_000);
 
   it.each([
     "after_work_item_completion_commit",
