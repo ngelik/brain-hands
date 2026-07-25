@@ -53,7 +53,7 @@
   "dependencies": {
     "commander": "^15.0.0",
     "execa": "^10.0.0",
-    "foglamp": "^0.7.1",
+    "foglamp": "^0.8.0",
     "three": "^0.185.1",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
